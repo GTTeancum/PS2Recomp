@@ -299,7 +299,9 @@ namespace ps2_stubs
             }
 
             bool usedBackend = false;
-            if (!useOverride)
+            static const bool disableHostInput =
+                std::getenv("PS2X_DISABLE_HOST_INPUT") != nullptr;
+            if (!useOverride && !disableHostInput)
             {
                 uint8_t backendData[32]{};
                 if (runtime && runtime->padBackend().readState(port, slot, backendData, sizeof(backendData)))
