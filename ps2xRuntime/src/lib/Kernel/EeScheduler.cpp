@@ -311,6 +311,17 @@ void EeScheduler::run()
                 GuestThread *owner = &acquireInvocationThread();
                 GuestInvocation invocation = std::move(m_pendingInvocations.front());
                 m_pendingInvocations.pop_front();
+                if (invocation.kind == GuestInvocationKind::Interrupt &&
+                    getRegU32(&invocation.context, 4) == 1u)
+                {
+                    std::fprintf(stderr,
+                                 "[xmen-vif1-irq-promote-idle] sequence=%llu handler=0x%x owner=%d pending=%zu cycle=%llu\n",
+                                 static_cast<unsigned long long>(invocation.sequence),
+                                 invocation.context.pc,
+                                 owner->id,
+                                 m_pendingInvocations.size(),
+                                 static_cast<unsigned long long>(m_eeCycle));
+                }
                 owner->status = EeThreadStatus::Running;
                 m_currentThreadId = owner->id;
                 renewTimeSlice();
@@ -341,6 +352,32 @@ void EeScheduler::run()
             }
         }
         R5900Context &context = running->activeContext();
+        if (context.pc == 0x002DE3D0u ||
+            context.pc == 0x002DE524u ||
+            context.pc == 0x002DE52Cu)
+        {
+            const uint32_t queue = readXmenWord(m_rdram, 0x007507D4u);
+            const uint64_t sequence = running->invocations.empty()
+                                          ? 0u
+                                          : running->invocations.back().sequence;
+            std::fprintf(stderr,
+                         "[xmen-vif1-handler-state] pc=0x%x sequence=%llu thread=%d depth=%zu "
+                         "status=0x%x queue=0x%x head0=0x%llx head8=0x%llx next=0x%x "
+                         "flags=0x%x completed=0x%x submitted=0x%x cycle=%llu\n",
+                         context.pc,
+                         static_cast<unsigned long long>(sequence),
+                         running->id,
+                         running->invocations.size(),
+                         context.cop0_status,
+                         queue,
+                         static_cast<unsigned long long>(queue ? readXmenDoubleword(m_rdram, queue) : 0u),
+                         static_cast<unsigned long long>(queue ? readXmenDoubleword(m_rdram, queue + 8u) : 0u),
+                         queue ? readXmenWord(m_rdram, queue + 0x34u) : 0u,
+                         queue ? readXmenWord(m_rdram, queue + 0x40u) : 0u,
+                         readXmenWord(m_rdram, 0x007537E0u),
+                         readXmenWord(m_rdram, 0x007537E8u),
+                         static_cast<unsigned long long>(m_eeCycle));
+        }
         if (context.pc == 0x002DE550u)
         {
             static uint32_t gifHandlerEntryTraceCount = 0u;
@@ -474,6 +511,30 @@ void EeScheduler::run()
             const GuestInvocation &pending = m_pendingInvocations.front();
             if (pending.kind == GuestInvocationKind::Interrupt && !eeInterruptsEnabled(context))
             {
+                if (getRegU32(&pending.context, 4) == 1u)
+                {
+                    static uint32_t xmenVif1BlockedTraceCount = 0u;
+                    if (xmenVif1BlockedTraceCount++ < 128u)
+                    {
+                        const GuestInvocation *active = running->invocations.empty()
+                                                            ? nullptr
+                                                            : &running->invocations.back();
+                        std::fprintf(stderr,
+                                     "[xmen-vif1-irq-blocked] sequence=%llu handler=0x%x current=%d "
+                                     "pc=0x%x status=0x%x depth=%zu activeKind=%u activeSequence=%llu "
+                                     "pending=%zu cycle=%llu\n",
+                                     static_cast<unsigned long long>(pending.sequence),
+                                     pending.context.pc,
+                                     running->id,
+                                     context.pc,
+                                     context.cop0_status,
+                                     running->invocations.size(),
+                                     active ? static_cast<unsigned>(active->kind) : 0u,
+                                     active ? static_cast<unsigned long long>(active->sequence) : 0ull,
+                                     m_pendingInvocations.size(),
+                                     static_cast<unsigned long long>(m_eeCycle));
+                    }
+                }
                 if (pending.context.pc == 0x002E63E0u &&
                     (m_runtime.memory().gs().csr.load(std::memory_order_relaxed) & 0x2u) != 0u)
                 {
@@ -498,6 +559,21 @@ void EeScheduler::run()
             {
                 GuestInvocation invocation = std::move(m_pendingInvocations.front());
                 m_pendingInvocations.pop_front();
+                if (invocation.kind == GuestInvocationKind::Interrupt &&
+                    getRegU32(&invocation.context, 4) == 1u)
+                {
+                    std::fprintf(stderr,
+                                 "[xmen-vif1-irq-preempt] sequence=%llu handler=0x%x current=%d "
+                                 "pc=0x%x status=0x%x depth=%zu pending=%zu cycle=%llu\n",
+                                 static_cast<unsigned long long>(invocation.sequence),
+                                 invocation.context.pc,
+                                 running->id,
+                                 context.pc,
+                                 context.cop0_status,
+                                 running->invocations.size(),
+                                 m_pendingInvocations.size(),
+                                 static_cast<unsigned long long>(m_eeCycle));
+                }
                 if (getRegU32(&invocation.context, 29) == 0u)
                 {
                     SET_GPR_U32(&invocation.context, 29, invocationStackTop());
@@ -1713,6 +1789,23 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
 {
     assertExecutor();
     invocation.sequence = ++m_invocationSequence;
+    if (invocation.kind == GuestInvocationKind::Interrupt &&
+        getRegU32(&invocation.context, 4) == 1u)
+    {
+        const GuestThread *owner = currentThread();
+        const R5900Context *active = owner ? &owner->activeContext() : nullptr;
+        std::fprintf(stderr,
+                     "[xmen-vif1-irq-queued] sequence=%llu handler=0x%x current=%d "
+                     "pc=0x%x status=0x%x depth=%zu pendingBefore=%zu cycle=%llu\n",
+                     static_cast<unsigned long long>(invocation.sequence),
+                     invocation.context.pc,
+                     owner ? owner->id : 0,
+                     active ? active->pc : 0u,
+                     active ? active->cop0_status : 0u,
+                     owner ? owner->invocations.size() : 0u,
+                     m_pendingInvocations.size(),
+                     static_cast<unsigned long long>(m_eeCycle));
+    }
     m_pendingInvocations.push_back(std::move(invocation));
     m_checkpointPending.store(true, std::memory_order_release);
 }
@@ -1957,6 +2050,16 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
                      interrupted ? interrupted->activeContext().pc : 0u,
                      interrupted ? interrupted->invocations.size() : 0u,
                      static_cast<unsigned long long>(m_eeCycle));
+        for (const EeIrqHandler &handler : matching)
+        {
+            std::fprintf(stderr,
+                         "[xmen-vif1-irq-handler] id=%d handler=0x%x argument=0x%x gp=0x%x order=%d\n",
+                         handler.id,
+                         handler.handler,
+                         handler.argument,
+                         handler.gp,
+                         handler.order);
+        }
     }
     if (dmac && cause == 2u)
     {

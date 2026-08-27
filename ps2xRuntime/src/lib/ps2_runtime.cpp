@@ -1929,6 +1929,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      const char *debugName)
 {
     ctx->pc = targetPc;
+    const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
     constexpr uint32_t kXmenDispatchTable = 0x006AC600u;
     constexpr std::array<uint32_t, 14> kXmenExpectedDispatchTable = {
         0x002F3400u, 0x002F3400u, 0x002F3400u, 0x002F313Cu,
@@ -1939,6 +1940,132 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     static std::atomic<bool> s_xmenDispatchTableClobberLogged{false};
     static std::atomic<bool> s_xmenPacketCursorOverrunLogged{false};
     static thread_local uint32_t s_xmenDispatchTableSampleCounter = 0u;
+    static thread_local bool s_xmenSlotBaseInitialized = false;
+    static thread_local uint32_t s_xmenLastSlotManager = 0u;
+    static thread_local uint32_t s_xmenLastSlotBase = 0u;
+    static thread_local bool s_xmenSlotGrowActive = false;
+    static thread_local uint32_t s_xmenSlotGrowOldAddress = 0u;
+    static thread_local uint32_t s_xmenSlotGrowBytes = 0u;
+    if (sourcePc == 0x0024B2ACu && targetPc == 0u)
+    {
+        static std::atomic<uint32_t> s_xmenNullListenerTraceCount{0u};
+        const uint32_t count = s_xmenNullListenerTraceCount.fetch_add(1u, std::memory_order_relaxed);
+        if (count < 32u)
+        {
+            const uint32_t container = GPR_U32(ctx, 19);
+            const uint32_t descriptor = readRdramProbeU32(rdram, container + 8u);
+            const uint32_t storage = readRdramProbeU32(rdram, descriptor + 0x10u);
+            std::cerr << "[xmen-null-listener] index=" << std::dec << count
+                      << " container=0x" << std::hex << container
+                      << " event=0x" << GPR_U32(ctx, 18)
+                      << " listenerIndex=0x" << GPR_U32(ctx, 16)
+                      << " listener=0x" << GPR_U32(ctx, 4)
+                      << " descriptor=0x" << descriptor
+                      << " descriptor0=0x" << readRdramProbeU32(rdram, descriptor)
+                      << " descriptor4=0x" << readRdramProbeU32(rdram, descriptor + 4u)
+                      << " descriptor8=0x" << readRdramProbeU32(rdram, descriptor + 8u)
+                      << " descriptorC=0x" << readRdramProbeU32(rdram, descriptor + 0x0Cu)
+                      << " storage=0x" << storage
+                      << " storage0=0x" << readRdramProbeU32(rdram, storage)
+                      << " storage4=0x" << readRdramProbeU32(rdram, storage + 4u)
+                      << " storage8=0x" << readRdramProbeU32(rdram, storage + 8u)
+                      << " trace=" << formatDispatchHistory()
+                      << std::dec << std::endl;
+        }
+    }
+    if (isCall && sourcePc == 0x00271BA0u && targetPc == 0x00200F30u)
+    {
+        const uint32_t manager = GPR_U32(ctx, 17);
+        s_xmenSlotGrowActive = true;
+        s_xmenSlotGrowOldAddress = GPR_U32(ctx, 4);
+        s_xmenSlotGrowBytes = GPR_U32(ctx, 5);
+        std::cerr << "[xmen-render-slot-grow-enter] manager=0x" << std::hex << manager
+                  << " used=0x" << readRdramProbeU32(rdram, manager)
+                  << " free=0x" << readRdramProbeU32(rdram, manager + 4u)
+                  << " oldBase=0x" << GPR_U32(ctx, 4)
+                  << " bytes=0x" << GPR_U32(ctx, 5)
+                  << " alignment=0x" << GPR_U32(ctx, 6)
+                  << " sp=0x" << GPR_U32(ctx, 29)
+                  << std::dec << std::endl;
+    }
+    if (isCall && sourcePc == 0x00271BC8u && targetPc == 0x001240CCu)
+    {
+        const uint32_t manager = GPR_U32(ctx, 17);
+        std::cerr << "[xmen-render-slot-grow-return] manager=0x" << std::hex << manager
+                  << " used=0x" << readRdramProbeU32(rdram, manager)
+                  << " free=0x" << readRdramProbeU32(rdram, manager + 4u)
+                  << " newBase=0x" << readRdramProbeU32(rdram, manager + 0x10u)
+                  << " allocationResult=0x" << GPR_U32(ctx, 2)
+                  << " clearAddress=0x" << GPR_U32(ctx, 4)
+                  << " clearBytes=0x" << GPR_U32(ctx, 5)
+                  << std::dec << std::endl;
+        s_xmenSlotGrowActive = false;
+    }
+    if (s_xmenSlotGrowActive && isCall &&
+        (sourcePc == 0x00203FE0u || sourcePc == 0x00203FFCu ||
+         sourcePc == 0x00204058u || sourcePc == 0x00204074u))
+    {
+        std::cerr << "[xmen-render-slot-owner-check] source=0x" << std::hex << sourcePc
+                  << " target=0x" << targetPc
+                  << " candidate=0x" << GPR_U32(ctx, 4)
+                  << " pointer=0x" << s_xmenSlotGrowOldAddress
+                  << " argument=0x" << GPR_U32(ctx, 5)
+                  << " bytes=0x" << s_xmenSlotGrowBytes
+                  << std::dec << std::endl;
+    }
+    if (s_xmenSlotGrowActive &&
+        ((sourcePc == 0x00232048u && kind == GuestBranchKind::IndirectJump) ||
+         (sourcePc == 0x00231EE8u && kind == GuestBranchKind::IndirectJump)))
+    {
+        std::cerr << "[xmen-render-slot-backend] source=0x" << std::hex << sourcePc
+                  << " target=0x" << targetPc
+                  << " heap=0x" << GPR_U32(ctx, 4)
+                  << " a1=0x" << GPR_U32(ctx, 5)
+                  << " a2=0x" << GPR_U32(ctx, 6)
+                  << " a3=0x" << GPR_U32(ctx, 7)
+                  << std::dec << std::endl;
+    }
+    if (isCall && sourcePc == 0x00200EECu)
+    {
+        std::cerr << "[xmen-realloc-method-enter] target=0x" << std::hex << targetPc
+                  << " heap=0x" << GPR_U32(ctx, 4)
+                  << " oldAddress=0x" << GPR_U32(ctx, 5)
+                  << " bytes=0x" << GPR_U32(ctx, 6)
+                  << " alignment=0x" << GPR_U32(ctx, 7)
+                  << std::dec << std::endl;
+    }
+    if (isCall && sourcePc == 0x00200D6Cu)
+    {
+        std::cerr << "[xmen-alloc-method-enter] target=0x" << std::hex << targetPc
+                  << " heap=0x" << GPR_U32(ctx, 4)
+                  << " bytes=0x" << GPR_U32(ctx, 5)
+                  << " alignment=0x" << GPR_U32(ctx, 6)
+                  << std::dec << std::endl;
+    }
+    if (rdram)
+    {
+        const uint32_t slotManager = readRdramProbeU32(rdram, 0x009727C8u);
+        const uint32_t slotBase = readRdramProbeU32(rdram, slotManager + 0x10u);
+        if (!s_xmenSlotBaseInitialized || slotManager != s_xmenLastSlotManager ||
+            slotBase != s_xmenLastSlotBase)
+        {
+            std::cerr << "[xmen-render-slot-base-change] source=0x" << std::hex << sourcePc
+                      << " target=0x" << targetPc
+                      << " kind=0x" << static_cast<uint32_t>(kind)
+                      << " managerOld=0x" << s_xmenLastSlotManager
+                      << " managerNew=0x" << slotManager
+                      << " baseOld=0x" << s_xmenLastSlotBase
+                      << " baseNew=0x" << slotBase
+                      << " pc=0x" << ctx->pc
+                      << " ra=0x" << GPR_U32(ctx, 31)
+                      << " sp=0x" << GPR_U32(ctx, 29)
+                      << " trace=" << formatDispatchHistory()
+                      << std::dec << std::endl;
+            s_xmenSlotBaseInitialized = true;
+            s_xmenLastSlotManager = slotManager;
+            s_xmenLastSlotBase = slotBase;
+        }
+    }
     if (rdram && targetPc == 0x002E6C60u &&
         !s_xmenPacketCursorOverrunLogged.load(std::memory_order_relaxed))
     {
@@ -2769,7 +2896,6 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                   << " trace=" << formatDispatchHistory()
                   << std::dec << std::endl;
     }
-    const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
     if (rdram && kind == GuestBranchKind::Return && sourcePc == 0x002FA54Cu &&
         GPR_U32(ctx, 2) == 0xFFFFFFFFu)
     {
@@ -6746,7 +6872,7 @@ xmen_component_attach_trace_done:
     // Compatibility-heap blocks are intentionally invisible to Alchemy's
     // native allocator registry. Handle its outer realloc wrapper before it
     // asks that registry to identify the block owner.
-    if (isCall && targetPc == 0x00200E90u)
+    if (isCall && (targetPc == 0x00200E90u || targetPc == 0x00200F30u))
     {
         const uint32_t oldAddress = GPR_U32(ctx, 4);
         const uint32_t oldSize = ps2xGuestBumpAllocationSize(oldAddress);
@@ -7093,9 +7219,20 @@ xmen_component_attach_trace_done:
         const uint32_t frame =
             s_xmenFramePrepareSequence.fetch_add(1u, std::memory_order_relaxed);
         const uint32_t queue = readRdramProbeU32(rdram, 0x00750774u);
+        const uint32_t renderer = GPR_U32(ctx, 16);
+        const uint32_t slotManager = readRdramProbeU32(rdram, renderer + 0x148u);
+        constexpr uint32_t xmenLevelManager = 0x00B1A220u;
+        const uint32_t xmenActiveLevel =
+            readRdramProbeU32(rdram, xmenLevelManager + 0x0C08u);
+        const uint32_t xmenActiveLevelVtable = xmenActiveLevel != 0u
+            ? readRdramProbeU32(rdram, xmenActiveLevel + 0x0EC8u)
+            : 0u;
         std::cerr << "[xmen-frame-prepare] frame=" << frame
-                  << " renderer=0x" << std::hex << GPR_U32(ctx, 16)
-                  << " active=0x" << (readRdramProbeU32(rdram, GPR_U32(ctx, 16) + 0x3Cu) & 0xFFu)
+                  << " renderer=0x" << std::hex << renderer
+                  << " active=0x" << (readRdramProbeU32(rdram, renderer + 0x3Cu) & 0xFFu)
+                  << " slotManager=0x" << slotManager
+                  << " slotBase=0x" << readRdramProbeU32(rdram, slotManager + 0x10u)
+                  << " slotCount=0x" << readRdramProbeU32(rdram, slotManager + 0x14u)
                   << " queue=0x" << queue
                   << " read=0x" << readRdramProbeU32(rdram, queue + 0x20u)
                   << " write=0x" << readRdramProbeU32(rdram, queue + 0x30u)
@@ -7104,6 +7241,29 @@ xmen_component_attach_trace_done:
                   << " submitted=0x" << readRdramProbeU32(rdram, 0x007537E8u)
                   << " finishPending=0x" << readRdramProbeU32(rdram, 0x007537D0u)
                   << std::dec << std::endl;
+        if ((frame & 0x3Fu) == 0u)
+        {
+            std::cerr << "[xmen-level-state] frame=" << std::dec << frame
+                      << " manager=0x" << std::hex << xmenLevelManager
+                      << " flags=0x" << readRdramProbeU32(rdram, xmenLevelManager + 0x0948u)
+                      << " pathA=\"" << readGuestPrintableString(rdram, xmenLevelManager + 0x09CCu, 128u) << "\""
+                      << " pathB=\"" << readGuestPrintableString(rdram, xmenLevelManager + 0x0A4Cu, 128u) << "\""
+                      << " objectHead=0x" << readRdramProbeU32(rdram, xmenLevelManager + 0x0BD4u)
+                      << " objectCount=0x" << readRdramProbeU32(rdram, xmenLevelManager + 0x0BE0u)
+                      << " active=0x" << xmenActiveLevel
+                      << " activeFlags=0x" << readRdramProbeU32(rdram, xmenActiveLevel)
+                      << " activeVtable=0x" << xmenActiveLevelVtable
+                      << " update=0x" << readRdramProbeU32(rdram, xmenActiveLevelVtable + 0x3Cu)
+                      << " render=0x" << readRdramProbeU32(rdram, xmenActiveLevelVtable + 0x38u)
+                      << " nextA=\"" << readGuestPrintableString(rdram, xmenLevelManager + 0x17A8u, 128u) << "\""
+                      << " nextB=\"" << readGuestPrintableString(rdram, xmenLevelManager + 0x1828u, 128u) << "\""
+                      << " state1798=0x" << readRdramProbeU32(rdram, xmenLevelManager + 0x1798u)
+                      << " state179c=0x" << readRdramProbeU32(rdram, xmenLevelManager + 0x179Cu)
+                      << " state17a0=0x" << readRdramProbeU32(rdram, xmenLevelManager + 0x17A0u)
+                      << " state17a4=0x" << readRdramProbeU32(rdram, xmenLevelManager + 0x17A4u)
+                      << " state18a8=0x" << readRdramProbeU32(rdram, xmenLevelManager + 0x18A8u)
+                      << std::dec << std::endl;
+        }
     }
 
     if (isCall && sourcePc == 0x002F6158u && targetPc == 0x002F6E90u)
@@ -7132,12 +7292,124 @@ xmen_component_attach_trace_done:
                   << " queue=0x" << queue
                   << " read=0x" << readRdramProbeU32(rdram, queue + 0x20u)
                   << " write=0x" << readRdramProbeU32(rdram, queue + 0x30u)
-                  << " flags=0x" << (readRdramProbeU32(rdram, queue + 0x40u) & 0xFFu)
-                  << " list=0x" << list
-                  << " listNext=0x" << readRdramProbeU32(rdram, list + 0x10u)
-                  << " vif1Chcr=0x" << m_memory.readIORegister(0x10009000u)
-                  << " vif1Tadr=0x" << m_memory.readIORegister(0x10009030u)
-                  << " dstat=0x" << m_memory.readIORegister(0x1000E010u)
+                   << " flags=0x" << (readRdramProbeU32(rdram, queue + 0x40u) & 0xFFu)
+                   << " list=0x" << list
+                   << " listNext=0x" << readRdramProbeU32(rdram, list + 0x10u)
+                   << " caller=0x" << readRdramProbeU32(rdram, GPR_U32(ctx, 29))
+                   << " issued=0x" << readRdramProbeU64(rdram, 0x00750800u + mode * 8u)
+                   << " completedMode=0x" << readRdramProbeU64(rdram, 0x00750850u + mode * 8u)
+                   << " waitTarget=0x" << readRdramProbeU64(rdram, 0x007508B0u + mode * 8u)
+                   << " waitFlags=0x" << readRdramProbeU32(rdram, 0x00754EE0u)
+                   << " vif1Chcr=0x" << m_memory.readIORegister(0x10009000u)
+                   << " vif1Tadr=0x" << m_memory.readIORegister(0x10009030u)
+                   << " dstat=0x" << m_memory.readIORegister(0x1000E010u)
+                   << std::dec << std::endl;
+    }
+
+    if (isCall && targetPc == 0x002DF450u)
+    {
+        const uint32_t mode = GPR_U32(ctx, 4);
+        const uint32_t queue = readRdramProbeU32(rdram, 0x00750770u + mode * 4u);
+        std::cerr << "[xmen-dma-sync-enter] frame="
+                  << (s_xmenFramePrepareSequence.load(std::memory_order_relaxed) - 1u)
+                  << " source=0x" << std::hex << sourcePc
+                  << " mode=0x" << mode
+                  << " target=0x" << GPR_U64(ctx, 5)
+                  << " issued=0x" << readRdramProbeU64(rdram, 0x00750800u + mode * 8u)
+                  << " completedMode=0x" << readRdramProbeU64(rdram, 0x00750850u + mode * 8u)
+                  << " waitTarget=0x" << readRdramProbeU64(rdram, 0x007508B0u + mode * 8u)
+                  << " waitFlags=0x" << readRdramProbeU32(rdram, 0x00754EE0u)
+                  << " queue=0x" << queue
+                  << " queueSequence=0x" << readRdramProbeU64(rdram, queue)
+                  << " queueFlags=0x" << (readRdramProbeU32(rdram, queue + 0x40u) & 0xFFu)
+                  << std::dec << std::endl;
+    }
+
+    if (isCall &&
+        ((sourcePc == 0x00271F08u && targetPc == 0x002D92E0u) ||
+         (sourcePc == 0x00271F14u && targetPc == 0x002FB570u) ||
+         (sourcePc == 0x00271F1Cu && targetPc == 0x002F9FE0u)))
+    {
+        const uint32_t object = GPR_U32(ctx, 4);
+        const uint32_t fence = sourcePc == 0x00271F08u
+                                   ? readRdramProbeU32(rdram, object + 0x0Cu)
+                                   : object;
+        const uint32_t slot = GPR_U32(ctx, 16);
+        const uint32_t renderer = GPR_U32(ctx, 18);
+        const uint32_t slotManager = readRdramProbeU32(rdram, renderer + 0x148u);
+        std::cerr << "[xmen-gif-fence-object] frame="
+                  << (s_xmenFramePrepareSequence.load(std::memory_order_relaxed) - 1u)
+                  << " source=0x" << std::hex << sourcePc
+                  << " target=0x" << targetPc
+                  << " root=0x" << renderer
+                  << " slotManager=0x" << slotManager
+                  << " slotBase=0x" << readRdramProbeU32(rdram, slotManager + 0x10u)
+                  << " slotCount=0x" << readRdramProbeU32(rdram, slotManager + 0x14u)
+                  << " slot=0x" << slot
+                  << " slotOwner=0x" << readRdramProbeU32(rdram, slot + 4u)
+                  << " slotObject=0x" << readRdramProbeU32(rdram, slot + 8u)
+                  << " object=0x" << object
+                  << " objectFence=0x" << readRdramProbeU32(rdram, object + 0x0Cu)
+                  << " fence=0x" << fence
+                  << " fenceValue=0x" << readRdramProbeU64(rdram, fence)
+                  << " fenceFlags=0x" << (readRdramProbeU32(rdram, fence + 0x44u) & 0xFFFFFFu)
+                  << std::dec << std::endl;
+    }
+
+    if (isCall && sourcePc == 0x002DF4D4u && targetPc == 0x002F6E90u)
+    {
+        const uint32_t mode = GPR_U32(ctx, 16) >> 3u;
+        const uint32_t queue = readRdramProbeU32(rdram, 0x00750770u + mode * 4u);
+        std::cerr << "[xmen-dma-sync-flush] frame="
+                  << (s_xmenFramePrepareSequence.load(std::memory_order_relaxed) - 1u)
+                  << " mode=0x" << std::hex << mode
+                  << " target=0x" << GPR_U64(ctx, 18)
+                  << " issued=0x" << readRdramProbeU64(rdram, 0x00750800u + mode * 8u)
+                  << " completedMode=0x" << readRdramProbeU64(rdram, 0x00750850u + mode * 8u)
+                  << " waitTarget=0x" << readRdramProbeU64(rdram, 0x007508B0u + mode * 8u)
+                  << " waitFlags=0x" << readRdramProbeU32(rdram, 0x00754EE0u)
+                  << " queue=0x" << queue
+                  << " queueSequence=0x" << readRdramProbeU64(rdram, queue)
+                  << " queueFlags=0x" << (readRdramProbeU32(rdram, queue + 0x40u) & 0xFFu)
+                  << std::dec << std::endl;
+    }
+
+    if (isCall &&
+        (sourcePc == 0x002DE3ACu || sourcePc == 0x002DE51Cu || sourcePc == 0x002DE69Cu) &&
+        targetPc == 0x002DE130u)
+    {
+        const uint32_t mode = GPR_U32(ctx, 4);
+        const uint32_t queue = GPR_U32(ctx, 5);
+        std::cerr << "[xmen-dma-complete-enter] frame="
+                  << (s_xmenFramePrepareSequence.load(std::memory_order_relaxed) - 1u)
+                  << " mode=0x" << std::hex << mode
+                  << " queue=0x" << queue
+                  << " queueSequence=0x" << readRdramProbeU64(rdram, queue)
+                  << " queueFlags=0x" << (readRdramProbeU32(rdram, queue + 0x40u) & 0xFFu)
+                  << " issued=0x" << readRdramProbeU64(rdram, 0x00750800u + mode * 8u)
+                  << " completedMode=0x" << readRdramProbeU64(rdram, 0x00750850u + mode * 8u)
+                  << " waitTarget=0x" << readRdramProbeU64(rdram, 0x007508B0u + mode * 8u)
+                  << " waitFlags=0x" << readRdramProbeU32(rdram, 0x00754EE0u)
+                  << std::dec << std::endl;
+    }
+
+    if (isCall && sourcePc == 0x002DE268u && targetPc == 0x0010AFA0u)
+    {
+        const uint32_t mode = GPR_U32(ctx, 17);
+        std::cerr << "[xmen-dma-complete-target-reached] frame="
+                  << (s_xmenFramePrepareSequence.load(std::memory_order_relaxed) - 1u)
+                  << " mode=0x" << std::hex << mode
+                  << " completedMode=0x" << readRdramProbeU64(rdram, 0x00750850u + mode * 8u)
+                  << " waitTarget=0x" << readRdramProbeU64(rdram, 0x007508B0u + mode * 8u)
+                  << " sema=0x" << GPR_U32(ctx, 4)
+                  << std::dec << std::endl;
+    }
+
+    if (isCall && sourcePc == 0x002DE284u && targetPc == 0x0010AF50u)
+    {
+        std::cerr << "[xmen-dma-complete-signal] frame="
+                  << (s_xmenFramePrepareSequence.load(std::memory_order_relaxed) - 1u)
+                  << " sema=0x" << std::hex << GPR_U32(ctx, 4)
                   << std::dec << std::endl;
     }
 

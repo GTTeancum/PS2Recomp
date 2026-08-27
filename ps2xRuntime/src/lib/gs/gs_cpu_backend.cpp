@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -947,7 +948,21 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
     if (xmenTitleRasterTraceIndex != UINT32_MAX || traceXmenGameplayRaster)
         s_xmenActiveRasterProbe = &xmenRasterStats;
     const auto rasterStart = std::chrono::steady_clock::now();
-    DrawPrimitive(batch);
+    static const bool skipCpuRaster = std::getenv("PS2X_SKIP_CPU_RASTER") != nullptr;
+    static const uint32_t skipCpuRasterBeforePresent = []
+    {
+        const char *value = std::getenv("PS2X_SKIP_CPU_RASTER_BEFORE_PRESENT");
+        if (!value)
+            return 0u;
+
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 10);
+        return end != value && *end == '\0'
+            ? static_cast<uint32_t>(std::min<unsigned long>(parsed, UINT32_MAX))
+            : 0u;
+    }();
+    if (!skipCpuRaster && batch.debugPresentCount >= skipCpuRasterBeforePresent)
+        DrawPrimitive(batch);
     s_xmenActiveRasterProbe = nullptr;
     static uint64_t s_xmenCerebroCaptureTick = UINT64_MAX;
     static uint32_t s_xmenCerebroCaptureBatchCount = 0u;
