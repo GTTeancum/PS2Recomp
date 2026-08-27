@@ -218,6 +218,20 @@ void register_code_generator_tests()
                  "MULT should not write rd when rd is zero");
     });
 
+    tc.Run("R5900 LQ and SQ silently align qword addresses", [](TestCase &t) {
+        CodeGenerator gen({}, {});
+
+        Instruction lq = makeIType(0x9010, OPCODE_LQ, 5, 6, 0x23);
+        Instruction sq = makeIType(0x9014, OPCODE_SQ, 7, 8, 0x34);
+        const std::string generatedLq = gen.translateInstruction(lq);
+        const std::string generatedSq = gen.translateInstruction(sq);
+
+        t.IsTrue(generatedLq.find("(ADD32(GPR_U32(ctx, 5), 35) & ~0xFu)") != std::string::npos,
+                 "LQ should clear the low four effective-address bits");
+        t.IsTrue(generatedSq.find("(ADD32(GPR_U32(ctx, 7), 52) & ~0xFu)") != std::string::npos,
+                 "SQ should clear the low four effective-address bits");
+    });
+
     tc.Run("R5900 MMI MULT1 writes rd when rd is non-zero", [](TestCase &t) {
         CodeGenerator gen({}, {});
 
@@ -908,6 +922,66 @@ void register_code_generator_tests()
             t.IsTrue(ctc1Code.find("ignored") == std::string::npos, "CTC1 FCR31 should not be ignored");
         });
 
+        tc.Run("DIV.S uses the R5900 finite-saturation helper", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            Instruction div{};
+            div.opcode = OPCODE_COP1;
+            div.rs = COP1_S;
+            div.rt = 3;
+            div.rd = 2;
+            div.sa = 1;
+            div.function = COP1_S_DIV;
+
+            const std::string generated = gen.translateInstruction(div);
+            t.IsTrue(generated.find("ctx->f[1] = FPU_DIV_S(ctx, ctx->f[2], ctx->f[3]);") != std::string::npos,
+                     "DIV.S should use the R5900 helper instead of host IEEE division");
+            t.IsTrue(generated.find("INFINITY") == std::string::npos,
+                      "DIV.S must not emit IEEE infinity for a zero divisor");
+        });
+
+        tc.Run("SQRT.S reads the ft source register", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            Instruction sqrt{};
+            sqrt.opcode = OPCODE_COP1;
+            sqrt.rs = COP1_S;
+            sqrt.rt = 4;
+            sqrt.rd = 9;
+            sqrt.sa = 2;
+            sqrt.function = COP1_S_SQRT;
+
+            const std::string generated = gen.translateInstruction(sqrt);
+            t.IsTrue(generated.find("ctx->f[2] = FPU_SQRT_S(ctx->f[4]);") != std::string::npos,
+                     "SQRT.S should read ft, not the otherwise-unused fs field");
+        });
+
+        tc.Run("COP1 arithmetic uses R5900 normalization helpers", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            Instruction arithmetic{};
+            arithmetic.opcode = OPCODE_COP1;
+            arithmetic.rs = COP1_S;
+            arithmetic.rt = 3;
+            arithmetic.rd = 2;
+            arithmetic.sa = 1;
+
+            arithmetic.function = COP1_S_ADD;
+            t.IsTrue(gen.translateInstruction(arithmetic).find(
+                         "ctx->f[1] = FPU_ADD_S(ctx, ctx->f[2], ctx->f[3]);") != std::string::npos,
+                     "ADD.S should use the R5900 normalization helper");
+
+            arithmetic.function = COP1_S_MUL;
+            t.IsTrue(gen.translateInstruction(arithmetic).find(
+                         "ctx->f[1] = FPU_MUL_S(ctx, ctx->f[2], ctx->f[3]);") != std::string::npos,
+                     "MUL.S should use the R5900 normalization helper");
+
+            arithmetic.function = COP1_S_MADD;
+            t.IsTrue(gen.translateInstruction(arithmetic).find(
+                         "ctx->f[1] = FPU_MADD_S(ctx, ctx->f_acc, ctx->f[2], ctx->f[3]);") != std::string::npos,
+                     "MADD.S should normalize only its final accumulator result");
+        });
+
         tc.Run("VU CFC2/CTC2 access VI registers directly", [](TestCase& t)
             {
                 CodeGenerator gen({}, {});
@@ -1329,6 +1403,26 @@ void register_code_generator_tests()
             t.IsTrue(out.find("ctx->vu0_vf[12]") != std::string::npos, "S2 source VF should come from rd");
             t.IsTrue(out.find("ctx->vu0_vf[8]") != std::string::npos, "S2 destination VF should come from rt");
             t.IsTrue(out.find("ctx->vu0_vf[22]") == std::string::npos, "S2 must not use rs(format) as register index");
+        });
+
+        tc.Run("VU0 VCLIP emits the PS2 clip helper", [](TestCase &t) {
+            Instruction inst{};
+            inst.opcode = OPCODE_COP2;
+            inst.rs = COP2_CO | 0xF;
+            inst.rt = 20;
+            inst.rd = 12;
+            inst.function = 0x3C;
+            inst.vectorInfo.vectorField = 0xF;
+
+            const uint32_t upper = (VU0_S2_VCLIPw >> 2) & 0x1F;
+            const uint32_t lower = VU0_S2_VCLIPw & 0x3;
+            inst.raw = (upper << 6) | lower;
+
+            CodeGenerator gen({}, {});
+            const std::string out = gen.translateInstruction(inst);
+
+            t.IsTrue(out.find("PS2_VCLIP(ctx->vu0_clip_flags, ctx->vu0_vf[12], ctx->vu0_vf[20])") != std::string::npos,
+                     "VCLIP should use the runtime helper with Fs from rd and Ft from rt");
         });
 
         tc.Run("VU0 S2 VI memory ops use rd as VI base register", [](TestCase &t) {

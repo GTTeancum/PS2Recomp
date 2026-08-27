@@ -181,6 +181,7 @@ struct EeThreadSnapshot
 {
     int id = 0;
     uint32_t pc = 0;
+    uint32_t ra = 0;
     uint32_t entry = 0;
     uint32_t stack = 0;
     uint32_t stackSize = 0;
@@ -228,6 +229,7 @@ enum class EeEventType : uint8_t
     Stop,
     VBlankStart,
     VBlankEnd,
+    Intc,
     Dmac,
     ExternalWake,
     Alarm,
@@ -289,6 +291,7 @@ public:
     int resumeThread(int id, bool interruptSafe);
     void sleepCurrent();
     int wakeupThread(int id, bool interruptSafe);
+    int queueThreadWakeup(int id, bool interruptSafe);
     int cancelWakeup(int id);
     int changePriority(int id, int priority, bool interruptSafe, int &oldPriority);
     int rotateReadyQueue(int priority, bool interruptSafe);
@@ -367,6 +370,8 @@ private:
     void assertExecutor() const;
     [[nodiscard]] int allocateThreadId();
     GuestThread &acquireInvocationThread();
+    void releaseInvocationStack(int threadId, size_t depth) noexcept;
+    void releaseInvocationStacks(const GuestThread &thread) noexcept;
     void enqueueReady(GuestThread &thread, bool front = false);
     void removeReady(GuestThread &thread);
     [[nodiscard]] GuestThread *selectReady();
@@ -441,6 +446,7 @@ private:
     uint32_t m_gsVSyncCallbackGp = 0;
     uint32_t m_gsVSyncCallbackSp = 0;
     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
+    std::vector<uint32_t> m_freeInvocationStackTops;
     std::atomic<uint64_t> m_nextDeadlineCycle{0};
 
     mutable std::mutex m_snapshotMutex;

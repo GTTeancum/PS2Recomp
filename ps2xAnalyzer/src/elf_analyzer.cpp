@@ -19,6 +19,29 @@ namespace ps2recomp
     static uint32_t decodeAbsoluteJumpTarget(uint32_t instructionAddress, uint32_t targetField);
     static bool tryReadWord(const ElfParser *parser, uint32_t address, uint32_t &outWord);
 
+    static bool tryGetGprWriteDestination(const Instruction &inst, uint32_t &outReg)
+    {
+        if (!inst.modificationInfo.modifiesGPR)
+        {
+            return false;
+        }
+
+        if (inst.opcode == OPCODE_SPECIAL || inst.opcode == OPCODE_MMI)
+        {
+            outReg = inst.rd;
+            return outReg != 0u;
+        }
+
+        if (inst.opcode == OPCODE_JAL || (inst.opcode == OPCODE_REGIMM && inst.isCall))
+        {
+            outReg = 31u;
+            return true;
+        }
+
+        outReg = inst.rt;
+        return outReg != 0u;
+    }
+
     ElfAnalyzer::ElfAnalyzer(const std::string &elfPath)
         : m_elfPath(elfPath)
     {
@@ -359,8 +382,9 @@ namespace ps2recomp
 
             const auto &instructions = getDecodedInstructions(func);
 
-            for (const auto &inst : instructions)
+            for (size_t instructionIndex = 0u; instructionIndex < instructions.size(); ++instructionIndex)
             {
+                const Instruction &inst = instructions[instructionIndex];
                 if (inst.opcode == OPCODE_LW || inst.opcode == OPCODE_SW ||
                     inst.opcode == OPCODE_LB || inst.opcode == OPCODE_SB ||
                     inst.opcode == OPCODE_LH || inst.opcode == OPCODE_SH ||
@@ -420,61 +444,49 @@ namespace ps2recomp
                             }
                         }
                     }
-                    // Also check for direct addressing with LUI+ADDIU combinations
-                    else if (inst.opcode == OPCODE_LW || inst.opcode == OPCODE_SW)
+                    // Resolve direct addressing assembled through LUI and an optional
+                    // ORI/ADDIU before applying the load/store displacement.
+                    else
                     {
-                        // Look for the LUI instruction that sets up the high bits
-                        uint32_t baseAddr = 0;
-                        for (int i = 1; i <= 5 && static_cast<int>(inst.address) - i * 4 >= static_cast<int>(func.start); i++)
+                        uint32_t targetAddr = 0u;
+                        if (!resolveBasePlusOffsetForHeuristics(
+                                instructions,
+                                instructionIndex,
+                                inst.rs,
+                                static_cast<int16_t>(inst.immediate),
+                                targetAddr))
                         {
-                            uint32_t prevAddr = inst.address - i * 4;
-                            uint32_t prevInst = 0;
-                            if (!tryReadWord(m_elfParser.get(), prevAddr, prevInst))
-                            {
-                                continue;
-                            }
-
-                            // Check if it's a LUI instruction for the same register
-                            if (OPCODE(prevInst) == OPCODE_LUI && RT(prevInst) == inst.rs)
-                            {
-                                baseAddr = IMMEDIATE(prevInst) << 16;
-                                break;
-                            }
+                            continue;
                         }
 
-                        if (baseAddr != 0)
+                        // Detect MMIO accesses
+                        if ((targetAddr >= 0x10000000 && targetAddr < 0x14000000) || // I/O
+                            (targetAddr >= 0x70000000 && targetAddr < 0x70004000))   // Scratchpad
                         {
-                            uint32_t targetAddr = baseAddr + static_cast<int16_t>(inst.immediate);
+                            m_mmioByInstructionAddress[inst.address] = targetAddr;
+                            std::cout << "Detected MMIO access at " << std::hex << inst.address
+                                      << " -> " << targetAddr << std::dec << std::endl;
+                        }
 
-                            // Detect MMIO accesses
-                            if ((targetAddr >= 0x10000000 && targetAddr < 0x14000000) || // I/O
-                                (targetAddr >= 0x70000000 && targetAddr < 0x70004000))   // Scratchpad
+                        for (const auto &section : m_context.sections)
+                        {
+                            if (targetAddr >= section.address && targetAddr < section.address + section.size)
                             {
-                                m_mmioByInstructionAddress[inst.address] = targetAddr;
-                                std::cout << "Detected MMIO access at " << std::hex << inst.address
-                                          << " -> " << targetAddr << std::dec << std::endl;
-                            }
+                                auto symIt = std::find_if(m_context.symbols.begin(), m_context.symbols.end(),
+                                                          [targetAddr](const Symbol &s)
+                                                          { return !s.isFunction && s.address <= targetAddr &&
+                                                                   s.address + s.size > targetAddr; });
 
-                            for (const auto &section : m_context.sections)
-                            {
-                                if (targetAddr >= section.address && targetAddr < section.address + section.size)
+                                if (symIt != m_context.symbols.end())
                                 {
-                                    auto symIt = std::find_if(m_context.symbols.begin(), m_context.symbols.end(),
-                                                              [targetAddr](const Symbol &s)
-                                                              { return !s.isFunction && s.address <= targetAddr &&
-                                                                       s.address + s.size > targetAddr; });
+                                    std::cout << "Function " << func.name << " directly accesses "
+                                              << (inst.isStore ? "writes to" : "reads from")
+                                              << " data symbol " << symIt->name
+                                              << " at 0x" << std::hex << targetAddr << std::dec << std::endl;
 
-                                    if (symIt != m_context.symbols.end())
-                                    {
-                                        std::cout << "Function " << func.name << " directly accesses "
-                                                  << (inst.opcode == OPCODE_LW ? "reads from" : "writes to")
-                                                  << " data symbol " << symIt->name
-                                                  << " at 0x" << std::hex << targetAddr << std::dec << std::endl;
-
-                                        m_functionDataUsage[func.name].insert(symIt->name);
-                                    }
-                                    break;
+                                    m_functionDataUsage[func.name].insert(symIt->name);
                                 }
+                                break;
                             }
                         }
                     }
@@ -604,6 +616,16 @@ namespace ps2recomp
         int16_t offset,
         uint32_t &outAddr) const
     {
+        return resolveBasePlusOffsetForHeuristics(instructions, index, baseReg, offset, outAddr);
+    }
+
+    bool ElfAnalyzer::resolveBasePlusOffsetForHeuristics(
+        const std::vector<Instruction> &instructions,
+        size_t index,
+        uint32_t baseReg,
+        int16_t offset,
+        uint32_t &outAddr)
+    {
         uint32_t baseAddr = 0;
         if (!tryResolveLuiBase(instructions, index, baseReg, baseAddr))
         {
@@ -618,7 +640,7 @@ namespace ps2recomp
         const std::vector<Instruction> &instructions,
         size_t index,
         uint32_t reg,
-        uint32_t &baseAddr) const
+        uint32_t &baseAddr)
     {
         baseAddr = 0;
 
@@ -653,7 +675,8 @@ namespace ps2recomp
                 return true;
             }
 
-            if (prev.rt == reg || prev.rd == reg)
+            uint32_t writtenReg = 0u;
+            if (tryGetGprWriteDestination(prev, writtenReg) && writtenReg == reg)
             {
                 break;
             }

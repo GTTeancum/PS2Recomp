@@ -3,6 +3,7 @@
 
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 #include <string>
 #include <functional>
@@ -21,6 +22,7 @@
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
+#include <iostream>
 
 #include "ps2_log.h"
 #include "runtime/ps2_address.h"
@@ -41,6 +43,9 @@ class PS2IopHostAdapter;
 class PS2IopTransport;
 class EeScheduler;
 struct EeEvent;
+
+extern "C" uint32_t ps2xGuestBumpAlloc(uint8_t *rdram, uint32_t size, uint32_t alignment);
+extern "C" uint32_t ps2xGuestBumpAllocationSize(uint32_t address);
 
 enum PS2Exception
 {
@@ -257,6 +262,15 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
     return static_cast<uint8_t>((valueHi >> ((byteIndex - 8u) * 8u)) & 0xFFu);
 }
 
+inline uint32_t ps2TraceGuestRegisterLo32(const R5900Context *ctx, uint32_t reg)
+{
+    if (!ctx || reg >= 32u)
+    {
+        return 0u;
+    }
+    return static_cast<uint32_t>(_mm_cvtsi128_si64(ctx->r[reg]));
+}
+
 inline void ps2TraceGuestWrite(uint8_t *rdram,
                                uint32_t guestAddr,
                                uint32_t size,
@@ -265,13 +279,290 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                                const char *op,
                                const R5900Context *ctx)
 {
-    (void)rdram;
-    (void)guestAddr;
-    (void)size;
-    (void)valueLo;
-    (void)valueHi;
-    (void)op;
-    (void)ctx;
+    const uint32_t textureHeapWriteStart = guestAddr & PS2_RAM_MASK;
+    const uint32_t textureHeapWordCount = std::min(size / 4u, 4u);
+    for (uint32_t word = 0u; word < textureHeapWordCount; ++word)
+    {
+        const uint64_t source = word < 2u ? valueLo : valueHi;
+        const uint32_t value = static_cast<uint32_t>(source >> ((word & 1u) * 32u));
+        const uint32_t address = textureHeapWriteStart + word * sizeof(uint32_t);
+        const bool touchesKnownOverlap =
+            (address >= 0x00A3BEC0u && address < 0x00A3BF60u) ||
+            (address >= 0x00A3C8C0u && address < 0x00A3C960u);
+        if (value != 0xFFFFFFFFu || !touchesKnownOverlap)
+        {
+            continue;
+        }
+
+        uint32_t previous = 0u;
+        std::memcpy(&previous, rdram + address, sizeof(previous));
+        if (previous == 0xFFFFFFFFu)
+        {
+            continue;
+        }
+
+        static std::atomic<uint32_t> xmenTextureMinusOneWriteLogCount{0u};
+        const uint32_t index =
+            xmenTextureMinusOneWriteLogCount.fetch_add(1u, std::memory_order_relaxed);
+        if (index >= 256u)
+        {
+            continue;
+        }
+
+        const uint32_t possibleObject = address >= 0x18u ? address - 0x18u : 0u;
+        uint32_t possiblePreviousLink = 0u;
+        uint32_t possibleNextLink = 0u;
+        uint32_t possibleOffset = 0u;
+        uint16_t possibleExtent = 0u;
+        uint8_t possibleType = 0u;
+        uint8_t possibleState = 0u;
+        if (possibleObject + 0x49u <= PS2_RAM_SIZE)
+        {
+            std::memcpy(&possiblePreviousLink, rdram + possibleObject + 0x1Cu,
+                        sizeof(possiblePreviousLink));
+            std::memcpy(&possibleNextLink, rdram + possibleObject + 0x18u,
+                        sizeof(possibleNextLink));
+            std::memcpy(&possibleOffset, rdram + possibleObject + 0x38u,
+                        sizeof(possibleOffset));
+            std::memcpy(&possibleExtent, rdram + possibleObject + 0x40u,
+                        sizeof(possibleExtent));
+            std::memcpy(&possibleType, rdram + possibleObject + 0x46u,
+                        sizeof(possibleType));
+            std::memcpy(&possibleState, rdram + possibleObject + 0x48u,
+                        sizeof(possibleState));
+        }
+        std::cerr << "[xmen-texture-heap:minus-one-write] index=" << std::dec << index
+                  << " op=" << op
+                  << " addr=0x" << std::hex << address
+                  << " previous=0x" << previous
+                  << " possibleObject=0x" << possibleObject
+                  << " objectNext=0x" << possibleNextLink
+                  << " objectPrevious=0x" << possiblePreviousLink
+                  << " objectOffset=0x" << possibleOffset
+                  << " objectExtent=0x" << possibleExtent
+                  << " objectType=0x" << static_cast<uint32_t>(possibleType)
+                  << " objectState=0x" << static_cast<uint32_t>(possibleState)
+                  << " pc=0x" << (ctx ? ctx->pc : 0u)
+                  << " ra=0x" << ps2TraceGuestRegisterLo32(ctx, 31)
+                  << " sp=0x" << ps2TraceGuestRegisterLo32(ctx, 29)
+                  << " a0=0x" << ps2TraceGuestRegisterLo32(ctx, 4)
+                  << " a1=0x" << ps2TraceGuestRegisterLo32(ctx, 5)
+                  << " a2=0x" << ps2TraceGuestRegisterLo32(ctx, 6)
+                  << " a3=0x" << ps2TraceGuestRegisterLo32(ctx, 7)
+                  << std::dec << std::endl;
+    }
+
+    constexpr uint32_t xmenChainSavedReturnSlot = 0x01F12560u;
+    const uint32_t focusedWriteStart = guestAddr & PS2_RAM_MASK;
+    const uint64_t focusedWriteEnd = static_cast<uint64_t>(focusedWriteStart) + size;
+    const bool touchesXmenChainSavedReturn =
+        focusedWriteStart < xmenChainSavedReturnSlot + sizeof(uint64_t) &&
+        focusedWriteEnd > xmenChainSavedReturnSlot;
+    static std::atomic<bool> xmenChainSavedReturnArmed{false};
+    if (touchesXmenChainSavedReturn && ctx && ctx->pc == 0x002E6C64u)
+    {
+        xmenChainSavedReturnArmed.store(true, std::memory_order_release);
+    }
+    if (touchesXmenChainSavedReturn &&
+        xmenChainSavedReturnArmed.load(std::memory_order_acquire))
+    {
+        static std::atomic<uint32_t> xmenChainSavedReturnLogCount{0u};
+        const uint32_t index =
+            xmenChainSavedReturnLogCount.fetch_add(1u, std::memory_order_relaxed);
+        if (index < 2048u)
+        {
+            uint64_t previous = 0u;
+            std::memcpy(&previous,
+                        rdram + xmenChainSavedReturnSlot,
+                        sizeof(previous));
+            std::cerr << "[xmen-chain-slot-write] index=" << std::dec << index
+                      << " op=" << op
+                      << " addr=0x" << std::hex << guestAddr
+                      << " size=0x" << size
+                      << " previous=0x" << previous
+                      << " lo=0x" << valueLo
+                      << " hi=0x" << valueHi
+                      << " pc=0x" << ctx->pc
+                      << " ra=0x" << ps2TraceGuestRegisterLo32(ctx, 31)
+                      << " sp=0x" << ps2TraceGuestRegisterLo32(ctx, 29)
+                      << std::dec << std::endl;
+        }
+    }
+
+    const uint32_t writeWords = std::min(size / 4u, 4u);
+    constexpr uint32_t xmenBadRegistryValue = 0x0028F6B0u;
+    bool containsBadRegistryValue = false;
+    for (uint32_t word = 0u; word < writeWords; ++word)
+    {
+        const uint64_t source = word < 2u ? valueLo : valueHi;
+        const uint32_t shift = (word & 1u) * 32u;
+        containsBadRegistryValue |= static_cast<uint32_t>(source >> shift) == xmenBadRegistryValue;
+    }
+    if (containsBadRegistryValue)
+    {
+        static std::atomic<uint32_t> badRegistryValueLogCount{0};
+        if (badRegistryValueLogCount.fetch_add(1, std::memory_order_relaxed) < 128u)
+        {
+            std::cerr << "[xmen-watch-value:28f6b0] op=" << op
+                      << " addr=0x" << std::hex << guestAddr
+                      << " size=0x" << size
+                      << " lo=0x" << valueLo
+                      << " hi=0x" << valueHi
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      << " ra=0x" << ps2TraceGuestRegisterLo32(ctx, 31)
+                      << " sp=0x" << ps2TraceGuestRegisterLo32(ctx, 29)
+                      << std::dec << std::endl;
+        }
+    }
+    static std::atomic<uint32_t> watchLogCount{0};
+    constexpr uint32_t watchStartA = 0x00898EF0u;
+    constexpr uint32_t watchEndA = 0x00898F00u;
+    constexpr uint32_t watchStartB = 0x00741E20u;
+    constexpr uint32_t watchEndB = 0x00741E34u;
+    constexpr uint32_t watchStartC = 0x006F2B50u;
+    constexpr uint32_t watchEndC = 0x006F2B80u;
+    constexpr uint32_t watchStartD = 0x00747250u;
+    constexpr uint32_t watchEndD = 0x007472B0u;
+    constexpr uint32_t watchStartE = 0x00745C78u;
+    constexpr uint32_t watchEndE = 0x00745C7Cu;
+    constexpr uint32_t watchStartF = 0x00900410u;
+    constexpr uint32_t watchEndF = 0x00900430u;
+    constexpr uint32_t watchStartG = 0x00897460u;
+    constexpr uint32_t watchEndG = 0x00898EE4u;
+    constexpr uint32_t watchStartH = 0x00746FF0u;
+    constexpr uint32_t watchEndH = 0x00746FF4u;
+    constexpr uint32_t watchStartI = 0x00B1A870u;
+    constexpr uint32_t watchEndI = 0x00B1AAA0u;
+    constexpr uint32_t watchStartJ = 0x0089B000u;
+    constexpr uint32_t watchEndJ = 0x0089B010u;
+    static const uint32_t watchStartK = [] {
+        const char* value = std::getenv("PS2X_WATCH_START_K");
+        return value && *value
+            ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) & PS2_RAM_MASK
+            : 0x00720A4Cu;
+    }();
+    static const uint32_t watchSizeK = [] {
+        const char* value = std::getenv("PS2X_WATCH_SIZE_K");
+        return value && *value
+            ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0))
+            : 0x40u;
+    }();
+    static const uint32_t watchPcStartK = [] {
+        const char* value = std::getenv("PS2X_WATCH_PC_START_K");
+        return value && *value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
+    }();
+    static const uint32_t watchPcEndK = [] {
+        const char* value = std::getenv("PS2X_WATCH_PC_END_K");
+        return value && *value
+            ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0))
+            : 0xFFFFFFFFu;
+    }();
+    const uint64_t watchEndK = static_cast<uint64_t>(watchStartK) + watchSizeK;
+    const uint32_t writeEnd = guestAddr + size;
+    const bool touchesA = guestAddr < watchEndA && writeEnd > watchStartA;
+    const bool touchesB = guestAddr < watchEndB && writeEnd > watchStartB;
+    const bool touchesC = guestAddr < watchEndC && writeEnd > watchStartC;
+    const bool touchesD = guestAddr < watchEndD && writeEnd > watchStartD;
+    const bool touchesE = guestAddr < watchEndE && writeEnd > watchStartE;
+    const bool touchesF = guestAddr < watchEndF && writeEnd > watchStartF;
+    const bool touchesG = guestAddr < watchEndG && writeEnd > watchStartG;
+    const bool touchesH = guestAddr < watchEndH && writeEnd > watchStartH;
+    const bool touchesI = guestAddr < watchEndI && writeEnd > watchStartI;
+    const bool touchesJ = guestAddr < watchEndJ && writeEnd > watchStartJ;
+    const uint32_t guestPhys = guestAddr & PS2_RAM_MASK;
+    const uint64_t writePhysEnd = static_cast<uint64_t>(guestPhys) + size;
+    const bool touchesK = guestPhys < watchEndK && writePhysEnd > watchStartK;
+    const uint32_t writePc = ctx ? ctx->pc : 0u;
+    const bool watchPcMatchesK =
+        watchPcStartK == 0u || (ctx && writePc >= watchPcStartK && writePc < watchPcEndK);
+    if (touchesK && watchPcMatchesK)
+    {
+        static std::atomic<uint32_t> legalMatrixPacketWatchLogCount{0};
+        if (legalMatrixPacketWatchLogCount.fetch_add(1, std::memory_order_relaxed) < 256u)
+        {
+            std::cerr << "[xmen-watch:dynamic-k] range=0x" << std::hex << watchStartK
+                      << "+0x" << watchSizeK
+                      << " op=" << op
+                      << " addr=0x" << guestAddr
+                      << " size=0x" << size
+                      << " lo=0x" << valueLo
+                      << " hi=0x" << valueHi
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      << " ra=0x" << ps2TraceGuestRegisterLo32(ctx, 31)
+                      << " sp=0x" << ps2TraceGuestRegisterLo32(ctx, 29)
+                      << " s0=0x" << ps2TraceGuestRegisterLo32(ctx, 16)
+                      << " s1=0x" << ps2TraceGuestRegisterLo32(ctx, 17)
+                      << " a0=0x" << ps2TraceGuestRegisterLo32(ctx, 4)
+                      << " a1=0x" << ps2TraceGuestRegisterLo32(ctx, 5)
+                      << " a2=0x" << ps2TraceGuestRegisterLo32(ctx, 6)
+                      << " a3=0x" << ps2TraceGuestRegisterLo32(ctx, 7)
+                      << std::dec << std::endl;
+        }
+    }
+    if (touchesJ)
+    {
+        static std::atomic<uint32_t> renderBufferWatchLogCount{0};
+        if (renderBufferWatchLogCount.fetch_add(1, std::memory_order_relaxed) < 4096u)
+        {
+            std::cerr << "[xmen-watch:89b000] op=" << op
+                      << " addr=0x" << std::hex << guestAddr
+                      << " size=0x" << size
+                      << " lo=0x" << valueLo
+                      << " hi=0x" << valueHi
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      << " ra=0x" << ps2TraceGuestRegisterLo32(ctx, 31)
+                      << " sp=0x" << ps2TraceGuestRegisterLo32(ctx, 29)
+                      << std::dec << std::endl;
+        }
+    }
+    if (touchesI)
+    {
+        static std::atomic<uint32_t> objectWatchLogCount{0};
+        if (objectWatchLogCount.fetch_add(1, std::memory_order_relaxed) < 2048u)
+        {
+            std::cerr << "[xmen-watch:b1a870] op=" << op
+                      << " addr=0x" << std::hex << guestAddr
+                      << " size=0x" << size
+                      << " lo=0x" << valueLo
+                      << " hi=0x" << valueHi
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      << " ra=0x" << ps2TraceGuestRegisterLo32(ctx, 31)
+                      << std::dec << std::endl;
+        }
+    }
+    if (touchesH)
+    {
+        static std::atomic<uint32_t> factoryWatchLogCount{0};
+        if (factoryWatchLogCount.fetch_add(1, std::memory_order_relaxed) < 256u)
+        {
+            std::cerr << "[xmen-watch:746ff0] op=" << op
+                      << " addr=0x" << std::hex << guestAddr
+                      << " size=0x" << size
+                      << " lo=0x" << valueLo
+                      << " hi=0x" << valueHi
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      << " ra=0x" << ps2TraceGuestRegisterLo32(ctx, 31)
+                      << std::dec << std::endl;
+        }
+    }
+    if ((touchesA || touchesB || touchesC || touchesD || touchesE || touchesF || touchesG) && watchLogCount.fetch_add(1, std::memory_order_relaxed) < 8192u)
+    {
+        const char *tag = touchesG ? "[xmen-watch:897460] op="
+                          : touchesF ? "[xmen-watch:900410] op="
+                          : touchesE ? "[xmen-watch:745c78] op="
+                          : touchesD ? "[xmen-watch:747250] op="
+                          : touchesC ? "[xmen-watch:6f2b50] op="
+                          : touchesB ? "[xmen-watch:741e20] op="
+                                     : "[xmen-watch:898ef0] op=";
+        std::cerr << tag << op
+                  << " addr=0x" << std::hex << guestAddr
+                  << " size=0x" << size
+                  << " lo=0x" << valueLo
+                  << " hi=0x" << valueHi
+                  << " pc=0x" << (ctx ? ctx->pc : 0u)
+                  << " ra=0x" << ps2TraceGuestRegisterLo32(ctx, 31)
+                  << std::dec << std::endl;
+    }
     // TODO we dont need this anymore so on next release it will be deleted
 }
 
@@ -281,11 +572,144 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
                                     const char *op,
                                     const R5900Context *ctx)
 {
-    (void)rdram;
-    (void)guestAddr;
-    (void)size;
-    (void)op;
-    (void)ctx;
+    static std::atomic<uint32_t> rangeWatchLogCount{0};
+    constexpr uint32_t watchStartD = 0x00747250u;
+    constexpr uint32_t watchEndD = 0x007472B0u;
+    constexpr uint32_t watchStartE = 0x00745C78u;
+    constexpr uint32_t watchEndE = 0x00745C7Cu;
+    constexpr uint32_t watchStartF = 0x00900410u;
+    constexpr uint32_t watchEndF = 0x00900430u;
+    constexpr uint32_t watchStartG = 0x00897460u;
+    constexpr uint32_t watchEndG = 0x00898EE4u;
+    constexpr uint32_t watchStartH = 0x00746FF0u;
+    constexpr uint32_t watchEndH = 0x00746FF4u;
+    constexpr uint32_t watchStartI = 0x00B1A870u;
+    constexpr uint32_t watchEndI = 0x00B1AAA0u;
+    constexpr uint32_t watchStartJ = 0x0089B000u;
+    constexpr uint32_t watchEndJ = 0x0089B010u;
+    static const uint32_t watchStartK = [] {
+        const char* value = std::getenv("PS2X_WATCH_START_K");
+        return value && *value
+            ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) & PS2_RAM_MASK
+            : 0x00720A4Cu;
+    }();
+    static const uint32_t watchSizeK = [] {
+        const char* value = std::getenv("PS2X_WATCH_SIZE_K");
+        return value && *value
+            ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0))
+            : 0x40u;
+    }();
+    const uint64_t watchEndK = static_cast<uint64_t>(watchStartK) + watchSizeK;
+    const uint64_t writeEnd = static_cast<uint64_t>(guestAddr) + static_cast<uint64_t>(size);
+    const bool touchesD = guestAddr < watchEndD && writeEnd > watchStartD;
+    const bool touchesE = guestAddr < watchEndE && writeEnd > watchStartE;
+    const bool touchesF = guestAddr < watchEndF && writeEnd > watchStartF;
+    const bool touchesG = guestAddr < watchEndG && writeEnd > watchStartG;
+    const bool touchesH = guestAddr < watchEndH && writeEnd > watchStartH;
+    const bool touchesI = guestAddr < watchEndI && writeEnd > watchStartI;
+    const bool touchesJ = guestAddr < watchEndJ && writeEnd > watchStartJ;
+    const uint32_t guestPhys = guestAddr & PS2_RAM_MASK;
+    const uint64_t writePhysEnd = static_cast<uint64_t>(guestPhys) + size;
+    const bool touchesK = guestPhys < watchEndK && writePhysEnd > watchStartK;
+    if (touchesK)
+    {
+        static std::atomic<uint32_t> dynamicRangeWatchLogCount{0};
+        if (dynamicRangeWatchLogCount.fetch_add(1, std::memory_order_relaxed) < 256u)
+        {
+            const uint32_t sampleAddr = std::max(guestPhys, watchStartK);
+            uint32_t sample = 0u;
+            if (rdram && sampleAddr + sizeof(sample) <= PS2_RAM_SIZE)
+            {
+                std::memcpy(&sample, rdram + sampleAddr, sizeof(sample));
+            }
+            std::cerr << "[xmen-range-watch:dynamic-k] range=0x" << std::hex << watchStartK
+                      << "+0x" << watchSizeK
+                      << " op=" << op
+                      << " addr=0x" << guestAddr
+                      << " size=0x" << size
+                      << " sample-addr=0x" << sampleAddr
+                      << " sample=0x" << sample
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      << " ra=0x" << ps2TraceGuestRegisterLo32(ctx, 31)
+                      << " sp=0x" << ps2TraceGuestRegisterLo32(ctx, 29)
+                      << std::dec << std::endl;
+        }
+    }
+    if (touchesJ)
+    {
+        static std::atomic<uint32_t> renderBufferRangeWatchLogCount{0};
+        if (renderBufferRangeWatchLogCount.fetch_add(1, std::memory_order_relaxed) < 512u)
+        {
+            uint32_t sample = 0u;
+            if (rdram && watchStartJ + sizeof(sample) <= PS2_RAM_SIZE)
+            {
+                std::memcpy(&sample, rdram + watchStartJ, sizeof(sample));
+            }
+            std::cerr << "[xmen-range-watch:89b000] op=" << op
+                      << " addr=0x" << std::hex << guestAddr
+                      << " size=0x" << size
+                      << " sample=0x" << sample
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      << " ra=0x" << ps2TraceGuestRegisterLo32(ctx, 31)
+                      << " sp=0x" << ps2TraceGuestRegisterLo32(ctx, 29)
+                      << std::dec << std::endl;
+        }
+    }
+    if (touchesI)
+    {
+        static std::atomic<uint32_t> objectRangeWatchLogCount{0};
+        if (objectRangeWatchLogCount.fetch_add(1, std::memory_order_relaxed) < 256u)
+        {
+            uint32_t sample = 0u;
+            if (rdram && watchStartI + sizeof(sample) <= PS2_RAM_SIZE)
+            {
+                std::memcpy(&sample, rdram + watchStartI, sizeof(sample));
+            }
+            std::cerr << "[xmen-range-watch:b1a870] op=" << op
+                      << " addr=0x" << std::hex << guestAddr
+                      << " size=0x" << size
+                      << " sample=0x" << sample
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      << " ra=0x" << ps2TraceGuestRegisterLo32(ctx, 31)
+                      << std::dec << std::endl;
+        }
+    }
+    if (touchesH)
+    {
+        static std::atomic<uint32_t> factoryRangeWatchLogCount{0};
+        if (factoryRangeWatchLogCount.fetch_add(1, std::memory_order_relaxed) < 256u)
+        {
+            uint32_t sample = 0u;
+            if (rdram && watchStartH + sizeof(sample) <= PS2_RAM_SIZE)
+            {
+                std::memcpy(&sample, rdram + watchStartH, sizeof(sample));
+            }
+            std::cerr << "[xmen-range-watch:746ff0] op=" << op
+                      << " addr=0x" << std::hex << guestAddr
+                      << " size=0x" << size
+                      << " sample=0x" << sample
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      << " ra=0x" << ps2TraceGuestRegisterLo32(ctx, 31)
+                      << std::dec << std::endl;
+        }
+    }
+    if ((touchesD || touchesE || touchesF || touchesG) && rangeWatchLogCount.fetch_add(1, std::memory_order_relaxed) < 1024u)
+    {
+        const uint32_t sampleAddr = touchesG ? watchStartG : touchesF ? watchStartF : touchesE ? watchStartE : watchStartD;
+        uint32_t sample = 0u;
+        if (rdram && sampleAddr + sizeof(sample) <= PS2_RAM_SIZE)
+        {
+            std::memcpy(&sample, rdram + sampleAddr, sizeof(sample));
+        }
+        std::cerr << (touchesG ? "[xmen-range-watch:897460] op=" : touchesF ? "[xmen-range-watch:900410] op=" : touchesE ? "[xmen-range-watch:745c78] op=" : "[xmen-range-watch:747250] op=")
+                  << op
+                  << " addr=0x" << std::hex << guestAddr
+                  << " size=0x" << size
+                  << " sample=0x" << sample
+                  << " pc=0x" << (ctx ? ctx->pc : 0u)
+                  << " ra=0x" << ps2TraceGuestRegisterLo32(ctx, 31)
+                  << std::dec << std::endl;
+    }
     // TODO we dont need this anymore so on next release it will be deleted
 }
 
@@ -391,6 +815,7 @@ public:
     uint32_t guestMalloc(uint32_t size, uint32_t alignment = 16u);
     uint32_t guestCalloc(uint32_t count, uint32_t size, uint32_t alignment = 16u);
     uint32_t guestRealloc(uint32_t guestAddr, uint32_t newSize, uint32_t alignment = 16u);
+    uint32_t guestAllocationRemainingSize(uint32_t guestAddr) const;
     void guestFree(uint32_t guestAddr);
     uint32_t guestHeapBase() const;
     uint32_t guestHeapEnd() const;

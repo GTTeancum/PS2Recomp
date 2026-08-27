@@ -394,6 +394,15 @@ void register_ps2_iop_tests()
                         "core MCSERV should remain active with a game profile");
 
             error.clear();
+            t.IsTrue(subsystem.configure({"SLUS_206.56", 0u, 0u}, &error),
+                     "X-Men Legends profile should configure");
+            snapshot = subsystem.debugSnapshot();
+            t.Equals(snapshot.activeProfile, std::string("xmen-legends-us"),
+                     "X-Men Legends ELF should select its built-in profile");
+            t.IsNotNull(findService(snapshot, "X-Men Legends CRI DTX"),
+                        "X-Men Legends profile should register its Sofdec transport");
+
+            error.clear();
             t.IsTrue(subsystem.configure({"slus_203.88", 0u, 0u}, &error),
                      "Fatal Frame profile should configure after a different game");
             snapshot = subsystem.debugSnapshot();
@@ -438,6 +447,63 @@ void register_ps2_iop_tests()
             (void)subsystemA.handleRpc(request);
             t.Equals(hostA.readWord(0x1004u), 1u,
                      "reset should restore per-instance service state");
+        });
+
+        tc.Run("X-Men ZAUDIO allocates and accepts chunked sample banks", [](TestCase &t)
+        {
+            FakeIopHost host(0x20000u);
+            ps2x::iop::IopSubsystem subsystem(host);
+            std::string error;
+            t.IsTrue(subsystem.configure({"SLUS_206.56", 0u, 0u}, &error),
+                     "X-Men Legends profile should configure");
+
+            constexpr uint32_t kSendAddress = 0x1000u;
+            constexpr uint32_t kReceiveAddress = 0x2000u;
+            ps2x::iop::RpcRequest request{};
+            request.sid = 0x47u;
+            request.send = {kSendAddress, 8u};
+            request.receive = {kReceiveAddress, 0x200u};
+            const std::array<uint32_t, 2> initialize{1u, 0x8825C0u};
+            t.IsTrue(host.writeGuest(kSendAddress, initialize.data(), sizeof(initialize)),
+                     "ZAUDIO initialize packet should fit in guest memory");
+            t.IsTrue(subsystem.handleRpc(request).handled,
+                     "ZAUDIO initialize should be handled by the X-Men profile");
+            t.Equals(host.readWord(kReceiveAddress), 1u,
+                     "ZAUDIO initialize should report success");
+
+            constexpr uint32_t kBankSize = 0x51B40u;
+            request.function = 2u;
+            request.send.size = sizeof(uint32_t);
+            t.IsTrue(host.writeWord(kSendAddress, kBankSize),
+                     "sample-bank size should fit in guest memory");
+            t.IsTrue(subsystem.handleRpc(request).handled,
+                     "ZAUDIO sample allocation should be handled");
+            const uint32_t handle = host.readWord(kReceiveAddress);
+            const uint32_t spuAddress = host.readWord(kReceiveAddress + sizeof(uint32_t));
+            t.IsTrue(handle != 0u && handle != kBankSize,
+                     "sample allocation should return a real synthetic handle, not stale request data");
+            t.IsTrue(spuAddress != 0u,
+                     "sample allocation should return a synthetic SPU address");
+
+            std::array<uint8_t, 0x440u> upload{};
+            std::memcpy(upload.data(), &handle, sizeof(handle));
+            constexpr uint32_t kUploadOffset = 0u;
+            std::memcpy(upload.data() + sizeof(handle), &kUploadOffset, sizeof(kUploadOffset));
+            t.IsTrue(host.writeGuest(kSendAddress, upload.data(), upload.size()),
+                     "ZAUDIO upload packet should fit in guest memory");
+            request.function = 4u;
+            request.send.size = static_cast<uint32_t>(upload.size());
+            request.receive = {};
+            t.IsTrue(subsystem.handleRpc(request).handled,
+                     "ZAUDIO sample upload should be handled");
+            t.Equals(host.lastAudioSid, 0x47u,
+                     "ZAUDIO calls should reach the host audio backend");
+            t.Equals(host.lastAudioFunction, 4u,
+                     "the host audio backend should receive the upload command");
+
+            const ps2x::iop::DebugSnapshot snapshot = subsystem.debugSnapshot();
+            const ps2x::iop::DebugService *service = findService(snapshot, "X-Men Legends ZAUDIO");
+            t.IsNotNull(service, "X-Men profile should expose ZAUDIO diagnostics");
         });
 
         tc.Run("LotR sound update completes queued PlayStream slots", [](TestCase &t)
@@ -608,6 +674,55 @@ void register_ps2_iop_tests()
             }
             t.Equals(metricValue(*service, "sjrmt_objects"), uint64_t{0},
                      "reset should clear CRI object maps");
+        });
+
+        tc.Run("X-Men CRI acknowledges DMA to an opaque IOP address", [](TestCase &t)
+        {
+            FakeIopHost host(0x02000000u);
+            ps2x::iop::IopSubsystem subsystem(host);
+            std::string error;
+            t.IsTrue(subsystem.configure({"SLUS_206.56", 0u, 0u}, &error),
+                     "X-Men Legends profile should configure");
+
+            constexpr uint32_t kSendAddress = 0x2000u;
+            constexpr uint32_t kReceiveAddress = 0x2100u;
+            constexpr uint32_t kEeWorkAddress = 0x4000u;
+            constexpr uint32_t kIopWorkAddress = 0x04041980u;
+            constexpr uint32_t kWorkSize = 0x880u;
+            constexpr uint32_t kFooterAddress = kEeWorkAddress + kWorkSize - sizeof(uint32_t);
+
+            host.writeWord(kSendAddress + 0u, 1u);
+            host.writeWord(kSendAddress + 4u, kEeWorkAddress);
+            host.writeWord(kSendAddress + 8u, kIopWorkAddress);
+            host.writeWord(kSendAddress + 12u, kWorkSize);
+            host.writeWord(kFooterAddress, 1u);
+
+            ps2x::iop::RpcRequest request{};
+            request.sid = 0x90000200u;
+            request.function = 2u;
+            request.send = {kSendAddress, 16u};
+            request.receive = {kReceiveAddress, sizeof(uint32_t)};
+            t.IsTrue(subsystem.handleRpc(request).handled,
+                     "X-Men CRI transport creation should be handled");
+
+            subsystem.onSifTransfer({ps2x::iop::SifTransferKind::SetDma,
+                                     ps2x::iop::SifTransferPhase::AfterCopy,
+                                     kEeWorkAddress,
+                                     kIopWorkAddress,
+                                     kWorkSize});
+            t.Equals(host.readWord(kFooterAddress), 2u,
+                     "the CRI completion ticket should advance after the DMA");
+
+            const ps2x::iop::DebugSnapshot snapshot = subsystem.debugSnapshot();
+            const ps2x::iop::DebugService *service =
+                findService(snapshot, "X-Men Legends CRI DTX");
+            if (!service)
+            {
+                t.Fail("X-Men CRI service should be visible in the debug snapshot");
+                return;
+            }
+            t.Equals(metricValue(*service, "dma_acks"), uint64_t{1},
+                     "the X-Men CRI service should count the matched DMA");
         });
 
         tc.Run("reset closes profile-owned host file handles", [](TestCase &t)

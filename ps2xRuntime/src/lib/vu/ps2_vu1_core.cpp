@@ -16,6 +16,88 @@
 
 namespace
 {
+    thread_local bool xmenTraceVu1Program = false;
+
+    struct XmenTitleVuTrace
+    {
+        bool active = false;
+        uint64_t tick = 0u;
+        uint32_t executionIndex = 0u;
+        uint32_t xgkickStarts = 0u;
+        uint32_t xgkickFinishes = 0u;
+        uint64_t xgkickBytes = 0u;
+    };
+
+    thread_local XmenTitleVuTrace xmenTitleVuTrace{};
+
+    struct XmenGameplayVuSummary
+    {
+        bool active = false;
+        uint64_t tick = 0u;
+        uint64_t startCycle = 0u;
+        uint32_t startPc = 0u;
+        uint32_t top = 0u;
+        uint32_t itop = 0u;
+        uint32_t slices = 0u;
+        uint32_t xgkickStarts = 0u;
+        uint32_t xgkickFinishes = 0u;
+        uint64_t xgkickBytes = 0u;
+        uint32_t largestXgkickBytes = 0u;
+        uint32_t largestXgkickSource = 0u;
+        uint32_t stores = 0u;
+        uint32_t outputStores = 0u;
+        uint32_t tagStores = 0u;
+        uint32_t minStoreAddress = UINT32_MAX;
+        uint32_t maxStoreAddress = 0u;
+        uint64_t startTagLo = 0u;
+        uint64_t endTagLo = 0u;
+    };
+
+    thread_local XmenGameplayVuSummary xmenGameplayVuSummary{};
+
+    void finishXmenGameplayVuSummary(const VU1State &state, uint64_t endCycle)
+    {
+        if (!xmenGameplayVuSummary.active)
+            return;
+
+        static uint32_t traceCount = 0u;
+        if (traceCount++ < 256u)
+        {
+            std::fprintf(stdout,
+                         "[xmen-gameplay-vu] tick=%llu start=0x%x top=0x%x itop=0x%x "
+                         "cycles=%llu slices=%u end=0x%x kicks=%u/%u bytes=%llu "
+                         "largest=%u@0x%x stores=%u range=0x%x..0x%x output=%u tagStores=%u "
+                         "tag=%016llx->%016llx status=0x%x mac=0x%x clip=0x%x q=%g\n",
+                         static_cast<unsigned long long>(xmenGameplayVuSummary.tick),
+                         xmenGameplayVuSummary.startPc,
+                         xmenGameplayVuSummary.top,
+                         xmenGameplayVuSummary.itop,
+                         static_cast<unsigned long long>(endCycle - xmenGameplayVuSummary.startCycle),
+                         xmenGameplayVuSummary.slices,
+                         state.pc,
+                         xmenGameplayVuSummary.xgkickStarts,
+                         xmenGameplayVuSummary.xgkickFinishes,
+                         static_cast<unsigned long long>(xmenGameplayVuSummary.xgkickBytes),
+                         xmenGameplayVuSummary.largestXgkickBytes,
+                         xmenGameplayVuSummary.largestXgkickSource,
+                         xmenGameplayVuSummary.stores,
+                         xmenGameplayVuSummary.minStoreAddress == UINT32_MAX
+                             ? 0u
+                             : xmenGameplayVuSummary.minStoreAddress,
+                         xmenGameplayVuSummary.maxStoreAddress,
+                         xmenGameplayVuSummary.outputStores,
+                         xmenGameplayVuSummary.tagStores,
+                         static_cast<unsigned long long>(xmenGameplayVuSummary.startTagLo),
+                         static_cast<unsigned long long>(xmenGameplayVuSummary.endTagLo),
+                         state.status,
+                         state.mac,
+                         state.clip,
+                         state.q);
+            std::fflush(stdout);
+        }
+        xmenGameplayVuSummary = {};
+    }
+
     constexpr uint8_t laneForComponent(uint32_t component)
     {
         return static_cast<uint8_t>(1u << (3u - component));
@@ -98,6 +180,7 @@ void VU1Interpreter::reset()
     m_state.q = 1.0f;
     m_state.r = 0x3F800000u;
     m_cycle = 0;
+    m_running = false;
     resetScheduler();
 }
 
@@ -654,6 +737,25 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
 
 void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
 {
+    if (xmenGameplayVuSummary.active)
+    {
+        ++xmenGameplayVuSummary.stores;
+        xmenGameplayVuSummary.minStoreAddress =
+            std::min(xmenGameplayVuSummary.minStoreAddress, address);
+        xmenGameplayVuSummary.maxStoreAddress =
+            std::max(xmenGameplayVuSummary.maxStoreAddress, address);
+        if (address >= 0x490u && address < 0x1000u)
+            ++xmenGameplayVuSummary.outputStores;
+        if (address == 0x490u)
+            ++xmenGameplayVuSummary.tagStores;
+    }
+    if (xmenTraceVu1Program)
+    {
+        std::fprintf(stderr,
+                     "[xmen-vu1:store] cycle=%llu pc=0x%x address=0x%x mask=0x%x words=%08x,%08x,%08x,%08x\n",
+                     static_cast<unsigned long long>(m_cycle), m_state.pc, address,
+                     laneMask, words[0], words[1], words[2], words[3]);
+    }
     for (PendingStore &store : m_storePipeline)
     {
         if (!store.valid)
@@ -919,6 +1021,81 @@ void VU1Interpreter::finishXgkick()
     if (!m_xgkick.active)
         return;
 
+    static uint32_t finishTraceCount = 0u;
+    if (xmenTraceVu1Program || finishTraceCount++ < 32u)
+    {
+        uint64_t tagLo = 0u;
+        uint64_t tagHi = 0u;
+        std::memcpy(&tagLo, m_xgkick.packet.data(), sizeof(tagLo));
+        std::memcpy(&tagHi, m_xgkick.packet.data() + sizeof(tagLo), sizeof(tagHi));
+        std::fprintf(stderr,
+                     "[vu1:xgkick-finish] source=0x%x bytes=%u copied=%u cycle=%llu tagLo=0x%016llx tagHi=0x%016llx",
+                     m_xgkick.sourceAddress,
+                     m_xgkick.totalBytes,
+                     m_xgkick.copiedBytes,
+                     static_cast<unsigned long long>(m_cycle),
+                     static_cast<unsigned long long>(tagLo),
+                     static_cast<unsigned long long>(tagHi));
+        const uint32_t payloadCount = (m_xgkick.totalBytes - 16u) / 16u;
+        for (uint32_t i = 0u; i < payloadCount; ++i)
+        {
+            uint64_t payloadLo = 0u;
+            uint64_t payloadHi = 0u;
+            std::memcpy(&payloadLo, m_xgkick.packet.data() + 16u + i * 16u, sizeof(payloadLo));
+            std::memcpy(&payloadHi, m_xgkick.packet.data() + 24u + i * 16u, sizeof(payloadHi));
+            std::fprintf(stderr,
+                         " ad%u=%02llx:%016llx",
+                         i,
+                         static_cast<unsigned long long>(payloadHi & 0xFFu),
+                         static_cast<unsigned long long>(payloadLo));
+        }
+        std::fprintf(stderr, "\n");
+    }
+
+    if (xmenTitleVuTrace.active)
+    {
+        uint64_t tagLo = 0u;
+        uint64_t tagHi = 0u;
+        std::memcpy(&tagLo, m_xgkick.packet.data(), sizeof(tagLo));
+        std::memcpy(&tagHi, m_xgkick.packet.data() + sizeof(tagLo), sizeof(tagHi));
+        ++xmenTitleVuTrace.xgkickFinishes;
+        xmenTitleVuTrace.xgkickBytes += m_xgkick.totalBytes;
+        if (xmenTitleVuTrace.xgkickFinishes <= 1u)
+        {
+            std::fprintf(stdout,
+                         "[xmen-title-vu-xgkick] exec=%u tick=%llu source=0x%x bytes=%u copied=%u tagLo=0x%016llx tagHi=0x%016llx\n",
+                         xmenTitleVuTrace.executionIndex,
+                         static_cast<unsigned long long>(xmenTitleVuTrace.tick),
+                         m_xgkick.sourceAddress,
+                         m_xgkick.totalBytes,
+                         m_xgkick.copiedBytes,
+                         static_cast<unsigned long long>(tagLo),
+                         static_cast<unsigned long long>(tagHi));
+        }
+    }
+    if (xmenGameplayVuSummary.active)
+    {
+        ++xmenGameplayVuSummary.xgkickFinishes;
+        xmenGameplayVuSummary.xgkickBytes += m_xgkick.totalBytes;
+        if (m_xgkick.totalBytes > xmenGameplayVuSummary.largestXgkickBytes)
+        {
+            xmenGameplayVuSummary.largestXgkickBytes = m_xgkick.totalBytes;
+            xmenGameplayVuSummary.largestXgkickSource = m_xgkick.sourceAddress;
+        }
+    }
+
+    static uint32_t submitTraceCount = 0u;
+    if (xmenTraceVu1Program || submitTraceCount++ < 64u)
+    {
+        std::fprintf(stderr,
+                     "[vu1:xgkick-submit] source=0x%x bytes=%u copied=%u memory=%p gs=%p\n",
+                     m_xgkick.sourceAddress,
+                     m_xgkick.totalBytes,
+                     m_xgkick.copiedBytes,
+                     static_cast<void *>(m_activeMemory),
+                     static_cast<void *>(m_activeGs));
+    }
+
     if (m_activeMemory)
         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
     else if (m_activeGs)
@@ -932,6 +1109,20 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
         return;
 
     const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
+    if (xmenTitleVuTrace.active)
+        ++xmenTitleVuTrace.xgkickStarts;
+    if (xmenGameplayVuSummary.active)
+        ++xmenGameplayVuSummary.xgkickStarts;
+    static uint32_t startTraceCount = 0u;
+    if (xmenTraceVu1Program || startTraceCount++ < 32u)
+    {
+        std::fprintf(stderr,
+                     "[vu1:xgkick-start] qword=0x%x source=0x%x pc=0x%x cycle=%llu\n",
+                     qwordAddress,
+                     sourceAddress,
+                     m_state.pc,
+                     static_cast<unsigned long long>(m_cycle));
+    }
     m_xgkick = {};
     m_xgkick.active = true;
     m_xgkick.sourceAddress = sourceAddress;
@@ -1590,6 +1781,104 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                              uint32_t startPC, uint32_t top, uint32_t itop,
                              uint32_t maxCycles)
 {
+    static std::atomic<uint32_t> titleExecutionCount{0u};
+    const uint64_t titleTick = memory
+        ? memory->gs().vsyncTick.load(std::memory_order_relaxed)
+        : 0u;
+    if (m_unit == Unit::VU1 && titleTick == 635u)
+    {
+        xmenGameplayVuSummary = {};
+        xmenGameplayVuSummary.active = true;
+        xmenGameplayVuSummary.tick = titleTick;
+        xmenGameplayVuSummary.startCycle = m_cycle;
+        xmenGameplayVuSummary.startPc = startPC;
+        xmenGameplayVuSummary.top = top;
+        xmenGameplayVuSummary.itop = itop;
+        xmenGameplayVuSummary.slices = 1u;
+        if (vuData && dataSize >= 0x498u)
+        {
+            std::memcpy(&xmenGameplayVuSummary.startTagLo,
+                        vuData + 0x490u,
+                        sizeof(xmenGameplayVuSummary.startTagLo));
+            xmenGameplayVuSummary.endTagLo = xmenGameplayVuSummary.startTagLo;
+        }
+    }
+    uint32_t titleExecutionIndex = UINT32_MAX;
+    if (m_unit == Unit::VU1 && titleTick >= 1910u && titleTick <= 1960u)
+    {
+        titleExecutionIndex =
+            titleExecutionCount.fetch_add(1u, std::memory_order_relaxed);
+    }
+    const bool traceTitleExecution = titleExecutionIndex < 512u;
+    if (traceTitleExecution)
+    {
+        xmenTitleVuTrace = {};
+        xmenTitleVuTrace.active = true;
+        xmenTitleVuTrace.tick = titleTick;
+        xmenTitleVuTrace.executionIndex = titleExecutionIndex;
+    }
+
+    static bool dumpedFirstMainProgram = false;
+    if (m_unit == Unit::VU1 && startPC == 0u && !dumpedFirstMainProgram)
+    {
+        dumpedFirstMainProgram = true;
+        for (uint32_t pc = 0u; pc <= 0x230u && pc + 8u <= codeSize; pc += 8u)
+        {
+            uint32_t lower = 0u;
+            uint32_t upper = 0u;
+            std::memcpy(&lower, vuCode + pc, sizeof(lower));
+            std::memcpy(&upper, vuCode + pc + 4u, sizeof(upper));
+            std::fprintf(stderr, "[vu1:main-code] pc=0x%04x lower=%08x upper=%08x\n",
+                         pc, lower, upper);
+        }
+        for (const uint32_t qword : {0x4Eu, 0x4Fu, 0x78u, 0x79u})
+        {
+            uint32_t words[4]{};
+            const uint32_t address = qword * 16u;
+            if (address + sizeof(words) <= dataSize)
+                std::memcpy(words, vuData + address, sizeof(words));
+            std::fprintf(stderr,
+                         "[vu1:main-data] qword=0x%03x words=%08x,%08x,%08x,%08x\n",
+                         qword, words[0], words[1], words[2], words[3]);
+        }
+    }
+    static uint32_t tracedXmenMeshProgram = 0u;
+    static uint32_t tracedXmenGameplayKickPrograms = 0u;
+    const bool traceMeshProgram =
+        m_unit == Unit::VU1 && startPC == 0x230u && tracedXmenMeshProgram < 8u;
+    const bool traceGameplayKickProgram =
+        m_unit == Unit::VU1 && startPC == 0x230u && titleTick >= 640u &&
+        tracedXmenGameplayKickPrograms < 24u;
+    const bool traceThisProgram = traceMeshProgram || traceGameplayKickProgram;
+    if (traceThisProgram)
+    {
+        if (traceMeshProgram)
+            ++tracedXmenMeshProgram;
+        if (traceGameplayKickProgram)
+            ++tracedXmenGameplayKickPrograms;
+        xmenTraceVu1Program = true;
+        std::fprintf(stderr,
+                     "[xmen-vu1:begin] kind=%s start=0x%x top=0x%x itop=0x%x\n",
+                     traceGameplayKickProgram ? "gameplay-kick" : "mesh",
+                     startPC, top, itop);
+
+        const auto dumpDataRange = [&](uint32_t firstQword, uint32_t lastQword)
+        {
+            for (uint32_t qword = firstQword; qword <= lastQword; ++qword)
+            {
+                uint32_t words[4]{};
+                const uint32_t sourceQword = qword & 0x3FFu;
+                const uint32_t address = sourceQword * 16u;
+                if (address + sizeof(words) <= dataSize)
+                    std::memcpy(words, vuData + address, sizeof(words));
+                std::fprintf(stderr,
+                             "[xmen-vu1:input] qword=0x%x words=%08x,%08x,%08x,%08x\n",
+                             sourceQword, words[0], words[1], words[2], words[3]);
+            }
+        };
+
+        dumpDataRange(top, top + 7u);
+    }
     resetScheduler();
     m_state.pc = startPC & microAddressMask();
     m_state.ebit = false;
@@ -1605,7 +1894,57 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     m_state.vf[0][1] = 0.0f;
     m_state.vf[0][2] = 0.0f;
     m_state.vf[0][3] = 1.0f;
+    const uint64_t startCycle = m_cycle;
+    m_running = true;
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+    const uint64_t elapsedCycles = m_cycle - startCycle;
+    if (xmenGameplayVuSummary.active && !m_running)
+    {
+        if (vuData && dataSize >= 0x498u)
+            std::memcpy(&xmenGameplayVuSummary.endTagLo,
+                        vuData + 0x490u,
+                        sizeof(xmenGameplayVuSummary.endTagLo));
+        finishXmenGameplayVuSummary(m_state, m_cycle);
+    }
+    if (traceTitleExecution)
+    {
+        std::fprintf(stdout,
+                     "[xmen-title-vu-exec] index=%u tick=%llu start=0x%x top=0x%x itop=0x%x cycles=%llu/%u end=0x%x starts=%u finishes=%u bytes=%llu stop=%u ebit=%u\n",
+                     xmenTitleVuTrace.executionIndex,
+                     static_cast<unsigned long long>(titleTick),
+                     startPC,
+                     top,
+                     itop,
+                     static_cast<unsigned long long>(elapsedCycles),
+                     maxCycles,
+                     m_state.pc,
+                     xmenTitleVuTrace.xgkickStarts,
+                     xmenTitleVuTrace.xgkickFinishes,
+                     static_cast<unsigned long long>(xmenTitleVuTrace.xgkickBytes),
+                     m_stopRequested ? 1u : 0u,
+                     m_state.ebit ? 1u : 0u);
+        std::fflush(stdout);
+        xmenTitleVuTrace = {};
+    }
+    static uint32_t executeTraceCount = 0u;
+    if (executeTraceCount++ < 96u)
+    {
+        std::fprintf(stderr,
+            "[vu1:execute-summary] start=0x%x top=0x%x itop=0x%x cycles=%llu/%u "
+            "end-pc=0x%x stop=%u ebit=%u branch=%u target=0x%x delay=%u\n",
+            startPC, top, itop, static_cast<unsigned long long>(elapsedCycles), maxCycles,
+            m_state.pc, m_stopRequested ? 1u : 0u, m_state.ebit ? 1u : 0u,
+            m_state.branchPending ? 1u : 0u, m_state.branchTarget, m_state.branchDelay);
+    }
+    if (traceThisProgram)
+    {
+        std::fprintf(stderr,
+                     "[xmen-vu1:slice] pc=0x%x cycle=%llu running=%u status=0x%x mac=0x%x clip=0x%x q=%g\n",
+                     m_state.pc, static_cast<unsigned long long>(m_cycle),
+                     m_running ? 1u : 0u, m_state.status, m_state.mac, m_state.clip, m_state.q);
+        if (!m_running)
+            xmenTraceVu1Program = false;
+    }
 }
 
 void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
@@ -1617,13 +1956,42 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
     m_state.itop = itop;
     m_state.stoppedByD = false;
     m_state.stoppedByT = false;
+    m_running = true;
+    if (xmenGameplayVuSummary.active)
+        ++xmenGameplayVuSummary.slices;
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+    if (xmenGameplayVuSummary.active && !m_running)
+    {
+        if (vuData && dataSize >= 0x498u)
+            std::memcpy(&xmenGameplayVuSummary.endTagLo,
+                        vuData + 0x490u,
+                        sizeof(xmenGameplayVuSummary.endTagLo));
+        finishXmenGameplayVuSummary(m_state, m_cycle);
+    }
+    if (xmenTraceVu1Program && !m_running)
+    {
+        std::fprintf(stderr,
+                     "[xmen-vu1:complete] pc=0x%x cycle=%llu status=0x%x mac=0x%x clip=0x%x q=%g\n",
+                     m_state.pc, static_cast<unsigned long long>(m_cycle), m_state.status,
+                     m_state.mac, m_state.clip, m_state.q);
+        xmenTraceVu1Program = false;
+    }
 }
 
 void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                          uint8_t *vuData, uint32_t dataSize,
                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
 {
+    struct BudgetTraceEntry
+    {
+        uint32_t pc = 0;
+        uint32_t lower = 0;
+        uint32_t upper = 0;
+        int32_t vi[16]{};
+    };
+    BudgetTraceEntry budgetTrace[32]{};
+    uint32_t budgetTraceCount = 0;
+
     m_activeVuData = vuData;
     m_activeVuDataSize = dataSize;
     m_activeGs = &gs;
@@ -1637,9 +2005,104 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     {
         commitReadyPipelines();
         if (m_state.pc + 8u > codeSize)
+        {
+            programEnded = true;
             break;
+        }
 
         const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
+        BudgetTraceEntry &budgetEntry = budgetTrace[budgetTraceCount++ & 31u];
+        budgetEntry.pc = m_state.pc;
+        budgetEntry.lower = decoded.lower;
+        budgetEntry.upper = decoded.upper;
+        std::memcpy(budgetEntry.vi, m_state.vi, sizeof(budgetEntry.vi));
+        if (xmenTraceVu1Program)
+        {
+            std::fprintf(stderr,
+                         "[xmen-vu1:pair] cycle=%llu pc=0x%03x lower=%08x upper=%08x "
+                         "vi=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d "
+                         "q=%g clip=0x%x workingClip=0x%x\n",
+                         static_cast<unsigned long long>(m_cycle), m_state.pc,
+                         decoded.lower, decoded.upper,
+                         m_state.vi[1], m_state.vi[2], m_state.vi[3], m_state.vi[4],
+                         m_state.vi[5], m_state.vi[6], m_state.vi[7], m_state.vi[8],
+                         m_state.vi[9], m_state.vi[10], m_state.vi[11], m_state.vi[12],
+                         m_state.vi[13], m_state.vi[14], m_state.vi[15], m_state.q,
+                         m_state.clip, m_workingClip);
+            const auto dumpVfReads = [&](const char *slot, const InstructionUsage &usage)
+            {
+                for (uint32_t index = 0u; index < usage.vfReadCount; ++index)
+                {
+                    const VfAccess access = usage.vfRead[index];
+                    std::fprintf(stderr,
+                                 "[xmen-vu1:read] cycle=%llu pc=0x%03x slot=%s "
+                                 "vf%u mask=0x%x value=%g,%g,%g,%g\n",
+                                 static_cast<unsigned long long>(m_cycle), m_state.pc,
+                                 slot, access.reg, access.lanes,
+                                 m_state.vf[access.reg][0], m_state.vf[access.reg][1],
+                                 m_state.vf[access.reg][2], m_state.vf[access.reg][3]);
+                }
+            };
+            dumpVfReads("upper", decoded.upperUsage);
+            dumpVfReads("lower", decoded.lowerUsage);
+            if (m_state.pc >= 0x280u && m_state.pc <= 0x2B8u)
+            {
+                const uint32_t matrixBase = static_cast<uint32_t>(m_state.vi[5]);
+                std::fprintf(stderr,
+                             "[xmen-vu1:matrix-load] cycle=%llu pc=0x%03x vi5=0x%x",
+                             static_cast<unsigned long long>(m_cycle), m_state.pc, matrixBase);
+                for (uint32_t row = 0u; row < 4u; ++row)
+                {
+                    uint32_t words[4]{};
+                    const uint32_t address = ((matrixBase + row) * 16u) % dataSize;
+                    if (address + sizeof(words) <= dataSize)
+                        std::memcpy(words, vuData + address, sizeof(words));
+                    std::fprintf(stderr, " row%u=%08x,%08x,%08x,%08x",
+                                 row, words[0], words[1], words[2], words[3]);
+                }
+                std::fprintf(stderr,
+                             " vf1-4.w=%g,%g,%g,%g\n",
+                             m_state.vf[1][3], m_state.vf[2][3],
+                             m_state.vf[3][3], m_state.vf[4][3]);
+            }
+            if ((m_state.pc >= 0x2E0u && m_state.pc <= 0x340u) &&
+                (m_state.pc & 7u) == 0u)
+            {
+                uint32_t sourceWords[4]{};
+                const uint32_t sourceAddress =
+                    (static_cast<uint32_t>(m_state.vi[13]) * 16u) % dataSize;
+                if (sourceAddress + sizeof(sourceWords) <= dataSize)
+                    std::memcpy(sourceWords, vuData + sourceAddress, sizeof(sourceWords));
+                std::fprintf(stderr,
+                             "[xmen-vu1:operand] cycle=%llu pc=0x%03x "
+                             "vi9-15=%d,%d,%d,%d,%d,%d,%d vi13-qword=0x%x "
+                             "data=%08x,%08x,%08x,%08x "
+                             "vf19=%g,%g,%g,%g vf21=%g,%g,%g,%g q=%g\n",
+                             static_cast<unsigned long long>(m_cycle), m_state.pc,
+                             m_state.vi[9], m_state.vi[10], m_state.vi[11], m_state.vi[12],
+                             m_state.vi[13], m_state.vi[14], m_state.vi[15], sourceAddress / 16u,
+                             sourceWords[0], sourceWords[1], sourceWords[2], sourceWords[3],
+                             m_state.vf[19][0], m_state.vf[19][1],
+                             m_state.vf[19][2], m_state.vf[19][3],
+                             m_state.vf[21][0], m_state.vf[21][1],
+                             m_state.vf[21][2], m_state.vf[21][3], m_state.q);
+                if (m_state.pc >= 0x2F8u && m_state.pc <= 0x320u)
+                {
+                    std::fprintf(stderr,
+                                 "[xmen-vu1:matrix] cycle=%llu pc=0x%03x "
+                                 "vf1=%g,%g,%g,%g vf2=%g,%g,%g,%g "
+                                 "vf3=%g,%g,%g,%g vf4=%g,%g,%g,%g "
+                                 "vf29=%g,%g,%g,%g acc=%g,%g,%g,%g\n",
+                                 static_cast<unsigned long long>(m_cycle), m_state.pc,
+                                 m_state.vf[1][0], m_state.vf[1][1], m_state.vf[1][2], m_state.vf[1][3],
+                                 m_state.vf[2][0], m_state.vf[2][1], m_state.vf[2][2], m_state.vf[2][3],
+                                 m_state.vf[3][0], m_state.vf[3][1], m_state.vf[3][2], m_state.vf[3][3],
+                                 m_state.vf[4][0], m_state.vf[4][1], m_state.vf[4][2], m_state.vf[4][3],
+                                 m_state.vf[29][0], m_state.vf[29][1], m_state.vf[29][2], m_state.vf[29][3],
+                                 m_state.acc[0], m_state.acc[1], m_state.acc[2], m_state.acc[3]);
+                }
+            }
+        }
         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
         {
             reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
@@ -1720,6 +2183,47 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         {
             execUpper(decoded.upper);
             execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
+        }
+
+        if (xmenTraceVu1Program)
+        {
+            if (decoded.upperUsage.writesClip || decoded.lowerUsage.readsClip ||
+                decoded.lowerUsage.writesClip)
+            {
+                std::fprintf(stderr,
+                             "[xmen-vu1:clip-flags] cycle=%llu pc=0x%03x "
+                             "upperWrites=%u lowerReads=%u lowerWrites=%u "
+                             "committed=0x%x working=0x%x vi1=%d\n",
+                             static_cast<unsigned long long>(m_cycle), m_state.pc,
+                             decoded.upperUsage.writesClip ? 1u : 0u,
+                             decoded.lowerUsage.readsClip ? 1u : 0u,
+                             decoded.lowerUsage.writesClip ? 1u : 0u,
+                             m_state.clip, m_workingClip, m_state.vi[1]);
+            }
+            const auto dumpVfWrite = [&](const char *slot, const VfAccess &access)
+            {
+                if (access.reg == 0u)
+                    return;
+                std::fprintf(stderr,
+                             "[xmen-vu1:write] cycle=%llu pc=0x%03x slot=%s "
+                             "vf%u mask=0x%x value=%g,%g,%g,%g\n",
+                             static_cast<unsigned long long>(m_cycle), m_state.pc,
+                             slot, access.reg, access.lanes,
+                             m_state.vf[access.reg][0], m_state.vf[access.reg][1],
+                             m_state.vf[access.reg][2], m_state.vf[access.reg][3]);
+            };
+            dumpVfWrite("upper", decoded.upperUsage.vfWrite);
+            if (decoded.suppressedLowerVf != decoded.lowerUsage.vfWrite.reg)
+                dumpVfWrite("lower", decoded.lowerUsage.vfWrite);
+            if (decoded.upperUsage.accWrite != 0u)
+            {
+                std::fprintf(stderr,
+                             "[xmen-vu1:acc-write] cycle=%llu pc=0x%03x mask=0x%x "
+                             "value=%g,%g,%g,%g\n",
+                             static_cast<unsigned long long>(m_cycle), m_state.pc,
+                             decoded.upperUsage.accWrite,
+                             m_state.acc[0], m_state.acc[1], m_state.acc[2], m_state.acc[3]);
+            }
         }
 
         m_viBranchBackupValid = false;
@@ -1824,6 +2328,44 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             break;
     }
 
+    static bool dumpedBudgetTrace = false;
+    if (!dumpedBudgetTrace && m_cycle >= budgetEnd && !m_stopRequested)
+    {
+        dumpedBudgetTrace = true;
+        const uint32_t retained = std::min(budgetTraceCount, 32u);
+        const uint32_t first = budgetTraceCount - retained;
+        std::fprintf(stderr, "[vu1:budget-trace] entries=%u\n", retained);
+        for (uint32_t index = 0; index < retained; ++index)
+        {
+            const BudgetTraceEntry &entry = budgetTrace[(first + index) & 31u];
+            std::fprintf(stderr,
+                         "[vu1:budget-pair] pc=0x%04x lower=%08x upper=%08x "
+                         "vi=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                         entry.pc, entry.lower, entry.upper,
+                         entry.vi[1], entry.vi[2], entry.vi[3], entry.vi[4],
+                         entry.vi[5], entry.vi[6], entry.vi[7], entry.vi[8],
+                         entry.vi[9], entry.vi[10], entry.vi[11], entry.vi[12],
+                         entry.vi[13], entry.vi[14], entry.vi[15]);
+        }
+        for (uint32_t pc = 0xB90u; pc <= 0xE98u && pc + 8u <= codeSize; pc += 8u)
+        {
+            uint32_t lower = 0;
+            uint32_t upper = 0;
+            std::memcpy(&lower, vuCode + pc, sizeof(lower));
+            std::memcpy(&upper, vuCode + pc + 4u, sizeof(upper));
+            std::fprintf(stderr, "[vu1:budget-code] pc=0x%04x lower=%08x upper=%08x\n",
+                         pc, lower, upper);
+        }
+        for (uint32_t qword = 0x2E0u; qword <= 0x31Fu; ++qword)
+        {
+            uint32_t words[4]{};
+            std::memcpy(words, vuData + qword * 16u, sizeof(words));
+            std::fprintf(stderr,
+                         "[vu1:budget-data] qword=0x%03x words=%08x,%08x,%08x,%08x\n",
+                         qword, words[0], words[1], words[2], words[3]);
+        }
+    }
+
     if (programEnded)
     {
         flushPipelines();
@@ -1832,6 +2374,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         m_pendingHaltD = false;
         m_pendingHaltT = false;
     }
+    m_running = !programEnded && !m_stopRequested;
     m_state.cycles = m_cycle;
     if (useVuRounding && previousRoundingMode != -1)
         std::fesetround(previousRoundingMode);

@@ -3,6 +3,7 @@
 #include "ps2_syscalls.h"
 #include "runtime/ee_scheduler.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -62,6 +63,15 @@ namespace
     constexpr uint32_t kTimer2WaitPc = 0x00160500u;
     constexpr uint32_t kTimer2ResumePc = 0x00160510u;
     constexpr uint32_t kTimer2HandlerPc = 0x00160520u;
+    constexpr uint32_t kNestedIrqStartPc = 0x00160600u;
+    constexpr uint32_t kNestedIrqBaseResumePc = 0x00160610u;
+    constexpr uint32_t kNestedIrqHandlerPc = 0x00160620u;
+    constexpr uint32_t kNestedIrqHandlerResumePc = 0x00160630u;
+    constexpr uint32_t kStackReuseStartPc = 0x00160700u;
+    constexpr uint32_t kStackReuseWorkerPc = 0x00160710u;
+    constexpr uint32_t kStackReuseResumePc = 0x00160720u;
+    constexpr uint32_t kStackReuseHandlerPc = 0x00160730u;
+    constexpr uint32_t kStackReuseWorkerCount = 80u;
 
     constexpr uint32_t kTimer2Count = 0x10001000u;
     constexpr uint32_t kTimer2Mode = 0x10001010u;
@@ -83,6 +93,10 @@ namespace
     uint64_t g_vsyncTick = 0;
     uint64_t g_vsyncCsr = 0;
     std::atomic<bool> g_timer2Resumed{false};
+    uint32_t g_nestedIrqHandlerCalls = 0u;
+    uint32_t g_firstNestedIrqStatus = 0u;
+    std::vector<uint32_t> g_invocationStackSamples;
+    uint32_t g_stackReuseWorkersRemaining = 0u;
 
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
@@ -284,6 +298,80 @@ namespace
 
         ctx->pc = kTimer2ResumePc;
         scheduler.waitSemaphore(g_testSemaphoreId);
+    }
+
+    void schedulerNestedIrqHandlerResume(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        g_dispatchTrace.push_back(4);
+        ctx->pc = 0u;
+    }
+
+    void schedulerNestedIrqHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ++g_nestedIrqHandlerCalls;
+        g_dispatchTrace.push_back(g_nestedIrqHandlerCalls == 1u ? 2 : 3);
+        if (g_nestedIrqHandlerCalls == 1u)
+        {
+            g_firstNestedIrqStatus = ctx->cop0_status;
+            ctx->pc = kNestedIrqHandlerResumePc;
+            runtime->eeScheduler().dispatchIrq(true, 6u);
+            return;
+        }
+        ctx->pc = 0u;
+    }
+
+    void schedulerNestedIrqStart(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dispatchTrace.push_back(1);
+        runtime->eeScheduler().addIrqHandler(true, 6u, kNestedIrqHandlerPc, true, 0u, 0u, 0u);
+        ctx->pc = kNestedIrqBaseResumePc;
+        runtime->eeScheduler().dispatchIrq(true, 6u);
+    }
+
+    void schedulerNestedIrqBaseResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dispatchTrace.push_back(5);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void schedulerStackReuseHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        g_invocationStackSamples.push_back(getRegU32(ctx, 29));
+        ctx->pc = 0u;
+    }
+
+    void schedulerStackReuseWorker(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ctx->pc = kStackReuseResumePc;
+        runtime->eeScheduler().dispatchIrq(true, 7u);
+    }
+
+    void schedulerStackReuseResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ctx->pc = 0u;
+        if (--g_stackReuseWorkersRemaining == 0u)
+        {
+            runtime->requestStop();
+        }
+    }
+
+    void schedulerStackReuseStart(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        scheduler.addIrqHandler(true, 7u, kStackReuseHandlerPc, true, 0u, 0u, 0u);
+        for (uint32_t i = 0u; i < kStackReuseWorkerCount; ++i)
+        {
+            EeThreadCreateParams worker{};
+            worker.entry = kStackReuseWorkerPc;
+            worker.stack = 0x00040000u + (i * 0x100u);
+            worker.stackSize = 0x100u;
+            worker.priority = 10;
+            const int workerId = scheduler.createThread(worker);
+            scheduler.startThread(workerId, 0u, *ctx, false);
+        }
+        ctx->pc = 0u;
+        scheduler.sleepCurrent();
     }
 
     void schedulerTimer2Resume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
@@ -494,6 +582,59 @@ void register_ps2_runtime_interrupt_tests()
                 t.Equals(semaphore->count, 0, "direct handoff must not increment the semaphore count");
                 t.Equals(static_cast<uint32_t>(semaphore->waiters.size()), 0u,
                          "the awakened waiter must be removed from the semaphore queue");
+            }
+        });
+
+        tc.Run("masked IRQ raised inside a handler waits for the active handler to return", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kNestedIrqStartPc, schedulerNestedIrqStart);
+            env.runtime.registerFunction(kNestedIrqBaseResumePc, schedulerNestedIrqBaseResume);
+            env.runtime.registerFunction(kNestedIrqHandlerPc, schedulerNestedIrqHandler);
+            env.runtime.registerFunction(kNestedIrqHandlerResumePc, schedulerNestedIrqHandlerResume);
+
+            g_dispatchTrace.clear();
+            g_nestedIrqHandlerCalls = 0u;
+            g_firstNestedIrqStatus = 0u;
+            R5900Context mainContext{};
+            mainContext.pc = kNestedIrqStartPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            const std::vector<int> expected{1, 2, 4, 3, 5};
+            t.IsTrue(g_dispatchTrace == expected,
+                     "an IRQ raised under the handler's masked EIE state must not nest before its continuation");
+            t.IsTrue((g_firstNestedIrqStatus & 0x1u) != 0u,
+                     "the interrupt context should preserve architectural IE");
+            t.IsTrue((g_firstNestedIrqStatus & 0x10000u) == 0u,
+                      "the interrupt context should enter with EE EIE masked");
+        });
+
+        tc.Run("completed interrupt invocations reuse their private EE stack", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kStackReuseStartPc, schedulerStackReuseStart);
+            env.runtime.registerFunction(kStackReuseWorkerPc, schedulerStackReuseWorker);
+            env.runtime.registerFunction(kStackReuseResumePc, schedulerStackReuseResume);
+            env.runtime.registerFunction(kStackReuseHandlerPc, schedulerStackReuseHandler);
+
+            g_invocationStackSamples.clear();
+            g_stackReuseWorkersRemaining = kStackReuseWorkerCount;
+            R5900Context mainContext{};
+            mainContext.pc = kStackReuseStartPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            t.Equals(static_cast<uint32_t>(g_invocationStackSamples.size()), kStackReuseWorkerCount,
+                     "every worker should complete its interrupt invocation");
+            if (!g_invocationStackSamples.empty())
+            {
+                const uint32_t firstStack = g_invocationStackSamples.front();
+                const bool allReused = std::all_of(g_invocationStackSamples.begin(),
+                                                   g_invocationStackSamples.end(),
+                                                   [firstStack](uint32_t stack) { return stack == firstStack; });
+                t.IsTrue(allReused,
+                         "sequential invocations owned by distinct threads should recycle one completed stack block");
             }
         });
 

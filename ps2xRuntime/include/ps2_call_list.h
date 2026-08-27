@@ -156,6 +156,7 @@
     X(__malloc_lock)                          \
     X(__malloc_unlock)                        \
     X(abs)                                    \
+    X(__ieee754_acosf)                        \
     X(__ieee754_rem_pio2f)                    \
     X(__kernel_cosf)                          \
     X(__kernel_sinf)                          \

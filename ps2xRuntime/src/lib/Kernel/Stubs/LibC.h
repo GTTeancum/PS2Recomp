@@ -41,6 +41,7 @@ namespace ps2_stubs
     void __kernel_sinf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void cos(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void __kernel_cosf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void __ieee754_acosf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void __ieee754_rem_pio2f(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void tan(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void atan2(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

@@ -36,7 +36,19 @@ namespace ps2_syscalls
                                  bool interruptSafe)
         {
             EeScheduler &ee = scheduler(rdram, ctx, runtime);
-            const int result = ee.signalSemaphore(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
+            const int id = static_cast<int>(getRegU32(ctx, 4));
+            const EeSemaphore *before = ee.semaphore(id);
+            if (id >= 20)
+            {
+                std::cerr << "[ee-sema:signal] id=" << id
+                          << " count=" << (before ? before->count : -1)
+                          << " waiters=" << (before ? before->waiters.size() : 0u)
+                          << " interrupt=" << interruptSafe
+                          << " pc=0x" << std::hex << ctx->pc
+                          << " ra=0x" << getRegU32(ctx, 31)
+                          << std::dec << '\n';
+            }
+            const int result = ee.signalSemaphore(id, interruptSafe);
             setReturnS32(ctx, result);
             ee.transferIfRequested(interruptSafe);
         }
@@ -78,12 +90,24 @@ namespace ps2_syscalls
 
         // ee_sema_t from ps2sdk. The IOP attr/option/init/max ordering is not
         // accepted by the EE runtime.
-        setReturnS32(ctx,
-                     scheduler(rdram, ctx, runtime)
-                         .createSemaphore(param->init_count,
-                                          param->max_count,
-                                          param->attr,
-                                          param->option));
+        const int result = scheduler(rdram, ctx, runtime)
+                               .createSemaphore(param->init_count,
+                                                param->max_count,
+                                                param->attr,
+                                                param->option);
+        static uint32_t createLogs = 0u;
+        if (createLogs++ < 64u)
+        {
+            std::cerr << "[ee-sema:create] id=" << result
+                      << " init=" << param->init_count
+                      << " max=" << param->max_count
+                      << " attr=0x" << std::hex << param->attr
+                      << " option=0x" << param->option
+                      << " pc=0x" << ctx->pc
+                      << " ra=0x" << getRegU32(ctx, 31)
+                      << std::dec << '\n';
+        }
+        setReturnS32(ctx, result);
     }
 
     void DeleteSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -108,7 +132,19 @@ namespace ps2_syscalls
 
     void WaitSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        scheduler(rdram, ctx, runtime).waitSemaphore(static_cast<int>(getRegU32(ctx, 4)));
+        const int id = static_cast<int>(getRegU32(ctx, 4));
+        const EeSemaphore *object = runtime->eeScheduler().semaphore(id);
+        static uint32_t waitLogs = 0u;
+        if (id >= 20 || waitLogs++ < 64u)
+        {
+            std::cerr << "[ee-sema:wait] id=" << id
+                      << " count=" << (object ? object->count : -1)
+                      << " waiters=" << (object ? object->waiters.size() : 0u)
+                      << " pc=0x" << std::hex << ctx->pc
+                      << " ra=0x" << getRegU32(ctx, 31)
+                      << std::dec << '\n';
+        }
+        scheduler(rdram, ctx, runtime).waitSemaphore(id);
     }
 
     void PollSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

@@ -7,12 +7,36 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 
 namespace
 {
     static constexpr uint32_t kHostFrameWidth = 640u;
+
+    bool writePresentationPpm(const std::string &path,
+                              const std::vector<uint8_t> &pixels,
+                              uint32_t width,
+                              uint32_t height)
+    {
+        if (pixels.size() < static_cast<size_t>(width) * height * 4u)
+            return false;
+
+        std::ofstream out(path, std::ios::binary);
+        if (!out)
+            return false;
+        out << "P6\n" << width << ' ' << height << "\n255\n";
+        for (uint32_t y = 0u; y < height; ++y)
+        {
+            for (uint32_t x = 0u; x < width; ++x)
+            {
+                const size_t offset = (static_cast<size_t>(y) * width + x) * 4u;
+                out.write(reinterpret_cast<const char *>(pixels.data() + offset), 3);
+            }
+        }
+        return static_cast<bool>(out);
+    }
 
     GSPrimReg decodePrimRegister(uint64_t value)
     {
@@ -102,6 +126,7 @@ namespace
     std::atomic<uint32_t> s_debugTexaWriteCount{0};
     std::atomic<uint32_t> s_debugCvFontUploadCount{0};
     std::atomic<uint32_t> s_debugLocalCopyCount{0};
+    std::atomic<uint32_t> s_xmenPresentTraceCount{0};
 }
 
 
@@ -442,6 +467,36 @@ void GS::recordDrawDebugEventUnlocked(int vertexCount)
         entry.aMax = std::max(entry.aMax, v.a);
     }
 
+    static std::atomic<uint32_t> drawTraceCount{0u};
+    const uint32_t drawIndex = drawTraceCount.fetch_add(1u, std::memory_order_relaxed);
+    if (drawIndex < 64u)
+    {
+        const GSContext &ctx = m_ctx[m_prim.ctxt ? 1u : 0u];
+        std::fprintf(stderr,
+                     "[gs:draw] index=%u frame=%llu prim=%u ctxt=%u tme=%u abe=%u fst=%u fbp=%u fbw=%u psm=%u tex=%u/%u/%u xy=%.1f,%.1f-%.1f,%.1f z=%.0f-%.0f a=%u-%u\n",
+                     drawIndex,
+                     static_cast<unsigned long long>(m_debugFrameIndex),
+                     static_cast<unsigned>(m_prim.type),
+                     static_cast<unsigned>(m_prim.ctxt),
+                     static_cast<unsigned>(m_prim.tme),
+                     static_cast<unsigned>(m_prim.abe),
+                     static_cast<unsigned>(m_prim.fst),
+                     ctx.frame.fbp,
+                     ctx.frame.fbw,
+                     ctx.frame.psm,
+                     ctx.tex0.tbp0,
+                     ctx.tex0.tbw,
+                     ctx.tex0.psm,
+                     entry.xMin,
+                     entry.yMin,
+                     entry.xMax,
+                     entry.yMax,
+                     entry.zMin,
+                     entry.zMax,
+                     entry.aMin,
+                     entry.aMax);
+    }
+
     recordDebugEventUnlocked(entry);
 }
 
@@ -557,6 +612,60 @@ void GS::latchHostPresentationFrame()
     const uint32_t width = frame.width;
     const uint32_t height = frame.height;
     const bool usedPreferred = frame.usedPreferred;
+    const uint32_t presentIndex = s_xmenPresentTraceCount.fetch_add(1u, std::memory_order_relaxed);
+    static std::atomic<bool> dumpedFirstNonBlack{false};
+    if (hasFrame && !dumpedFirstNonBlack.load(std::memory_order_relaxed) &&
+        frame.pixels.size() >= static_cast<size_t>(width) * height * 4u)
+    {
+        bool nonBlack = false;
+        for (size_t offset = 0u; offset < static_cast<size_t>(width) * height * 4u; offset += 4u)
+        {
+            if (frame.pixels[offset] != 0u || frame.pixels[offset + 1u] != 0u || frame.pixels[offset + 2u] != 0u)
+            {
+                nonBlack = true;
+                break;
+            }
+        }
+        bool expected = false;
+        if (nonBlack && dumpedFirstNonBlack.compare_exchange_strong(expected, true, std::memory_order_relaxed))
+        {
+            const std::string path = "gs-present-first-nonblack-" + std::to_string(presentIndex) + ".ppm";
+            const bool wrote = writePresentationPpm(path, frame.pixels, width, height);
+            std::fprintf(stderr, "[gs:first-nonblack] index=%u path=%s wrote=%u\n",
+                         presentIndex, path.c_str(), wrote ? 1u : 0u);
+        }
+    }
+    if (hasFrame && (presentIndex == 23u || presentIndex == 24u || presentIndex == 128u ||
+                     presentIndex == 256u || presentIndex == 384u || presentIndex == 640u ||
+                     presentIndex == 768u || presentIndex == 896u ||
+                     presentIndex == 1420u || presentIndex == 1450u || presentIndex == 1500u) &&
+        frame.pixels.size() >= static_cast<size_t>(width) * height * 4u)
+    {
+        const std::string path = "gs-present-" + std::to_string(presentIndex) + ".ppm";
+        const bool wrote = writePresentationPpm(path, frame.pixels, width, height);
+        std::fprintf(stderr, "[gs:present-dump] index=%u path=%s wrote=%u\n",
+                     presentIndex, path.c_str(), wrote ? 1u : 0u);
+    }
+    if (presentIndex < 32u || (presentIndex & 127u) == 0u)
+    {
+        std::fprintf(stderr,
+                     "[gs:present] index=%u has=%u size=%ux%u display=%u source=%u preferred=%u dispfb1=0x%llx display1=0x%llx ctx0=%u/%u/%u ctx1=%u/%u/%u\n",
+                     presentIndex,
+                     static_cast<unsigned>(hasFrame),
+                     width,
+                     height,
+                     displayFbp,
+                     sourceFbp,
+                     static_cast<unsigned>(usedPreferred),
+                     static_cast<unsigned long long>(request.dispfb1),
+                     static_cast<unsigned long long>(request.display1),
+                     request.contextFrames[0].fbp,
+                     request.contextFrames[0].fbw,
+                     request.contextFrames[0].psm,
+                     request.contextFrames[1].fbp,
+                     request.contextFrames[1].fbw,
+                     request.contextFrames[1].psm);
+    }
     {
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
         m_hostPresentationFrame = std::move(frame.pixels);
@@ -642,10 +751,78 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_backend)
+    {
+        static std::atomic<uint32_t> dropTraceCount{0u};
+        const uint32_t dropTraceIndex = dropTraceCount.fetch_add(1u, std::memory_order_relaxed);
+        if (dropTraceIndex < 32u)
+        {
+            std::fprintf(stderr,
+                         "[gs-process-drop] idx=%u data=%p bytes=%u backend=%u\n",
+                         dropTraceIndex,
+                         static_cast<const void *>(data),
+                         sizeBytes,
+                         m_backend ? 1u : 0u);
+        }
         return;
+    }
+
+    const uint64_t firstTagLo = loadLE64(data);
+    const uint64_t firstTagHi = loadLE64(data + 8u);
+    uint32_t firstNloop = static_cast<uint32_t>(firstTagLo & 0x7FFFu);
+    uint8_t firstFlg = static_cast<uint8_t>((firstTagLo >> 58u) & 0x3u);
+    uint32_t firstNreg = static_cast<uint32_t>((firstTagLo >> 60u) & 0xFu);
+    if (firstNreg == 0u)
+        firstNreg = 16u;
+    static std::atomic<uint32_t> processTraceCount{0u};
+    const uint32_t processTraceIndex = processTraceCount.fetch_add(1u, std::memory_order_relaxed);
+    const bool traceThisPacket = processTraceIndex < 128u;
+    if (traceThisPacket)
+    {
+        std::fprintf(stderr,
+                     "[gs-process] idx=%u bytes=%u nloop=%u flg=%u nreg=%u backend=%u tagLo=0x%016llx tagHi=0x%016llx\n",
+                     processTraceIndex,
+                     sizeBytes,
+                     firstNloop,
+                     static_cast<unsigned>(firstFlg),
+                     firstNreg,
+                     m_backend ? 1u : 0u,
+                     static_cast<unsigned long long>(firstTagLo),
+                     static_cast<unsigned long long>(firstTagHi));
+    }
+
+    constexpr uint64_t kXmenLegalTex0 = 0x4005788401302bc0ull;
+    for (uint32_t probeOffset = 0; probeOffset + 8u <= sizeBytes; probeOffset += 8u)
+    {
+        if (loadLE64(data + probeOffset) != kXmenLegalTex0)
+            continue;
+
+        std::cerr << "[xmen-gs-legal-packet] data=" << static_cast<const void *>(data)
+                  << " size=" << sizeBytes
+                  << " tex0-offset=" << probeOffset
+                  << " tag=0x" << std::hex << loadLE64(data)
+                  << "/0x" << loadLE64(data + 8u)
+                  << " qwords=";
+        for (uint32_t qwordOffset = 0; qwordOffset + 16u <= sizeBytes; qwordOffset += 16u)
+        {
+            if (qwordOffset) std::cerr << ',';
+            std::cerr << std::hex << loadLE64(data + qwordOffset)
+                      << "/" << loadLE64(data + qwordOffset + 8u);
+        }
+        std::cerr << std::dec << std::endl;
+        break;
+    }
 
     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
+    {
+        if (traceThisPacket)
+        {
+            std::fprintf(stderr,
+                         "[gs-process-native-image] idx=%u bytes=%u\n",
+                         processTraceIndex,
+                         sizeBytes);
+        }
         return;
+    }
 
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t packetIndex = s_debugGifPacketCount.fetch_add(1, std::memory_order_relaxed);
@@ -694,6 +871,18 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         uint8_t regs[16];
         for (uint32_t i = 0; i < nreg; ++i)
             regs[i] = static_cast<uint8_t>((tagHi >> (i * 4)) & 0xF);
+        if (traceThisPacket)
+        {
+            std::fprintf(stderr, "[gs-process-regs] idx=%u offset=%u flg=%u nloop=%u nreg=%u regs=",
+                         processTraceIndex,
+                         offset - 16u,
+                         static_cast<unsigned>(flg),
+                         nloop,
+                         nreg);
+            for (uint32_t i = 0; i < nreg; ++i)
+                std::fprintf(stderr, "%s%02x", i ? "," : "", regs[i]);
+            std::fprintf(stderr, "\n");
+        }
 
         if (flg == GIF_FMT_PACKED)
         {
@@ -702,9 +891,35 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                 for (uint32_t r = 0; r < nreg; ++r)
                 {
                     if (offset + 16 > sizeBytes)
+                    {
+                        static std::atomic<uint32_t> packedTruncTraceCount{0u};
+                        const uint32_t truncTraceIndex = packedTruncTraceCount.fetch_add(1u, std::memory_order_relaxed);
+                        if (truncTraceIndex < 32u)
+                        {
+                            std::fprintf(stderr,
+                                         "[gs-process-trunc-packed] idx=%u offset=%u bytes=%u loop=%u reg=%u nloop=%u nreg=%u\n",
+                                         truncTraceIndex,
+                                         offset,
+                                         sizeBytes,
+                                         loop,
+                                         r,
+                                         nloop,
+                                         nreg);
+                        }
                         return;
+                    }
                     uint64_t lo = loadLE64(data + offset);
                     uint64_t hi = loadLE64(data + offset + 8);
+                    if (traceThisPacket && loop < 2u)
+                    {
+                        std::fprintf(stderr,
+                                     "[gs-process-packed] idx=%u loop=%u regDesc=0x%02x lo=0x%016llx hi=0x%016llx\n",
+                                     processTraceIndex,
+                                     loop,
+                                     regs[r],
+                                     static_cast<unsigned long long>(lo),
+                                     static_cast<unsigned long long>(hi));
+                    }
                     offset += 16;
                     writeRegisterPacked(regs[r], lo, hi);
                 }
@@ -717,8 +932,36 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                 for (uint32_t r = 0; r < nreg; ++r)
                 {
                     if (offset + 8 > sizeBytes)
+                    {
+                        static std::atomic<uint32_t> reglistTruncTraceCount{0u};
+                        const uint32_t truncTraceIndex = reglistTruncTraceCount.fetch_add(1u, std::memory_order_relaxed);
+                        if (truncTraceIndex < 32u)
+                        {
+                            std::fprintf(stderr,
+                                         "[gs-process-trunc-reglist] idx=%u offset=%u bytes=%u loop=%u reg=%u nloop=%u nreg=%u\n",
+                                         truncTraceIndex,
+                                         offset,
+                                         sizeBytes,
+                                         loop,
+                                         r,
+                                         nloop,
+                                         nreg);
+                        }
                         return;
-                    writeRegisterUnlocked(regs[r], loadLE64(data + offset));
+                    }
+                    {
+                        const uint64_t value = loadLE64(data + offset);
+                        if (traceThisPacket && loop < 2u)
+                        {
+                            std::fprintf(stderr,
+                                         "[gs-process-reglist] idx=%u loop=%u reg=0x%02x value=0x%016llx\n",
+                                         processTraceIndex,
+                                         loop,
+                                         regs[r],
+                                         static_cast<unsigned long long>(value));
+                        }
+                        writeRegisterUnlocked(regs[r], value);
+                    }
                     offset += 8;
                 }
             }
@@ -1469,6 +1712,23 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             lo = (lo & ~mask) | (id & mask);
             m_privRegs->siglblid = (m_privRegs->siglblid & 0xFFFFFFFF00000000ULL) | lo;
             m_privRegs->csr.fetch_or(0x1);
+            const bool masked = (m_privRegs->imr & (1ull << 8u)) != 0u;
+            static std::atomic<uint32_t> signalTraceCount{0u};
+            const uint32_t signalIndex =
+                signalTraceCount.fetch_add(1u, std::memory_order_relaxed);
+            if (signalIndex < 128u)
+            {
+                std::fprintf(stderr,
+                             "[gs:signal] index=%u id=0x%x mask=0x%x csr=0x%llx imr=0x%llx interrupt=%u\n",
+                             signalIndex,
+                             id,
+                             mask,
+                             static_cast<unsigned long long>(m_privRegs->csr.load()),
+                             static_cast<unsigned long long>(m_privRegs->imr),
+                             masked ? 0u : 1u);
+            }
+            if (!masked && m_interruptCallback)
+                m_interruptCallback(0u);
         }
         break;
     }
@@ -1480,7 +1740,24 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             m_backend->Sync(GSSyncReason::Finish);
         }
         if (m_privRegs)
+        {
             m_privRegs->csr.fetch_or(0x2);
+            const bool masked = (m_privRegs->imr & (1ull << 9u)) != 0u;
+            static std::atomic<uint32_t> finishTraceCount{0u};
+            const uint32_t finishIndex =
+                finishTraceCount.fetch_add(1u, std::memory_order_relaxed);
+            if (finishIndex < 512u)
+            {
+                std::fprintf(stderr,
+                             "[gs:finish] index=%u csr=0x%llx imr=0x%llx interrupt=%u\n",
+                             finishIndex,
+                             static_cast<unsigned long long>(m_privRegs->csr.load()),
+                             static_cast<unsigned long long>(m_privRegs->imr),
+                             masked ? 0u : 1u);
+            }
+            if (!masked && m_interruptCallback)
+                m_interruptCallback(0u);
+        }
         break;
     }
     case GS_REG_LABEL:
@@ -1524,6 +1801,33 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
 
 void GS::vertexKick(bool drawing)
 {
+    const GSContext &activeContext = m_ctx[m_prim.ctxt ? 1 : 0];
+    if (m_prim.type == GS_PRIM_TRISTRIP &&
+        activeContext.frame.fbp == 140u &&
+        activeContext.tex0.tbp0 == 11200u)
+    {
+        static std::atomic<uint32_t> legalVertexTraceCount{0u};
+        const uint32_t traceIndex = legalVertexTraceCount.fetch_add(1u, std::memory_order_relaxed);
+        if (traceIndex < 16u)
+        {
+            const GSVertex &vertex = m_vtxQueue[m_vtxCount % kMaxVerts];
+            std::fprintf(stderr,
+                         "[xmen-gs-legal-vertex] index=%u queueBefore=%d drawing=%u xy=%.1f,%.1f stq=%.3f,%.3f,%.3f rgba=%u,%u,%u,%u\n",
+                         traceIndex,
+                         m_vtxCount,
+                         drawing ? 1u : 0u,
+                         vertex.x,
+                         vertex.y,
+                         vertex.s,
+                         vertex.t,
+                         vertex.q,
+                         vertex.r,
+                         vertex.g,
+                         vertex.b,
+                         vertex.a);
+        }
+    }
+
     ++m_vtxCount;
     ++m_vtxIndex;
 
@@ -1573,6 +1877,229 @@ void GS::vertexKick(bool drawing)
     if (drawing && m_backend)
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
+        static std::atomic<uint32_t> submittedDrawTraceCount{0u};
+        static std::atomic<uint32_t> interestingDrawTraceCount{0u};
+        static std::atomic<uint32_t> nonSpriteDrawCount{0u};
+        static std::atomic<uint32_t> texturedDrawCount{0u};
+        static std::atomic<uint32_t> coloredDrawCount{0u};
+        const uint32_t drawIndex = submittedDrawTraceCount.fetch_add(1u, std::memory_order_relaxed);
+        bool hasColor = false;
+        for (uint32_t i = 0; i < batch.vertexCount; ++i)
+        {
+            const GSVertex &vertex = batch.vertices[i];
+            hasColor |= vertex.r != 0u || vertex.g != 0u || vertex.b != 0u || vertex.a != 0u;
+        }
+        const bool nonSprite = batch.state.prim.type != GS_PRIM_SPRITE;
+        const bool textured = batch.state.prim.tme;
+        const bool interesting = nonSprite || textured || hasColor;
+        const uint32_t interestingIndex = interesting
+            ? interestingDrawTraceCount.fetch_add(1u, std::memory_order_relaxed)
+            : UINT32_MAX;
+        if (nonSprite)
+            nonSpriteDrawCount.fetch_add(1u, std::memory_order_relaxed);
+        if (textured)
+            texturedDrawCount.fetch_add(1u, std::memory_order_relaxed);
+        if (hasColor)
+            coloredDrawCount.fetch_add(1u, std::memory_order_relaxed);
+        if (drawIndex < 96u || interestingIndex < 256u)
+        {
+            const GSContext &ctx = batch.state.context;
+            const GSVertex &v0 = batch.vertices[0];
+            const GSVertex &v1 = batch.vertices[batch.vertexCount - 1u];
+            std::fprintf(stderr,
+                         "[gs:submit] index=%u prim=%u vertices=%u ctxt=%u fbp=%u/%u/%u scissor=%u,%u-%u,%u offset=%u,%u v0=%.1f,%.1f,%.0f/%u,%u,%u,%u v1=%.1f,%.1f,%.0f/%u,%u,%u,%u\n",
+                         drawIndex,
+                         static_cast<unsigned>(batch.state.prim.type),
+                         static_cast<unsigned>(batch.vertexCount),
+                         static_cast<unsigned>(batch.state.prim.ctxt),
+                         ctx.frame.fbp,
+                         ctx.frame.fbw,
+                         ctx.frame.psm,
+                         ctx.scissor.x0,
+                         ctx.scissor.y0,
+                         ctx.scissor.x1,
+                         ctx.scissor.y1,
+                         ctx.xyoffset.ofx,
+                         ctx.xyoffset.ofy,
+                         v0.x,
+                         v0.y,
+                         v0.z,
+                         v0.r,
+                         v0.g,
+                         v0.b,
+                         v0.a,
+                         v1.x,
+                         v1.y,
+                         v1.z,
+                         v1.r,
+                         v1.g,
+                         v1.b,
+                          v1.a);
+        }
+        const uint64_t vsyncTick = m_privRegs
+            ? m_privRegs->vsyncTick.load(std::memory_order_relaxed)
+            : 0u;
+        const uint32_t presentCount = s_xmenPresentTraceCount.load(std::memory_order_relaxed);
+        if (vsyncTick >= 1910u && vsyncTick <= 1960u)
+        {
+            static std::atomic<uint32_t> broadTitleDrawTraceCount{0u};
+            const uint32_t broadIndex = broadTitleDrawTraceCount.fetch_add(1u, std::memory_order_relaxed);
+            if (broadIndex < 64u || (broadIndex < 16384u && (broadIndex & 255u) == 0u))
+            {
+                const GSContext &ctx = batch.state.context;
+                float minX = batch.vertices[0].x;
+                float minY = batch.vertices[0].y;
+                float maxX = batch.vertices[0].x;
+                float maxY = batch.vertices[0].y;
+                double minZ = batch.vertices[0].z;
+                double maxZ = batch.vertices[0].z;
+                uint32_t maxRgb = 0u;
+                for (uint32_t i = 0u; i < batch.vertexCount; ++i)
+                {
+                    const GSVertex &vertex = batch.vertices[i];
+                    minX = std::min(minX, vertex.x);
+                    minY = std::min(minY, vertex.y);
+                    maxX = std::max(maxX, vertex.x);
+                    maxY = std::max(maxY, vertex.y);
+                    minZ = std::min(minZ, vertex.z);
+                    maxZ = std::max(maxZ, vertex.z);
+                    maxRgb = std::max<uint32_t>(maxRgb,
+                        std::max<uint32_t>(vertex.r, std::max<uint32_t>(vertex.g, vertex.b)));
+                }
+                const GSVertex &v0 = batch.vertices[0];
+                std::fprintf(stdout,
+                             "[xmen-title-broad-draw] index=%u present=%u tick=%llu prim=%u vertices=%u ctxt=%u tme=%u abe=%u fst=%u iip=%u frame=%u/%u/%u/0x%x zbuf=%u/%u/%u tex0=%u/%u/%u/%u/%u test=0x%llx alpha=0x%llx scissor=%u,%u-%u,%u offset=%u,%u bounds=%.1f,%.1f-%.1f,%.1f z=%.0f-%.0f maxRgb=%u v0=%.1f,%.1f,%.0f/%u,%u,%u,%u/stq=%.3f,%.3f,%.3f/uv=%u,%u\n",
+                             broadIndex,
+                             presentCount,
+                             static_cast<unsigned long long>(vsyncTick),
+                             static_cast<unsigned>(batch.state.prim.type),
+                             static_cast<unsigned>(batch.vertexCount),
+                             static_cast<unsigned>(batch.state.prim.ctxt),
+                             batch.state.prim.tme ? 1u : 0u,
+                             batch.state.prim.abe ? 1u : 0u,
+                             batch.state.prim.fst ? 1u : 0u,
+                             batch.state.prim.iip ? 1u : 0u,
+                             ctx.frame.fbp,
+                             ctx.frame.fbw,
+                             ctx.frame.psm,
+                             ctx.frame.fbmsk,
+                             ctx.zbuf.zbp,
+                             ctx.zbuf.psm,
+                             ctx.zbuf.zmask ? 1u : 0u,
+                             ctx.tex0.tbp0,
+                             ctx.tex0.tbw,
+                             ctx.tex0.psm,
+                             ctx.tex0.tw,
+                             ctx.tex0.th,
+                             static_cast<unsigned long long>(ctx.test),
+                             static_cast<unsigned long long>(ctx.alpha),
+                             ctx.scissor.x0,
+                             ctx.scissor.y0,
+                             ctx.scissor.x1,
+                             ctx.scissor.y1,
+                             ctx.xyoffset.ofx,
+                             ctx.xyoffset.ofy,
+                             minX,
+                             minY,
+                             maxX,
+                             maxY,
+                             minZ,
+                             maxZ,
+                             maxRgb,
+                             v0.x,
+                             v0.y,
+                             v0.z,
+                             v0.r,
+                             v0.g,
+                             v0.b,
+                             v0.a,
+                             v0.s,
+                             v0.t,
+                             v0.q,
+                             v0.u,
+                             v0.v);
+                std::fflush(stdout);
+            }
+        }
+        static uint64_t titleDrawTraceTick = UINT64_MAX;
+        const GSContext &titleCandidateContext = batch.state.context;
+        const bool titleMeshCandidate =
+            vsyncTick >= 1910u &&
+            batch.state.prim.type == GS_PRIM_TRISTRIP &&
+            !batch.state.prim.tme &&
+            (titleCandidateContext.frame.fbp == 0u || titleCandidateContext.frame.fbp == 140u) &&
+            batch.vertices[0].z >= 28000.0 &&
+            batch.vertices[0].z <= 40000.0;
+        if (titleDrawTraceTick == UINT64_MAX && titleMeshCandidate)
+            titleDrawTraceTick = vsyncTick;
+        if (vsyncTick == titleDrawTraceTick)
+        {
+            static std::atomic<uint32_t> titleDrawTraceCount{0u};
+            const uint32_t titleDrawIndex = titleDrawTraceCount.fetch_add(1u, std::memory_order_relaxed);
+            if (titleDrawIndex < 4096u)
+            {
+                const GSContext &ctx = batch.state.context;
+                const GSVertex &v0 = batch.vertices[0];
+                const GSVertex &v1 = batch.vertices[batch.vertexCount - 1u];
+                std::fprintf(stdout,
+                             "[xmen-title-draw] index=%u present=%u tick=%llu prim=%u vertices=%u ctxt=%u tme=%u abe=%u fst=%u iip=%u frame=%u/%u/%u/0x%x zbuf=%u/%u/%u tex0=%u/%u/%u/%u/%u test=0x%llx alpha=0x%llx scissor=%u,%u-%u,%u offset=%u,%u v0=%.1f,%.1f,%.0f/%u,%u,%u,%u v1=%.1f,%.1f,%.0f/%u,%u,%u,%u\n",
+                             titleDrawIndex,
+                             presentCount,
+                             static_cast<unsigned long long>(vsyncTick),
+                             static_cast<unsigned>(batch.state.prim.type),
+                             static_cast<unsigned>(batch.vertexCount),
+                             static_cast<unsigned>(batch.state.prim.ctxt),
+                             batch.state.prim.tme ? 1u : 0u,
+                             batch.state.prim.abe ? 1u : 0u,
+                             batch.state.prim.fst ? 1u : 0u,
+                             batch.state.prim.iip ? 1u : 0u,
+                             ctx.frame.fbp,
+                             ctx.frame.fbw,
+                             ctx.frame.psm,
+                             ctx.frame.fbmsk,
+                             ctx.zbuf.zbp,
+                             ctx.zbuf.psm,
+                             ctx.zbuf.zmask ? 1u : 0u,
+                             ctx.tex0.tbp0,
+                             ctx.tex0.tbw,
+                             ctx.tex0.psm,
+                             ctx.tex0.tw,
+                             ctx.tex0.th,
+                             static_cast<unsigned long long>(ctx.test),
+                             static_cast<unsigned long long>(ctx.alpha),
+                             ctx.scissor.x0,
+                             ctx.scissor.y0,
+                             ctx.scissor.x1,
+                             ctx.scissor.y1,
+                             ctx.xyoffset.ofx,
+                             ctx.xyoffset.ofy,
+                             v0.x,
+                             v0.y,
+                             v0.z,
+                             v0.r,
+                             v0.g,
+                             v0.b,
+                             v0.a,
+                             v1.x,
+                             v1.y,
+                             v1.z,
+                             v1.r,
+                             v1.g,
+                             v1.b,
+                             v1.a);
+                std::fflush(stdout);
+            }
+        }
+        if (false && (drawIndex & 511u) == 511u)
+        {
+            std::fprintf(stderr,
+                         "[gs:submit-summary] total=%u interesting=%u nonSprite=%u textured=%u colored=%u\n",
+                         drawIndex + 1u,
+                         interestingDrawTraceCount.load(std::memory_order_relaxed),
+                         nonSpriteDrawCount.load(std::memory_order_relaxed),
+                         texturedDrawCount.load(std::memory_order_relaxed),
+                         coloredDrawCount.load(std::memory_order_relaxed));
+        }
         updatePreferredDisplaySourceForDraw(batch);
         m_backend->Submit(batch);
         recordDrawDebugEventUnlocked(needed);
@@ -1696,6 +2223,10 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
     const uint8_t mmag = static_cast<uint8_t>((tex1 >> 5u) & 0x1u);
     const uint8_t mmin = static_cast<uint8_t>((tex1 >> 6u) & 0x7u);
     batch.state.linearFilter = mmag != 0u || mmin == 1u || (mmin & 0x4u) != 0u;
+    batch.debugVsyncTick = m_privRegs
+        ? m_privRegs->vsyncTick.load(std::memory_order_relaxed)
+        : 0u;
+    batch.debugPresentCount = s_xmenPresentTraceCount.load(std::memory_order_relaxed);
     return batch;
 }
 

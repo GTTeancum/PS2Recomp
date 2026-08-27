@@ -75,6 +75,40 @@ namespace ps2x::iop::detail
             };
         }
 
+        CriDtxBindings xmenLegendsCriDtxBindings()
+        {
+            return {
+                .serviceName = "X-Men Legends CRI DTX",
+                .sid = 0x90000200u,
+                .urpcObjectBase = 0x01F18000u,
+                .urpcObjectLimit = 0x01F1FF00u,
+                .urpcObjectStride = 0x20u,
+                .rpcServerPoolBase = 0x01F10000u,
+                .rpcServerStride = 0x80u,
+            };
+        }
+
+        SoundUpdateStubBindings xmenLegendsSoundBindings()
+        {
+            return {
+                .serviceName = "X-Men Legends IOP update compatibility stub",
+                .sid = 0x00012114u,
+                .activeStreamCountOffset = 0x100u,
+                .responseCounterOffset = 0x104u,
+                .zeroReceiveBuffer = false,
+                .signalNowaitCompletion = true,
+                .completeQueuedPlayStreams = false,
+                .suppressedCompletionCallbacks = {},
+            };
+        }
+
+        ZaudioBindings xmenLegendsZaudioBindings()
+        {
+            return {
+                .serviceName = "X-Men Legends ZAUDIO",
+            };
+        }
+
         SdrdrvBindings fatalFrameSdrdrvBindings()
         {
             return {
@@ -129,6 +163,21 @@ namespace ps2x::iop::detail
                 ServiceList services;
                 services.emplace_back(createClFileService(host, lotrClFileBindings()));
                 services.emplace_back(createSoundUpdateStubService(host, lotrSoundBindings()));
+                return services;
+            },
+        });
+
+        profiles.push_back({
+            "xmen-legends-us",
+            "builtin",
+            {.elfName = "SLUS_206.56"},
+            [](IopHost &host, const GameIdentity &)
+            {
+                ServiceList services;
+                services.emplace_back(createZaudioService(host, xmenLegendsZaudioBindings()));
+                services.emplace_back(createSoundUpdateStubService(host, xmenLegendsSoundBindings()));
+                services.emplace_back(createCriDtxService(host, xmenLegendsCriDtxBindings()));
+                services.emplace_back(createMtapService(host, false));
                 return services;
             },
         });

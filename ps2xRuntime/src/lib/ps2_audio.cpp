@@ -2,6 +2,8 @@
 #include "runtime/ps2_memory.h"
 #include "ps2_host_backend.h"
 #include <cstring>
+#include <iostream>
+#include <unordered_map>
 #include <vector>
 
 namespace
@@ -76,7 +78,14 @@ struct PS2AudioBackend::Impl
         Sound snd;
         uint32_t sampleKey;
     };
+    struct ZaudioBank
+    {
+        uint32_t spuAddress = 0;
+        uint32_t uploadedBytes = 0;
+        std::vector<uint8_t> data;
+    };
     std::vector<TrackedSound> activeSounds;
+    std::unordered_map<uint32_t, ZaudioBank> zaudioBanks;
 };
 
 PS2AudioBackend::PS2AudioBackend() : m_impl(std::make_unique<Impl>())
@@ -147,6 +156,62 @@ void PS2AudioBackend::onSoundCommand(uint32_t sid, uint32_t rpcNum,
                                      const uint8_t *sendBuf, uint32_t sendSize,
                                      uint8_t *recvBuf, uint32_t recvSize)
 {
+    if (sid == 0x47u)
+    {
+        constexpr uint32_t kAllocateSample = 2u;
+        constexpr uint32_t kUploadSample = 4u;
+        if (rpcNum == kAllocateSample && sendBuf && sendSize >= sizeof(uint32_t) &&
+            recvBuf && recvSize >= sizeof(uint32_t) * 2u)
+        {
+            uint32_t size = 0u;
+            uint32_t handle = 0u;
+            uint32_t spuAddress = 0u;
+            std::memcpy(&size, sendBuf, sizeof(size));
+            std::memcpy(&handle, recvBuf, sizeof(handle));
+            std::memcpy(&spuAddress, recvBuf + sizeof(uint32_t), sizeof(spuAddress));
+            if (size != 0u && handle != 0u)
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                Impl::ZaudioBank bank{};
+                bank.spuAddress = spuAddress;
+                bank.data.resize(size);
+                m_impl->zaudioBanks[handle] = std::move(bank);
+            }
+        }
+        else if (rpcNum == kUploadSample && sendBuf && sendSize >= 0x408u)
+        {
+            uint32_t handle = 0u;
+            uint32_t offset = 0u;
+            std::memcpy(&handle, sendBuf, sizeof(handle));
+            std::memcpy(&offset, sendBuf + sizeof(uint32_t), sizeof(offset));
+            std::lock_guard<std::mutex> lock(m_mutex);
+            const auto bank = m_impl->zaudioBanks.find(handle);
+            if (bank != m_impl->zaudioBanks.end() && offset < bank->second.data.size())
+            {
+                const uint32_t bytes = std::min<uint32_t>(0x400u,
+                                                          static_cast<uint32_t>(bank->second.data.size()) - offset);
+                std::memcpy(bank->second.data.data() + offset, sendBuf + 8u, bytes);
+                bank->second.uploadedBytes = std::max(bank->second.uploadedBytes, offset + bytes);
+                if (bank->second.uploadedBytes == bank->second.data.size())
+                {
+                    size_t vagHeaders = 0u;
+                    for (size_t i = 0u; i + 4u <= bank->second.data.size(); ++i)
+                    {
+                        if (std::memcmp(bank->second.data.data() + i, "VAGp", 4u) == 0)
+                        {
+                            ++vagHeaders;
+                        }
+                    }
+                    std::cerr << "[ZAUDIO bank] handle=0x" << std::hex << handle
+                              << " spu=0x" << bank->second.spuAddress << std::dec
+                              << " bytes=" << bank->second.data.size()
+                              << " vagHeaders=" << vagHeaders << '\n';
+                }
+            }
+        }
+        return;
+    }
+
     if (sid != 0x80000701u)
         return;
 

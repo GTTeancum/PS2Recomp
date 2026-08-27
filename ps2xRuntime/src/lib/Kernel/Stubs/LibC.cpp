@@ -23,11 +23,45 @@ namespace ps2_stubs
             }
             if (warnCount <= 16u)
             {
-                std::cerr << "[" << (op ? op : "memop") << "] size clamp from 0x"
-                          << std::hex << size << " to 0x" << kMaxTransfer
+                std::cerr << "[" << (op ? op : "memop") << "] rejecting oversized transfer 0x"
+                          << std::hex << size << " above 0x" << kMaxTransfer
                           << std::dec << std::endl;
             }
-            return kMaxTransfer;
+            return 0u;
+        }
+
+        bool rejectNullPageWrite(uint32_t destAddr, uint32_t size, const char *op)
+        {
+            if (size == 0u)
+            {
+                return false;
+            }
+
+            uint32_t resolvedOffset = destAddr;
+            bool scratch = false;
+            const bool resolved = ps2ResolveGuestPointer(destAddr, resolvedOffset, scratch);
+            const bool lowVirtual = destAddr < 0x1000u;
+            const bool lowPhysical = resolved && !scratch && resolvedOffset < 0x1000u;
+            if (!lowVirtual && !lowPhysical)
+            {
+                return false;
+            }
+
+            static std::mutex s_warnMutex;
+            static std::unordered_map<std::string, uint32_t> s_warnCounts;
+            uint32_t warnCount = 0u;
+            {
+                std::lock_guard<std::mutex> lock(s_warnMutex);
+                warnCount = ++s_warnCounts[op ? op : "memop"];
+            }
+            if (warnCount <= 16u)
+            {
+                std::cerr << "[" << (op ? op : "memop") << "] rejecting null-page write dst=0x"
+                          << std::hex << destAddr << " size=0x" << size
+                          << " phys=0x" << (resolved ? resolvedOffset : 0xffffffffu)
+                          << std::dec << std::endl;
+            }
+            return true;
         }
 
         uint32_t guestContiguousBytes(uint32_t guestAddr)
@@ -45,12 +79,271 @@ namespace ps2_stubs
             return (offset < PS2_RAM_SIZE) ? (PS2_RAM_SIZE - offset) : 0u;
         }
 
+        uint32_t clampGuestMemTransfer(uint32_t size, uint32_t primaryAddr, uint32_t secondaryAddr,
+                                       bool hasSecondary, const char *op, const R5900Context *ctx)
+        {
+            uint32_t contiguous = guestContiguousBytes(primaryAddr);
+            if (hasSecondary)
+            {
+                contiguous = std::min(contiguous, guestContiguousBytes(secondaryAddr));
+            }
+
+            if (size <= contiguous)
+            {
+                return size;
+            }
+
+            static std::mutex s_warnMutex;
+            static std::unordered_map<std::string, uint32_t> s_warnCounts;
+            uint32_t warnCount = 0u;
+            {
+                std::lock_guard<std::mutex> lock(s_warnMutex);
+                warnCount = ++s_warnCounts[op ? op : "memop"];
+            }
+            if (warnCount <= 32u)
+            {
+                std::cerr << "[" << (op ? op : "memop") << "] rejecting wrapped transfer dst=0x"
+                          << std::hex << primaryAddr;
+                if (hasSecondary)
+                {
+                    std::cerr << " src=0x" << secondaryAddr;
+                }
+                std::cerr << " size=0x" << size
+                          << " contiguous=0x" << contiguous
+                          << " pc=0x" << (ctx ? ctx->pc : 0u)
+                          << " ra=0x" << (ctx ? getRegU32(ctx, 31) : 0u)
+                          << " sp=0x" << (ctx ? getRegU32(ctx, 29) : 0u)
+                          << std::dec << std::endl;
+            }
+            return 0u;
+        }
+
+        void traceXmenLegalMatrixBulkWrite(uint32_t destAddr, uint32_t srcAddr,
+                                           uint32_t size, const char *op,
+                                           const R5900Context *ctx)
+        {
+            constexpr uint32_t watchStart = 0x00972290u;
+            constexpr uint32_t watchEnd = 0x009722D0u;
+            const uint32_t destPhys = destAddr & PS2_RAM_MASK;
+            const uint64_t writeEnd = static_cast<uint64_t>(destPhys) + size;
+            if (destPhys >= watchEnd || writeEnd <= watchStart)
+                return;
+
+            std::cerr << "[xmen-bulk-watch:972290] op=" << op
+                      << " dst=0x" << std::hex << destAddr
+                      << " src=0x" << srcAddr
+                      << " size=0x" << size
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      << " ra=0x" << (ctx ? getRegU32(ctx, 31) : 0u)
+                      << " sp=0x" << (ctx ? getRegU32(ctx, 29) : 0u)
+                      << std::dec << std::endl;
+        }
+
+        void restoreXmenTitleVtable(uint8_t *rdram, const char *op, const R5900Context *ctx)
+        {
+            static constexpr uint32_t kVtableAddr = 0x006F2B50u;
+            static constexpr uint32_t kVtableWords[] = {
+                0x0068EF50u, 0x00000000u, 0x0014AE50u, 0x0014B240u,
+                0x0014B600u, 0x0014B610u, 0x0014BE90u, 0x0014BFA0u,
+                0x0014BFB0u, 0x0014AD80u, 0x0014AD90u, 0x00000000u,
+            };
+            for (uint32_t i = 0u; i < (sizeof(kVtableWords) / sizeof(kVtableWords[0])); ++i)
+            {
+                if (uint8_t *word = getMemPtr(rdram, kVtableAddr + (i * 4u)))
+                {
+                    word[0] = static_cast<uint8_t>(kVtableWords[i] & 0xFFu);
+                    word[1] = static_cast<uint8_t>((kVtableWords[i] >> 8) & 0xFFu);
+                    word[2] = static_cast<uint8_t>((kVtableWords[i] >> 16) & 0xFFu);
+                    word[3] = static_cast<uint8_t>((kVtableWords[i] >> 24) & 0xFFu);
+                }
+            }
+
+            static uint32_t s_restoreLogCount = 0u;
+            if (s_restoreLogCount++ < 64u)
+            {
+                std::cerr << "[xmen-vtable-restore:6f2b50] op=" << (op ? op : "memop")
+                          << " pc=0x" << std::hex << (ctx ? ctx->pc : 0u)
+                          << " ra=0x" << (ctx ? getRegU32(ctx, 31) : 0u)
+                          << " sp=0x" << (ctx ? getRegU32(ctx, 29) : 0u)
+                          << std::dec << std::endl;
+            }
+        }
+
+        bool rejectProtectedBulkWrite(uint8_t *rdram, uint32_t destAddr, uint32_t size, const char *op, const R5900Context *ctx)
+        {
+            if (size == 0u)
+            {
+                return false;
+            }
+
+            uint32_t resolvedOffset = destAddr;
+            bool scratch = false;
+            if (!ps2ResolveGuestPointer(destAddr, resolvedOffset, scratch) || scratch)
+            {
+                return false;
+            }
+
+            const uint64_t writeEnd = static_cast<uint64_t>(resolvedOffset) + static_cast<uint64_t>(size);
+            const bool touchesPool = resolvedOffset < 0x00898EE4u && writeEnd > 0x00897460u;
+            const bool touchesAlloc = resolvedOffset < 0x00898F00u && writeEnd > 0x00898EF0u;
+            const bool touchesTitle = resolvedOffset < 0x006F2B80u && writeEnd > 0x006F2B50u;
+            const bool touchesGlobals = resolvedOffset < 0x00748000u && writeEnd > 0x00745000u;
+            const bool touchesScratchAllocator = resolvedOffset < 0x00900430u && writeEnd > 0x00900410u;
+            if (!touchesPool && !touchesAlloc && !touchesTitle && !touchesGlobals && !touchesScratchAllocator)
+            {
+                return false;
+            }
+
+            const bool highAliased = destAddr >= 0x80000000u;
+            const bool implausiblyLarge = size > 0x10000u;
+            if (!highAliased && !implausiblyLarge)
+            {
+                return false;
+            }
+
+            static std::mutex s_warnMutex;
+            static std::unordered_map<std::string, uint32_t> s_warnCounts;
+            uint32_t warnCount = 0u;
+            {
+                std::lock_guard<std::mutex> lock(s_warnMutex);
+                warnCount = ++s_warnCounts[op ? op : "memop"];
+            }
+            if (warnCount <= 64u)
+            {
+                std::cerr << "[" << (op ? op : "memop") << "] rejecting protected bulk write dst=0x"
+                          << std::hex << destAddr
+                          << " phys=0x" << resolvedOffset
+                          << " size=0x" << size
+                          << " protected="
+                          << (touchesPool ? "pool" : touchesAlloc ? "alloc" : touchesTitle ? "title" : touchesGlobals ? "globals" : "scratch-allocator")
+                          << " pc=0x" << (ctx ? ctx->pc : 0u)
+                          << " ra=0x" << (ctx ? getRegU32(ctx, 31) : 0u)
+                          << " sp=0x" << (ctx ? getRegU32(ctx, 29) : 0u)
+                          << std::dec << std::endl;
+            }
+
+            if (touchesTitle)
+            {
+                restoreXmenTitleVtable(rdram, op, ctx);
+            }
+            return true;
+        }
+
+        void logWatchedBulkWrite(uint8_t *rdram,
+                                 uint32_t guestAddr,
+                                 uint32_t size,
+                                 const char *op,
+                                 const R5900Context *ctx,
+                                 uint32_t sourceAddr = 0u)
+        {
+            constexpr uint32_t watchStartA = 0x00898EF0u;
+            constexpr uint32_t watchEndA = 0x00898F00u;
+            constexpr uint32_t watchStartB = 0x006F2B50u;
+            constexpr uint32_t watchEndB = 0x006F2B80u;
+            constexpr uint32_t watchStartC = 0x00900410u;
+            constexpr uint32_t watchEndC = 0x00900430u;
+            constexpr uint32_t watchStartD = 0x00897460u;
+            constexpr uint32_t watchEndD = 0x00898EE4u;
+            constexpr uint32_t watchStartE = 0x00746FF0u;
+            constexpr uint32_t watchEndE = 0x00746FF4u;
+            static const uint32_t watchStartK = [] {
+                const char *value = std::getenv("PS2X_WATCH_START_K");
+                return value && *value
+                           ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) & PS2_RAM_MASK
+                           : 0x00720A4Cu;
+            }();
+            static const uint32_t watchSizeK = [] {
+                const char *value = std::getenv("PS2X_WATCH_SIZE_K");
+                return value && *value
+                           ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0))
+                           : 0x40u;
+            }();
+            const uint64_t watchEndK = static_cast<uint64_t>(watchStartK) + watchSizeK;
+            uint32_t resolvedAddr = guestAddr;
+            uint32_t resolvedOffset = 0u;
+            bool resolvedScratch = false;
+            if (ps2ResolveGuestPointer(guestAddr, resolvedOffset, resolvedScratch) && !resolvedScratch)
+            {
+                resolvedAddr = resolvedOffset;
+            }
+
+            const uint64_t writeEnd = static_cast<uint64_t>(resolvedAddr) + static_cast<uint64_t>(size);
+            const bool touchesA = resolvedAddr < watchEndA && writeEnd > watchStartA;
+            const bool touchesB = resolvedAddr < watchEndB && writeEnd > watchStartB;
+            const bool touchesC = resolvedAddr < watchEndC && writeEnd > watchStartC;
+            const bool touchesD = resolvedAddr < watchEndD && writeEnd > watchStartD;
+            const bool touchesE = resolvedAddr < watchEndE && writeEnd > watchStartE;
+            const bool touchesK = resolvedAddr < watchEndK && writeEnd > watchStartK;
+            if (!touchesA && !touchesB && !touchesC && !touchesD && !touchesE && !touchesK)
+            {
+                return;
+            }
+
+            static uint32_t s_bulkWatchCount = 0u;
+            if (s_bulkWatchCount++ >= 512u)
+            {
+                return;
+            }
+
+            const uint32_t watchStart = touchesK ? watchStartK : touchesE ? watchStartE : touchesD ? watchStartD : touchesC ? watchStartC : touchesB ? watchStartB : watchStartA;
+            const uint32_t watchEnd = touchesK ? static_cast<uint32_t>(watchEndK) : touchesE ? watchEndE : touchesD ? watchEndD : touchesC ? watchEndC : touchesB ? watchEndB : watchEndA;
+            const uint32_t first = std::max(resolvedAddr, watchStart);
+            const uint32_t last = static_cast<uint32_t>(std::min<uint64_t>(writeEnd, watchEnd));
+            std::cerr << (touchesK ? "[xmen-bulk-watch:dynamic-k] op=" : touchesE ? "[xmen-bulk-watch:746ff0] op=" : touchesD ? "[xmen-bulk-watch:897460] op=" : touchesC ? "[xmen-bulk-watch:900410] op=" : touchesB ? "[xmen-bulk-watch:6f2b50] op=" : "[xmen-bulk-watch:898ef0] op=")
+                      << (op ? op : "memop")
+                      << " dst=0x" << std::hex << guestAddr
+                      << " phys=0x" << resolvedAddr
+                      << " src=0x" << sourceAddr
+                      << " size=0x" << size
+                      << " overlap=0x" << first << "..0x" << last
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      << " ra=0x" << (ctx ? getRegU32(ctx, 31) : 0u)
+                      << " bytes=";
+            const uint32_t sampleEnd = touchesD ? std::min<uint32_t>(watchStart + 64u, watchEnd) : watchEnd;
+            for (uint32_t addr = watchStart; addr < sampleEnd; ++addr)
+            {
+                const uint8_t *byte = getConstMemPtr(rdram, addr);
+                if (!byte)
+                {
+                    std::cerr << "??";
+                }
+                else
+                {
+                    const uint32_t value = static_cast<uint32_t>(*byte);
+                    if (value < 0x10u)
+                    {
+                        std::cerr << '0';
+                    }
+                    std::cerr << value;
+                }
+            }
+            if (sampleEnd < watchEnd)
+            {
+                std::cerr << "...";
+            }
+            std::cerr << std::dec << std::endl;
+
+            if (touchesB)
+            {
+                restoreXmenTitleVtable(rdram, op, ctx);
+            }
+        }
+
     }
 
     void malloc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t size = getRegU32(ctx, 4); // $a0
         const uint32_t guestAddr = runtime ? runtime->guestMalloc(size) : 0u;
+        static uint32_t s_mallocLogCount = 0u;
+        if (s_mallocLogCount < 64u)
+        {
+            ++s_mallocLogCount;
+            std::cerr << "[malloc] size=0x" << std::hex << size
+                      << " ret=0x" << guestAddr
+                      << " pc=0x" << (ctx ? getRegU32(ctx, 31) : 0u)
+                      << std::dec << std::endl;
+        }
         setReturnU32(ctx, guestAddr);
     }
 
@@ -92,7 +385,19 @@ namespace ps2_stubs
         uint32_t destAddr = getRegU32(ctx, 4); // $a0
         uint32_t srcAddr = getRegU32(ctx, 5);  // $a1
         uint32_t size = getRegU32(ctx, 6);     // $a2
+        traceXmenLegalMatrixBulkWrite(destAddr, srcAddr, size, "memcpy", ctx);
         size = sanitizeMemTransferSize(size, "memcpy");
+        if (rejectNullPageWrite(destAddr, size, "memcpy"))
+        {
+            setReturnU32(ctx, 0u);
+            return;
+        }
+        size = clampGuestMemTransfer(size, destAddr, srcAddr, true, "memcpy", ctx);
+        if (rejectProtectedBulkWrite(rdram, destAddr, size, "memcpy", ctx))
+        {
+            ctx->r[2] = ctx->r[4];
+            return;
+        }
 
         uint32_t copied = 0u;
         uint32_t curDst = destAddr;
@@ -123,6 +428,7 @@ namespace ps2_stubs
         if (copied != 0u)
         {
             ps2TraceGuestRangeWrite(rdram, destAddr, copied, "memcpy", ctx);
+            logWatchedBulkWrite(rdram, destAddr, copied, "memcpy", ctx, srcAddr);
         }
 
         // returns dest pointer ($v0 = $a0)
@@ -135,6 +441,17 @@ namespace ps2_stubs
         int value = (int)(getRegU32(ctx, 5) & 0xFF); // $a1 (char value)
         uint32_t size = getRegU32(ctx, 6);           // $a2
         size = sanitizeMemTransferSize(size, "memset");
+        if (rejectNullPageWrite(destAddr, size, "memset"))
+        {
+            setReturnU32(ctx, 0u);
+            return;
+        }
+        size = clampGuestMemTransfer(size, destAddr, 0u, false, "memset", ctx);
+        if (rejectProtectedBulkWrite(rdram, destAddr, size, "memset", ctx))
+        {
+            ctx->r[2] = ctx->r[4];
+            return;
+        }
 
         uint32_t written = 0u;
         uint32_t curDst = destAddr;
@@ -161,6 +478,7 @@ namespace ps2_stubs
         if (written != 0u)
         {
             ps2TraceGuestRangeWrite(rdram, destAddr, written, "memset", ctx);
+            logWatchedBulkWrite(rdram, destAddr, written, "memset", ctx);
         }
 
         // returns dest pointer ($v0 = $a0)
@@ -172,6 +490,17 @@ namespace ps2_stubs
         uint32_t destAddr = getRegU32(ctx, 4); // $a0
         uint32_t size = getRegU32(ctx, 5);     // $a1
         size = sanitizeMemTransferSize(size, "memclr");
+        if (rejectNullPageWrite(destAddr, size, "memclr"))
+        {
+            setReturnU32(ctx, 0u);
+            return;
+        }
+        size = clampGuestMemTransfer(size, destAddr, 0u, false, "memclr", ctx);
+        if (rejectProtectedBulkWrite(rdram, destAddr, size, "memclr", ctx))
+        {
+            ctx->r[2] = ctx->r[4];
+            return;
+        }
 
         uint32_t written = 0u;
         uint32_t curDst = destAddr;
@@ -198,6 +527,7 @@ namespace ps2_stubs
         if (written != 0u)
         {
             ps2TraceGuestRangeWrite(rdram, destAddr, written, "memclr", ctx);
+            logWatchedBulkWrite(rdram, destAddr, written, "memclr", ctx);
         }
 
         ctx->r[2] = ctx->r[4];
@@ -208,7 +538,31 @@ namespace ps2_stubs
         uint32_t destAddr = getRegU32(ctx, 4); // $a0
         uint32_t srcAddr = getRegU32(ctx, 5);  // $a1
         uint32_t size = getRegU32(ctx, 6);     // $a2
+        traceXmenLegalMatrixBulkWrite(destAddr, srcAddr, size, "memmove", ctx);
+        static uint32_t s_memmoveTraceCount = 0u;
+        if (size > PS2_RAM_SIZE && s_memmoveTraceCount < 16u)
+        {
+            std::cerr << "[memmove:bad-size] dst=0x" << std::hex << destAddr
+                      << " src=0x" << srcAddr
+                      << " size=0x" << size
+                      << " pc=0x" << ctx->pc
+                      << " ra=0x" << getRegU32(ctx, 31)
+                      << " sp=0x" << getRegU32(ctx, 29)
+                      << std::dec << std::endl;
+            ++s_memmoveTraceCount;
+        }
         size = sanitizeMemTransferSize(size, "memmove");
+        if (rejectNullPageWrite(destAddr, size, "memmove"))
+        {
+            setReturnU32(ctx, 0u);
+            return;
+        }
+        size = clampGuestMemTransfer(size, destAddr, srcAddr, true, "memmove", ctx);
+        if (rejectProtectedBulkWrite(rdram, destAddr, size, "memmove", ctx))
+        {
+            ctx->r[2] = ctx->r[4];
+            return;
+        }
 
         uint32_t copied = 0u;
         std::vector<uint8_t> tmp;
@@ -237,6 +591,7 @@ namespace ps2_stubs
         if (copied != 0u)
         {
             ps2TraceGuestRangeWrite(rdram, destAddr, copied, "memmove", ctx);
+            logWatchedBulkWrite(rdram, destAddr, copied, "memmove", ctx, srcAddr);
         }
 
         // returns dest pointer ($v0 = $a0)
@@ -701,6 +1056,15 @@ namespace ps2_stubs
         {
             // TODO: Add translation for PS2 paths like mc0:, host:, cdrom:, etc.
             // treating as direct host path
+            static uint32_t s_fopenTraceCount = 0u;
+            if (s_fopenTraceCount++ < 256u)
+            {
+                std::cerr << "[fopen] path='" << hostPath << "' mode='" << hostMode
+                          << "' pathAddr=0x" << std::hex << pathAddr
+                          << " modeAddr=0x" << modeAddr
+                          << " ra=0x" << getRegU32(ctx, 31)
+                          << " sp=0x" << getRegU32(ctx, 29) << std::dec << std::endl;
+            }
             RUNTIME_LOG("ps2_stub fopen: path='" << hostPath << "', mode='" << hostMode << "'");
             FILE *fp = ::fopen(hostPath, hostMode);
             if (fp)
@@ -708,6 +1072,8 @@ namespace ps2_stubs
                 std::lock_guard<std::mutex> lock(g_file_mutex);
                 file_handle = generate_file_handle();
                 g_file_map[file_handle] = fp;
+                std::cerr << "[fopen:ok] handle=0x" << std::hex << file_handle
+                          << " path='" << hostPath << "'" << std::dec << std::endl;
                 RUNTIME_LOG("  -> handle=0x" << std::hex << file_handle << std::dec);
             }
             else
@@ -770,12 +1136,77 @@ namespace ps2_stubs
         if (hostPtr && fp && size > 0 && count > 0)
         {
             items_read = ::fread(hostPtr, size, count, fp);
+            static uint32_t s_freadTraceCount = 0u;
+            if (s_freadTraceCount++ < 256u)
+            {
+                std::cerr << "[fread] ptr=0x" << std::hex << ptrAddr
+                          << " handle=0x" << file_handle
+                          << " size=0x" << size
+                          << " count=0x" << count
+                          << " items=0x" << static_cast<uint32_t>(items_read)
+                          << " ra=0x" << getRegU32(ctx, 31)
+                          << " sp=0x" << getRegU32(ctx, 29) << std::dec << std::endl;
+            }
+        }
+        else if (hostPtr && !fp && size > 0 && count > 0 &&
+                 guestContiguousBytes(file_handle) >= 0x10u)
+        {
+            // Newlib's sscanf family fabricates a FILE object in guest memory.
+            // Consume its current read buffer before asking for a refill.
+            uint8_t *guestFile = getMemPtr(rdram, file_handle);
+            uint32_t readPtr = 0u;
+            uint32_t remaining = 0u;
+            uint16_t flags = 0u;
+            std::memcpy(&readPtr, guestFile + 0x00u, sizeof(readPtr));
+            std::memcpy(&remaining, guestFile + 0x04u, sizeof(remaining));
+            std::memcpy(&flags, guestFile + 0x0Cu, sizeof(flags));
+
+            constexpr uint16_t kNewlibReadFlag = 0x0004u;
+            const uint64_t requested64 = static_cast<uint64_t>(size) * static_cast<uint64_t>(count);
+            const uint32_t requested = requested64 > UINT32_MAX
+                ? UINT32_MAX
+                : static_cast<uint32_t>(requested64);
+            const uint32_t sourceAvailable = guestContiguousBytes(readPtr);
+            const uint32_t destinationAvailable = guestContiguousBytes(ptrAddr);
+
+            if ((flags & kNewlibReadFlag) != 0u && readPtr != 0u && remaining != 0u &&
+                sourceAvailable != 0u && destinationAvailable != 0u)
+            {
+                const uint32_t bytesRead = std::min(
+                    std::min(requested, remaining),
+                    std::min(sourceAvailable, destinationAvailable));
+                const uint8_t *source = getConstMemPtr(rdram, readPtr);
+                std::memmove(hostPtr, source, bytesRead);
+
+                readPtr += bytesRead;
+                remaining -= bytesRead;
+                std::memcpy(guestFile + 0x00u, &readPtr, sizeof(readPtr));
+                std::memcpy(guestFile + 0x04u, &remaining, sizeof(remaining));
+                items_read = bytesRead / size;
+
+                static uint32_t s_guestFreadTraceCount = 0u;
+                if (s_guestFreadTraceCount++ < 256u)
+                {
+                    std::cerr << "[fread:guest-buffer] ptr=0x" << std::hex << ptrAddr
+                              << " file=0x" << file_handle
+                              << " source=0x" << (readPtr - bytesRead)
+                              << " size=0x" << size
+                              << " count=0x" << count
+                              << " bytes=0x" << bytesRead
+                              << " remaining=0x" << remaining
+                              << " flags=0x" << flags
+                              << " ra=0x" << getRegU32(ctx, 31)
+                              << " sp=0x" << getRegU32(ctx, 29) << std::dec << std::endl;
+                }
+            }
         }
         else
         {
             std::cerr << "fread error: Invalid arguments."
                       << " Ptr: 0x" << std::hex << ptrAddr << " (host ptr valid: " << (hostPtr != nullptr) << ")"
-                      << ", Handle: 0x" << file_handle << " (file valid: " << (fp != nullptr) << ")" << std::dec
+                      << ", Handle: 0x" << file_handle << " (file valid: " << (fp != nullptr) << ")"
+                      << ", ra=0x" << getRegU32(ctx, 31)
+                      << ", sp=0x" << getRegU32(ctx, 29) << std::dec
                       << ", Size: " << size << ", Count: " << count << std::endl;
         }
         // returns the number of items successfully read.
@@ -909,7 +1340,9 @@ namespace ps2_stubs
             }
             else
             {
-                std::cerr << "fflush error: Invalid file handle 0x" << std::hex << file_handle << std::dec << std::endl;
+                std::cerr << "fflush error: Invalid file handle 0x" << std::hex << file_handle
+                          << " ra=0x" << getRegU32(ctx, 31)
+                          << " sp=0x" << getRegU32(ctx, 29) << std::dec << std::endl;
             }
         }
         // returns 0 on success, EOF on error.
@@ -947,6 +1380,11 @@ namespace ps2_stubs
         const float x = ctx->f[12];
         const float y = ctx->f[13];
         ctx->f[0] = ::cosf(x + y);
+    }
+
+    void __ieee754_acosf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ctx->f[0] = ::acosf(ctx->f[12]);
     }
 
     void __ieee754_rem_pio2f(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

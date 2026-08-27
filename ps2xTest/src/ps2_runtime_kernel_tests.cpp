@@ -386,11 +386,10 @@ namespace
         StartThread(rdram, ctx, runtime);
     }
 
-    void schedulerPreemptLowResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    void schedulerPreemptLowResume(uint8_t *, R5900Context *ctx, PS2Runtime *)
     {
         gSchedulerTrace->push_back(31);
         ctx->pc = 0u;
-        runtime->requestStop();
     }
 
     void schedulerHigh(uint8_t *, R5900Context *ctx, PS2Runtime *)
@@ -582,6 +581,17 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(thread->option, threadParam.option, "option must be decoded from offset 0x20");
             t.IsTrue(thread->status == EeThreadStatus::Dormant, "a newly created EE thread must be dormant");
 
+            threadParam.initial_priority = 0;
+            std::memcpy(env.rdram.data() + K_PARAM_ADDR, &threadParam, sizeof(threadParam));
+            setRegU32(env.ctx, 4, K_PARAM_ADDR);
+            CreateThread(env.rdram.data(), &env.ctx, &env.runtime);
+            const int priorityZeroThreadId = getRegS32(env.ctx, 2);
+            const GuestThread *priorityZeroThread = env.runtime.eeScheduler().thread(priorityZeroThreadId);
+            t.IsTrue(priorityZeroThreadId > threadId && priorityZeroThread != nullptr,
+                     "CreateThread should accept the kernel's highest scheduling priority, zero");
+            t.Equals(priorityZeroThread->initialPriority, 0,
+                     "priority-zero threads must retain their requested scheduling priority");
+
             setRegU32(env.ctx, 4, PS2_RAM_SIZE - static_cast<uint32_t>(sizeof(EeThreadCreateAbi)) + 4u);
             CreateThread(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegS32(env.ctx, 2), KE_ERROR,
@@ -704,6 +714,34 @@ void register_ps2_runtime_kernel_tests()
                      "the resumed waiter should re-enter its priority queue once");
         });
 
+        tc.Run("ChangeThreadPriority returns the previous priority", [](TestCase &t)
+        {
+            TestEnv env;
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+            ee.bindMainContextForSyscall(env.ctx, env.rdram.data());
+
+            const int id = ee.createThread(EeThreadCreateParams{0u, K_SCHED_HIGH, 0x24000u, 0x800u,
+                                                                 0u, 25, 0u});
+            t.Equals(ee.startThread(id, 0u, env.ctx, false), KE_OK,
+                     "the target thread should be ready before its priority changes");
+
+            setRegU32(env.ctx, 4, static_cast<uint32_t>(id));
+            setRegU32(env.ctx, 5, 8u);
+            ChangeThreadPriority(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), 25,
+                     "the syscall should return the target thread's previous priority");
+            t.Equals(ee.thread(id)->currentPriority, 8,
+                     "the requested priority should be applied to the target thread");
+
+            setRegU32(env.ctx, 5, 16u);
+            ChangeThreadPriority(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), 8,
+                     "a later change should return the priority established by the earlier call");
+            t.Equals(ee.thread(id)->currentPriority, 16,
+                     "the later priority should replace the earlier one");
+        });
+
         tc.Run("semaphore signal, delete, and release complete blocked contexts with exact results", [](TestCase &t)
         {
             const auto blockMain = [](TestEnv &env, int &semaId)
@@ -810,7 +848,7 @@ void register_ps2_runtime_kernel_tests()
             t.IsTrue(trace == expected, "explicit rotation should move the current head behind its FIFO peer");
         });
 
-        tc.Run("starting a strictly higher-priority thread preempts immediately", [](TestCase &t)
+        tc.Run("StartThread leaves a higher-priority thread ready until the caller yields", [](TestCase &t)
         {
             TestEnv env;
             std::vector<int> trace;
@@ -828,8 +866,37 @@ void register_ps2_runtime_kernel_tests()
             ee.startThread(low, 0, env.ctx, false);
             ee.run();
 
-            const std::vector<int> expected{1, 30, 5, 31};
-            t.IsTrue(trace == expected, "higher priority should run before the starter continues");
+            const std::vector<int> expected{1, 30, 31, 5};
+            t.IsTrue(trace == expected, "StartThread must not force an EE thread reschedule");
+        });
+
+        tc.Run("time-slice preemption waits until EE interrupts are enabled", [](TestCase &t)
+        {
+            constexpr uint32_t kStatusIe = 1u << 0u;
+            constexpr uint32_t kStatusEie = 1u << 16u;
+
+            TestEnv env;
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+            ee.bindMainContextForSyscall(env.ctx, env.rdram.data());
+
+            int oldPriority = 0;
+            t.Equals(ee.changePriority(EeScheduler::kMainThreadId, 5, false, oldPriority), 0,
+                     "the running main thread should accept a schedulable priority");
+            const int peer = ee.createThread(EeThreadCreateParams{0u, K_SCHED_HIGH, 0x24000u, 0x800u,
+                                                                  0u, 5, 0u});
+            t.Equals(ee.startThread(peer, 0u, env.ctx, false), KE_OK,
+                     "the same-priority peer should become ready");
+
+            R5900Context *current = ee.currentContext();
+            t.IsTrue(current != nullptr, "the main thread should remain the active context");
+            current->cop0_status = kStatusIe;
+            t.IsFalse(ee.checkpointDue(static_cast<uint32_t>(EeScheduler::kDefaultTimeSliceCycles)),
+                      "DI must defer synthetic time-slice preemption");
+
+            current->cop0_status |= kStatusEie;
+            t.IsTrue(ee.checkpointDue(1u),
+                     "EI must make the deferred time-slice preemption due immediately");
         });
 
         tc.Run("semaphore waiters are FIFO and signal transfers one token directly", [](TestCase &t)

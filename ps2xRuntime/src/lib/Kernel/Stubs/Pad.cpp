@@ -1,5 +1,8 @@
 #include "Common.h"
 #include "Pad.h"
+#include "runtime/ee_scheduler.h"
+
+#include <cstdlib>
 
 namespace ps2_stubs
 {
@@ -313,6 +316,86 @@ namespace ps2_stubs
                     applyGamepadState(state);
                     applyKeyboardState(state, portState.analogMode);
                 }
+            }
+
+            static const uint32_t autoPressStartRead = []()
+            {
+                const char *value = std::getenv("PS2X_AUTOPRESS_START_AFTER_READS");
+                return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
+            }();
+            static const uint32_t autoPressStartDuration = []()
+            {
+                const char *value = std::getenv("PS2X_AUTOPRESS_START_READS");
+                return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 8u;
+            }();
+            if (autoPressStartRead != 0u &&
+                portState.readCount >= autoPressStartRead &&
+                portState.readCount < autoPressStartRead + autoPressStartDuration)
+            {
+                state.buttons = static_cast<uint16_t>(state.buttons & ~kPadBtnStart);
+                if (portState.readCount == autoPressStartRead)
+                {
+                    std::fprintf(stderr, "[pad:auto-start] port=%d read=%u\n", port, portState.readCount);
+                }
+            }
+
+            static const uint32_t autoPressCrossRead = []()
+            {
+                const char *value = std::getenv("PS2X_AUTOPRESS_CROSS_AFTER_READS");
+                return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
+            }();
+            static const uint32_t autoPressCrossReads = []()
+            {
+                const char *value = std::getenv("PS2X_AUTOPRESS_CROSS_READS");
+                return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 8u;
+            }();
+            if (autoPressCrossRead != 0u &&
+                portState.readCount >= autoPressCrossRead &&
+                portState.readCount < autoPressCrossRead + autoPressCrossReads)
+            {
+                state.buttons = static_cast<uint16_t>(state.buttons & ~kPadBtnCross);
+                if (portState.readCount == autoPressCrossRead)
+                {
+                    std::fprintf(stderr, "[pad:auto-cross] port=%d read=%u\n", port, portState.readCount);
+                }
+            }
+
+            static const uint64_t autoPressCrossTick = []()
+            {
+                const char *value = std::getenv("PS2X_AUTOPRESS_CROSS_AT_TICK");
+                return value ? std::strtoull(value, nullptr, 0) : 0u;
+            }();
+            static const uint64_t autoPressCrossDuration = []()
+            {
+                const char *value = std::getenv("PS2X_AUTOPRESS_CROSS_TICKS");
+                return value ? std::strtoull(value, nullptr, 0) : 4u;
+            }();
+            if (runtime && autoPressCrossTick != 0u)
+            {
+                const uint64_t tick = runtime->eeScheduler().currentVSyncTick();
+                if (tick >= autoPressCrossTick &&
+                    tick < autoPressCrossTick + autoPressCrossDuration)
+                {
+                    state.buttons = static_cast<uint16_t>(state.buttons & ~kPadBtnCross);
+                    if (tick == autoPressCrossTick)
+                    {
+                        std::fprintf(stderr, "[pad:auto-cross] port=%d tick=%llu read=%u\n",
+                                     port, static_cast<unsigned long long>(tick), portState.readCount);
+                    }
+                }
+            }
+
+            static const uint32_t readLogInterval = []()
+            {
+                const char *value = std::getenv("PS2X_PAD_READ_LOG_INTERVAL");
+                return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
+            }();
+            if (runtime && port == 0 && readLogInterval != 0u &&
+                (portState.readCount % readLogInterval) == 0u)
+            {
+                std::fprintf(stderr, "[pad:read] tick=%llu read=%u buttons=0x%04x\n",
+                             static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()),
+                             portState.readCount, state.buttons);
             }
 
             fillPadStatus(outData, state, portState);
@@ -641,6 +724,16 @@ namespace ps2_stubs
         {
             setReturnS32(ctx, 0);
             return;
+        }
+
+        if (port == 0 && slot == 0 && runtime != nullptr &&
+            std::getenv("PS2X_PAD_AUTOPULSE_START") != nullptr)
+        {
+            const uint64_t tick = runtime->eeScheduler().currentVSyncTick();
+            if (tick >= 120u && (tick % 60u) < 2u)
+            {
+                data[2] = static_cast<uint8_t>(data[2] & ~kPadBtnStart);
+            }
         }
 
         PS2_IF_AGRESSIVE_LOGS({

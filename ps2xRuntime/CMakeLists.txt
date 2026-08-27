@@ -52,6 +52,7 @@ set(PS2X_VITA_APP_NAME "PS2 Retro X" CACHE STRING "Display name for the Vita bub
 set(PS2X_VITA_TITLEID "RANJ00001" CACHE STRING "9-character Vita title id")
 set(PS2X_VITA_VERSION "01.00" CACHE STRING "Vita app version")
 set(PS2X_DEFAULT_BOOT_ELF "" CACHE STRING "Guest ELF path passed directly to main() when argv is unavailable")
+set(PS2X_RECOMPILED_OUTPUT_DIR "" CACHE PATH "Directory containing ps2xRecomp-generated C++ output")
 
 if(PS2X_IS_VITA)
     if(NOT DEFINED ENV{VITASDK})
@@ -318,12 +319,19 @@ elseif(WIN32)
     add_dependencies(ffmpeg_swscale ffmpeg_external)
 
     add_library(ffmpeg INTERFACE)
+    add_library(ffmpeg_zlib UNKNOWN IMPORTED GLOBAL)
+    set_target_properties(ffmpeg_zlib PROPERTIES
+        IMPORTED_LOCATION "${FFMPEG_SOURCE_DIR}/lib/zlib.lib"
+        INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_INCLUDE_DIR}"
+    )
+    add_dependencies(ffmpeg_zlib ffmpeg_external)
     target_link_libraries(ffmpeg INTERFACE
         ffmpeg_avcodec
         ffmpeg_avformat
         ffmpeg_avutil
         ffmpeg_swresample
         ffmpeg_swscale
+        ffmpeg_zlib
         bcrypt
         secur32
         ws2_32
@@ -439,6 +447,29 @@ file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
 )
 
+set(PS2X_RECOMPILED_GENERATED_HEADERS "")
+set(PS2X_RECOMPILED_GENERATED_SOURCES "")
+
+if(PS2X_RECOMPILED_OUTPUT_DIR)
+    cmake_path(ABSOLUTE_PATH PS2X_RECOMPILED_OUTPUT_DIR
+        BASE_DIRECTORY "${CMAKE_BINARY_DIR}"
+        NORMALIZE
+        OUTPUT_VARIABLE PS2X_RECOMPILED_OUTPUT_ABS)
+
+    if(NOT EXISTS "${PS2X_RECOMPILED_OUTPUT_ABS}/register_functions.cpp")
+        message(FATAL_ERROR
+            "PS2X_RECOMPILED_OUTPUT_DIR must point at ps2xRecomp output containing register_functions.cpp: "
+            "${PS2X_RECOMPILED_OUTPUT_ABS}")
+    endif()
+
+    list(REMOVE_ITEM RUNNER_SRC_FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/register_functions.cpp")
+    file(GLOB PS2X_RECOMPILED_GENERATED_SOURCES CONFIGURE_DEPENDS
+        "${PS2X_RECOMPILED_OUTPUT_ABS}/*.cpp")
+    list(APPEND PS2X_RECOMPILED_GENERATED_HEADERS
+        "${PS2X_RECOMPILED_OUTPUT_ABS}/ps2_recompiled_functions.h"
+        "${PS2X_RECOMPILED_OUTPUT_ABS}/ps2_recompiled_stubs.h")
+endif()
+
 set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
 set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
 
@@ -475,7 +506,8 @@ if(PS2X_ENABLE_RUNNER_PCH)
 
     foreach(PS2X_RUNNER_GENERATED_HEADER IN ITEMS
         "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_functions.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_stubs.h")
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_stubs.h"
+        ${PS2X_RECOMPILED_GENERATED_HEADERS})
         if(EXISTS "${PS2X_RUNNER_GENERATED_HEADER}")
             list(APPEND PS2X_RUNNER_PCH_HEADERS "${PS2X_RUNNER_GENERATED_HEADER}")
         endif()
@@ -496,7 +528,8 @@ if(PS2X_DEFAULT_BOOT_ELF_DEFINE)
 endif()
 
 if(MSVC)
-    target_compile_options(ps2EntryRunner PRIVATE /FS)
+    target_compile_options(ps2EntryRunner PRIVATE /FS /MP1)
+    target_link_options(ps2EntryRunner PRIVATE "/STACK:67108864")
 endif()
 
 target_include_directories(ps2_runtime PUBLIC
@@ -509,6 +542,11 @@ target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime
 )
+
+if(PS2X_RECOMPILED_GENERATED_SOURCES)
+    target_sources(ps2EntryRunner PRIVATE ${PS2X_RECOMPILED_GENERATED_SOURCES})
+    target_include_directories(ps2EntryRunner PRIVATE "${PS2X_RECOMPILED_OUTPUT_ABS}")
+endif()
 
 if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE

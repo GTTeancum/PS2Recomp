@@ -52,6 +52,11 @@ namespace ps2recomp
         addEvent(Severity::Error, category, message);
     }
 
+    void RecompilerReporter::infoAt(const std::string &category, const std::string &functionName, uint32_t address, const std::string &message)
+    {
+        addEvent(Severity::Info, category, message, functionName, address, true);
+    }
+
     void RecompilerReporter::warningAt(const std::string &category, const std::string &functionName, uint32_t address, const std::string &message)
     {
         addEvent(Severity::Warning, category, message, functionName, address, true);

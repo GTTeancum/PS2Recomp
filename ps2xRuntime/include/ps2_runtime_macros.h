@@ -140,13 +140,75 @@ static inline uint32_t ps2_plzcw32(uint32_t x)
 #define PS2_PXOR(a, b) _mm_xor_si128((__m128i)(a), (__m128i)(b))
 #define PS2_PNOR(a, b) _mm_xor_si128(_mm_or_si128((__m128i)(a), (__m128i)(b)), _mm_set1_epi32(0xFFFFFFFF))
 
-// PS2 VU (Vector Unit) operations
-#define PS2_VADD(a, b) _mm_add_ps((__m128)(a), (__m128)(b))
-#define PS2_VSUB(a, b) _mm_sub_ps((__m128)(a), (__m128)(b))
-#define PS2_VMUL(a, b) _mm_mul_ps((__m128)(a), (__m128)(b))
-#define PS2_VDIV(a, b) _mm_div_ps((__m128)(a), (__m128)(b))
-#define PS2_VMULQ(a, q) _mm_mul_ps((__m128)(a), _mm_set1_ps(q))
+// PS2 VU (Vector Unit) operations. VU floats have no IEEE NaN/Infinity or
+// denormal values: exponent 255 clamps to signed max and exponent 0 to zero.
+static inline __m128 ps2_vu_normalize_float(__m128 value)
+{
+    const __m128i bits = _mm_castps_si128(value);
+    const __m128i sign = _mm_and_si128(bits, _mm_set1_epi32(INT32_MIN));
+    const __m128i exponent = _mm_and_si128(bits, _mm_set1_epi32(0x7F800000));
+    const __m128i zeroExponent = _mm_cmpeq_epi32(exponent, _mm_setzero_si128());
+    const __m128i maxExponent = _mm_cmpeq_epi32(exponent, _mm_set1_epi32(0x7F800000));
+    const __m128i signedMax = _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF));
+    __m128i normalized = _mm_or_si128(_mm_and_si128(zeroExponent, sign),
+                                      _mm_andnot_si128(zeroExponent, bits));
+    normalized = _mm_or_si128(_mm_and_si128(maxExponent, signedMax),
+                              _mm_andnot_si128(maxExponent, normalized));
+    return _mm_castsi128_ps(normalized);
+}
+
+static inline __m128 ps2_vu_add(__m128 a, __m128 b)
+{
+    return ps2_vu_normalize_float(
+        _mm_add_ps(ps2_vu_normalize_float(a), ps2_vu_normalize_float(b)));
+}
+
+static inline __m128 ps2_vu_sub(__m128 a, __m128 b)
+{
+    return ps2_vu_normalize_float(
+        _mm_sub_ps(ps2_vu_normalize_float(a), ps2_vu_normalize_float(b)));
+}
+
+static inline __m128 ps2_vu_mul(__m128 a, __m128 b)
+{
+    return ps2_vu_normalize_float(
+        _mm_mul_ps(ps2_vu_normalize_float(a), ps2_vu_normalize_float(b)));
+}
+
+static inline __m128 ps2_vu_div(__m128 a, __m128 b)
+{
+    return ps2_vu_normalize_float(
+        _mm_div_ps(ps2_vu_normalize_float(a), ps2_vu_normalize_float(b)));
+}
+
+static inline uint32_t ps2_vu_clip(uint32_t previousFlags, __m128 fs, __m128 ft)
+{
+    const __m128i fsBits = _mm_castps_si128(fs);
+    const __m128i ftBits = _mm_castps_si128(ft);
+    const uint32_t wBits = static_cast<uint32_t>(Ps2ExtractEpi32(ftBits, 3));
+    const int32_t clipMagnitude = static_cast<int32_t>(
+        (wBits & 0x7F800000u) != 0u ? (wBits & 0x7FFFFFFFu) : 0x007FFFFFu);
+
+    uint32_t flags = 0u;
+    for (int lane = 0; lane < 3; ++lane)
+    {
+        const uint32_t value = static_cast<uint32_t>(Ps2ExtractEpi32(fsBits, lane));
+        if (static_cast<int32_t>(value) > clipMagnitude)
+            flags |= 1u << (lane * 2);
+        if (static_cast<int32_t>(value ^ 0x80000000u) > clipMagnitude)
+            flags |= 2u << (lane * 2);
+    }
+
+    return ((previousFlags << 6) | flags) & 0x00FFFFFFu;
+}
+
+#define PS2_VADD(a, b) ps2_vu_add((__m128)(a), (__m128)(b))
+#define PS2_VSUB(a, b) ps2_vu_sub((__m128)(a), (__m128)(b))
+#define PS2_VMUL(a, b) ps2_vu_mul((__m128)(a), (__m128)(b))
+#define PS2_VDIV(a, b) ps2_vu_div((__m128)(a), (__m128)(b))
+#define PS2_VMULQ(a, q) ps2_vu_mul((__m128)(a), _mm_set1_ps(q))
 #define PS2_VBLEND(a, b, mask) PS2_BLENDV_PS((__m128)(a), (__m128)(b), (__m128)(mask))
+#define PS2_VCLIP(flags, fs, ft) ps2_vu_clip((uint32_t)(flags), (__m128)(fs), (__m128)(ft))
 
 // Memory access helpers - Hybrid Fast/Slow Path
 // Fast path: Direct RDRAM access (masked).
@@ -605,10 +667,102 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 
 // FPU (COP1) operations
 #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)
-#define FPU_ADD_S(a, b) ((float)(a) + (float)(b))
-#define FPU_SUB_S(a, b) ((float)(a) - (float)(b))
-#define FPU_MUL_S(a, b) ((float)(a) * (float)(b))
-#define FPU_DIV_S(a, b) ((float)(a) / (float)(b))
+inline float ps2_fpu_normalize_operand_s(float value)
+{
+    uint32_t bits = std::bit_cast<uint32_t>(value);
+    const uint32_t exponent = bits & 0x7F800000u;
+    if (exponent == 0u)
+        bits &= 0x80000000u;
+    else if (exponent == 0x7F800000u)
+        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+    return std::bit_cast<float>(bits);
+}
+
+inline float ps2_fpu_finish_arithmetic_s(R5900Context *ctx, float value)
+{
+    uint32_t bits = std::bit_cast<uint32_t>(value);
+    const uint32_t exponent = bits & 0x7F800000u;
+    if (exponent == 0x7F800000u)
+    {
+        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+        if (ctx)
+            ctx->fcr31 |= 0x00008010u;
+        return std::bit_cast<float>(bits);
+    }
+
+    if (ctx)
+        ctx->fcr31 &= ~0x00008000u;
+    if (exponent == 0u && (bits & 0x007FFFFFu) != 0u)
+    {
+        bits &= 0x80000000u;
+        if (ctx)
+            ctx->fcr31 |= 0x00004008u;
+    }
+    else if (ctx)
+    {
+        ctx->fcr31 &= ~0x00004000u;
+    }
+    return std::bit_cast<float>(bits);
+}
+
+inline float ps2_fpu_add_s(R5900Context *ctx, float lhs, float rhs)
+{
+    return ps2_fpu_finish_arithmetic_s(
+        ctx, ps2_fpu_normalize_operand_s(lhs) + ps2_fpu_normalize_operand_s(rhs));
+}
+
+inline float ps2_fpu_sub_s(R5900Context *ctx, float lhs, float rhs)
+{
+    return ps2_fpu_finish_arithmetic_s(
+        ctx, ps2_fpu_normalize_operand_s(lhs) - ps2_fpu_normalize_operand_s(rhs));
+}
+
+inline float ps2_fpu_mul_s(R5900Context *ctx, float lhs, float rhs)
+{
+    return ps2_fpu_finish_arithmetic_s(
+        ctx, ps2_fpu_normalize_operand_s(lhs) * ps2_fpu_normalize_operand_s(rhs));
+}
+
+inline float ps2_fpu_madd_s(R5900Context *ctx, float acc, float lhs, float rhs, bool subtract)
+{
+    const float product = ps2_fpu_normalize_operand_s(lhs) * ps2_fpu_normalize_operand_s(rhs);
+    const float normalizedProduct = ps2_fpu_normalize_operand_s(product);
+    const float normalizedAcc = ps2_fpu_normalize_operand_s(acc);
+    return ps2_fpu_finish_arithmetic_s(
+        ctx, subtract ? normalizedAcc - normalizedProduct : normalizedAcc + normalizedProduct);
+}
+
+#define FPU_ADD_S(ctx, a, b) ps2_fpu_add_s((ctx), (float)(a), (float)(b))
+#define FPU_SUB_S(ctx, a, b) ps2_fpu_sub_s((ctx), (float)(a), (float)(b))
+#define FPU_MUL_S(ctx, a, b) ps2_fpu_mul_s((ctx), (float)(a), (float)(b))
+#define FPU_MADD_S(ctx, acc, a, b) ps2_fpu_madd_s((ctx), (float)(acc), (float)(a), (float)(b), false)
+#define FPU_MSUB_S(ctx, acc, a, b) ps2_fpu_madd_s((ctx), (float)(acc), (float)(a), (float)(b), true)
+inline float ps2_fpu_div_s(R5900Context *ctx, float numerator, float denominator)
+{
+    uint32_t numeratorBits = std::bit_cast<uint32_t>(numerator);
+    uint32_t denominatorBits = std::bit_cast<uint32_t>(denominator);
+    const bool numeratorIsZero = (numeratorBits & 0x7F800000u) == 0u;
+    const bool denominatorIsZero = (denominatorBits & 0x7F800000u) == 0u;
+
+    if (denominatorIsZero)
+    {
+        if (ctx)
+            ctx->fcr31 |= numeratorIsZero ? 0x00020040u : 0x00010020u;
+        const uint32_t resultBits =
+            ((numeratorBits ^ denominatorBits) & 0x80000000u) | 0x7F7FFFFFu;
+        return std::bit_cast<float>(resultBits);
+    }
+
+    float result = ps2_fpu_normalize_operand_s(numerator) / ps2_fpu_normalize_operand_s(denominator);
+    uint32_t resultBits = std::bit_cast<uint32_t>(result);
+    const uint32_t resultExponent = resultBits & 0x7F800000u;
+    if (resultExponent == 0x7F800000u)
+        resultBits = (resultBits & 0x80000000u) | 0x7F7FFFFFu;
+    else if (resultExponent == 0u)
+        resultBits &= 0x80000000u;
+    return std::bit_cast<float>(resultBits);
+}
+#define FPU_DIV_S(ctx, a, b) ps2_fpu_div_s((ctx), (float)(a), (float)(b))
 #define FPU_SQRT_S(a) sqrtf((float)(a))
 #define FPU_ABS_S(a) fabsf((float)(a))
 #define FPU_MOV_S(a) ((float)(a))
@@ -623,7 +777,17 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
 #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
 #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
+inline int32_t ps2_fpu_cvt_w_s(float value)
+{
+    if (std::isnan(value))
+        return 0;
+    if (value >= 2147483648.0f)
+        return INT32_MAX;
+    if (value < -2147483648.0f)
+        return INT32_MIN;
+    return static_cast<int32_t>(value);
+}
+#define FPU_CVT_W_S(a) ps2_fpu_cvt_w_s((float)(a))
 #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
 #define FPU_C_F_S(a, b) (0)
 #define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))

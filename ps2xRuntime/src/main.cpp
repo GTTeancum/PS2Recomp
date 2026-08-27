@@ -14,6 +14,7 @@
 #include <exception>
 #include <algorithm>
 #include <cstdlib>
+#include <cstdio>
 
 #if defined(__ANDROID__)
 #include <android/log.h>
@@ -23,8 +24,55 @@
 #include <cstring>
 #endif
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
+extern "C" void ps2xDumpDispatchHistoryToStderr();
+
 namespace
 {
+#if defined(_WIN32)
+    PS2Runtime *g_activeRuntime = nullptr;
+
+    LONG WINAPI logUnhandledSehException(PEXCEPTION_POINTERS info)
+    {
+        const DWORD code = info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionCode : 0u;
+        if (code == 0xe06d7363u)
+        {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        const void *address = info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionAddress : nullptr;
+        uint32_t guestPc = 0u;
+        uint32_t guestRa = 0u;
+        uint32_t guestSp = 0u;
+        uint32_t guestGp = 0u;
+        if (g_activeRuntime)
+        {
+            guestPc = g_activeRuntime->m_debugPc.load(std::memory_order_relaxed);
+            guestRa = g_activeRuntime->m_debugRa.load(std::memory_order_relaxed);
+            guestSp = g_activeRuntime->m_debugSp.load(std::memory_order_relaxed);
+            guestGp = g_activeRuntime->m_debugGp.load(std::memory_order_relaxed);
+        }
+
+        const void *moduleBase = GetModuleHandleW(nullptr);
+        std::fprintf(stderr,
+                     "[seh] code=0x%08lx address=%p module_base=%p guest_pc=0x%08x guest_ra=0x%08x guest_sp=0x%08x guest_gp=0x%08x\n",
+                     static_cast<unsigned long>(code),
+                     address,
+                     moduleBase,
+                     guestPc,
+                     guestRa,
+                     guestSp,
+                     guestGp);
+        ps2xDumpDispatchHistoryToStderr();
+        std::fflush(stderr);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+#endif
+
 #if defined(__ANDROID__)
     int g_logcatPipeFds[2]{-1, -1};
     std::thread g_logcatThread;
@@ -169,6 +217,9 @@ int main(int argc, char *argv[])
 #if defined(__ANDROID__)
     redirectStdioToLogcat();
 #endif
+#if defined(_WIN32)
+    AddVectoredExceptionHandler(1, logUnhandledSehException);
+#endif
     setupTerminateLogger();
 
     try
@@ -194,6 +245,9 @@ int main(int argc, char *argv[])
         }
 
         PS2Runtime runtime;
+#if defined(_WIN32)
+        g_activeRuntime = &runtime;
+#endif
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
         // This hook is to prevent leak rlimgui deps to recompiler etc
         PS2DebugPanel debugPanel;

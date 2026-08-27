@@ -54,6 +54,7 @@ namespace ps2recomp
         void info(const std::string &category, const std::string &message);
         void warning(const std::string &category, const std::string &message);
         void error(const std::string &category, const std::string &message);
+        void infoAt(const std::string &category, const std::string &functionName, uint32_t address, const std::string &message);
         void warningAt(const std::string &category, const std::string &functionName, uint32_t address, const std::string &message);
         void errorAt(const std::string &category, const std::string &functionName, uint32_t address, const std::string &message);
 

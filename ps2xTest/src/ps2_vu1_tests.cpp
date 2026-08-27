@@ -860,7 +860,14 @@ void register_ps2_vu1_tests()
             VU1Interpreter vu1;
             vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
                         fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
-                        0u, 0u, 0u, 32u);
+                        0u, 0u, 0u, 1u);
+            t.IsTrue(vu1.isRunning(),
+                     "exhausting a cycle slice before E's delay slot should leave VU1 running");
+            vu1.resume(fx.code, PS2_VU1_CODE_SIZE,
+                       fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+                       0u, 0u, 31u);
+            t.IsTrue(!vu1.isRunning(),
+                     "completing E's delay slot should mark VU1 idle");
             t.Equals(vu1.state().vi[1], 7,
                      "E should execute exactly one sequential delay slot");
             t.Equals(vu1.state().vi[2], 0,

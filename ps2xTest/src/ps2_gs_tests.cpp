@@ -436,9 +436,9 @@ void register_ps2_gs_tests()
 
             const uint64_t imrPattern = 0x0123456789ABCDEFull;
             mem.write64(kGsImr, imrPattern);
-            t.Equals(mem.read64(kGsImr), imrPattern, "IMR 64-bit read should match prior write");
-            t.Equals(mem.read32(kGsImr), 0x89ABCDEFu, "IMR low dword should match");
-            t.Equals(mem.read32(kGsImr + 4u), 0x01234567u, "IMR high dword should match");
+            t.Equals(mem.read64(kGsImr), 0x6D00ull, "IMR should expose only writable mask and fixed bits");
+            t.Equals(mem.read32(kGsImr), 0x6D00u, "IMR low dword should expose the normalized value");
+            t.Equals(mem.read32(kGsImr + 4u), 0u, "IMR high dword should read as zero");
         });
 
         tc.Run("unknown GS privileged offsets are no-op and read as zero", [](TestCase &t)
@@ -470,29 +470,55 @@ void register_ps2_gs_tests()
             t.Equals(mem.gsWriteCount(), countBefore + 2ull, "GS IO writes should increment GS write counter");
 
             t.Equals(mem.readIORegister(kGsPmode), 0x11u, "writeIORegister PMODE value should be readable");
-            t.Equals(mem.readIORegister(kGsImr), 0x22u, "writeIORegister IMR value should be readable");
+            t.Equals(mem.readIORegister(kGsImr), 0x6000u, "writeIORegister IMR should expose fixed bits");
+        });
+
+        tc.Run("GS IMR unmask raises an interrupt for an event already pending in CSR", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kGsImr = 0x12001010u;
+            uint32_t interruptCount = 0u;
+            uint32_t interruptEvents = 0u;
+            mem.setGsInterruptCallback([&](uint32_t events)
+                                       {
+                                           ++interruptCount;
+                                           interruptEvents = events;
+                                       });
+
+            t.Equals(mem.gs().imr, PS2_GS_IMR_RESET_VALUE, "GS IMR should reset with all events masked");
+            mem.gs().csr.store(0x2ull);
+            mem.write32(kGsImr, 0x7D00u);
+
+            t.Equals(mem.gs().imr, 0x7D00ull, "FINISH should be unmasked");
+            t.Equals(interruptCount, 1u, "unmasking a pending event should raise one interrupt");
+            t.Equals(interruptEvents, 0x2u, "the callback should identify pending FINISH");
+
+            mem.write32(kGsImr, 0x7D00u);
+            t.Equals(interruptCount, 1u, "rewriting an already-unmasked event should not retrigger it");
         });
 
         tc.Run("GsPutIMR and GsGetIMR roundtrip old and new values", [](TestCase &t)
         {
             PS2Runtime runtime;
             t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
-            runtime.memory().gs().imr = 0xAAAABBBBCCCCDDDDull;
+            runtime.memory().writeGsImr(0x7F00ull);
 
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
             R5900Context ctx{};
 
-            setRegU64(ctx, 4, 0x3333444411112222ull);
+            setRegU64(ctx, 4, 0x7400ull);
             GsPutIMR(rdram.data(), &ctx, &runtime);
 
             const uint64_t oldImr = getReturnU64(ctx);
-            t.Equals(oldImr, 0xAAAABBBBCCCCDDDDull, "GsPutIMR should return previous IMR");
-            t.Equals(runtime.memory().gs().imr, 0x3333444411112222ull, "GsPutIMR should update GS IMR");
+            t.Equals(oldImr, 0x7F00ull, "GsPutIMR should return previous IMR");
+            t.Equals(runtime.memory().gs().imr, 0x7400ull, "GsPutIMR should update GS IMR");
 
             std::memset(&ctx, 0, sizeof(ctx));
             GsGetIMR(rdram.data(), &ctx, &runtime);
             const uint64_t currentImr = getReturnU64(ctx);
-            t.Equals(currentImr, 0x3333444411112222ull, "GsGetIMR should return current GS IMR");
+            t.Equals(currentImr, 0x7400ull, "GsGetIMR should return current GS IMR");
         });
 
         tc.Run("GsSetCrt updates SMODE2 for host presentation mode", [](TestCase &t)
@@ -3610,6 +3636,22 @@ void register_ps2_gs_tests()
                      "AFAIL=RGB_ONLY should preserve destination alpha on CT32");
             t.Equals(rgbOnly.depth, kInitialDepth,
                      "AFAIL=RGB_ONLY should preserve depth");
+        });
+
+        tc.Run("GS disabled depth test passes regardless of ZTST", [](TestCase &t)
+        {
+            constexpr uint32_t kInitialFramebuffer = 0xAB030201u;
+            constexpr uint32_t kInitialDepth = 0x33333333u;
+            constexpr uint64_t kDisabledZteNeverZtst = 0ull;
+
+            const GsPixelTestResult result =
+                drawGsPixelForTests(GS_PSM_CT32, kDisabledZteNeverZtst, false,
+                                    kInitialFramebuffer, kInitialDepth, 0x80u);
+
+            t.Equals(result.framebuffer, 0x80563412u,
+                     "ZTE=0 should allow the framebuffer write even when ZTST encodes NEVER");
+            t.Equals(result.depth, 0x22222222u,
+                     "ZTE=0 should allow the passing pixel to update depth");
         });
 
         tc.Run("GS RGB_ONLY falls back to FB_ONLY outside CT32", [](TestCase &t)

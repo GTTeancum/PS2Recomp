@@ -64,8 +64,7 @@ namespace ps2_syscalls
         uint64_t oldImr = 0;
         if (runtime)
         {
-            oldImr = runtime->memory().gs().imr;
-            runtime->memory().gs().imr = newImr;
+            oldImr = runtime->memory().writeGsImr(newImr);
         }
         RUNTIME_LOG("PS2 GsPutIMR: " << " new=0x" << newImr
                                      << " a0_64=0x" << GPR_U64(ctx, 4)
@@ -567,7 +566,7 @@ namespace ps2_syscalls
         const uint32_t heapBase = (heapBaseRaw + 0xFu) & ~0xFu;
 
         // Silent Hill and other games often pass -1 (0xFFFFFFFF) to mean "rest of RAM".
-        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
+        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01800000u;
         uint32_t heapLimit = kDefaultGuestHeapEnd;
 
         if (heapSize != 0u && heapSize != 0xFFFFFFFFu)
@@ -607,7 +606,7 @@ namespace ps2_syscalls
     {
         (void)rdram;
 
-        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
+        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01800000u;
 
         const uint32_t ret = runtime
                                  ? runtime->guestHeapLimit()

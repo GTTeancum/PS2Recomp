@@ -26,6 +26,10 @@ namespace ps2_stubs
 
     void exit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        std::cerr << "[system:exit] pc=0x" << std::hex << (ctx ? ctx->pc : 0u)
+                  << " ra=0x" << (ctx ? getRegU32(ctx, 31) : 0u)
+                  << " sp=0x" << (ctx ? getRegU32(ctx, 29) : 0u)
+                  << std::dec << std::endl;
         if (runtime)
         {
             runtime->requestStop();

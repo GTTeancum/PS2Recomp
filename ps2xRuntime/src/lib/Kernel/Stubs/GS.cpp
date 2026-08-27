@@ -5,6 +5,9 @@
 #include "runtime/gs/ps2_gs_psmct16.h"
 #include "runtime/ee_scheduler.h"
 
+#include <atomic>
+#include <cstdio>
+
 namespace ps2_stubs
 {
     namespace
@@ -158,6 +161,7 @@ namespace ps2_stubs
             }
 
             writePacketBuilderCurrent(rdram, runtime, stateAddr, currentAddr);
+            refreshPacketBuilderPendingCount(rdram, runtime, stateAddr);
             writeGuestBytes(rdram,
                             runtime,
                             stateAddr + 8u,
@@ -259,7 +263,6 @@ namespace ps2_stubs
         void writePacketBuilderCurrent(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr, uint32_t currentAddr)
         {
             writeGuestU32(rdram, runtime, stateAddr, currentAddr);
-            refreshPacketBuilderPendingCount(rdram, runtime, stateAddr);
         }
 
         uint32_t reservePacketBuilderWords(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr, uint32_t wordCount)
@@ -483,6 +486,17 @@ namespace ps2_stubs
         const uint32_t dsay = getRegU32(ctx, 11);
         const uint32_t width = readStackU32(rdram, ctx, 0);
         const uint32_t height = readStackU32(rdram, ctx, 8);
+
+        static std::atomic<uint32_t> s_refLoadImageTraceCount{0u};
+        const uint32_t traceIndex = s_refLoadImageTraceCount.fetch_add(1u, std::memory_order_relaxed);
+        if (traceIndex < 96u || dbp == 11200u || dbp == 12224u)
+        {
+            std::fprintf(stderr,
+                         "[xmen-ref-load-image] index=%u pc=%08x ra=%08x state=%08x dbp=%u data=%08x qwc=%u "
+                         "dpsm=%u dbw=%u ds=%u,%u size=%u,%u\n",
+                         traceIndex, ctx->pc, getRegU32(ctx, 31), stateAddr, dbp, dataAddr, qwcRemaining,
+                         dpsm, dbw, dsax, dsay, width, height);
+        }
 
         // Open a 4-register A+D GIF tag and emit the GS load-image setup.
         {
@@ -766,6 +780,17 @@ namespace ps2_stubs
             setReturnS32(ctx, -1);
             return;
         }
+        static std::atomic<uint32_t> s_putDispEnvTraceCount{0u};
+        const uint32_t traceIndex = s_putDispEnvTraceCount.fetch_add(1u, std::memory_order_relaxed);
+        if (traceIndex < 64u)
+        {
+            std::fprintf(stderr,
+                         "[gs:sceGsPutDispEnv] index=%u env=0x%08x dispfb=0x%016llx display=0x%016llx\n",
+                         traceIndex,
+                         envAddr,
+                         static_cast<unsigned long long>(env.dispfb),
+                         static_cast<unsigned long long>(env.display));
+        }
         applyGsDispEnv(runtime, env);
         setReturnS32(ctx, 0);
     }
@@ -789,6 +814,19 @@ namespace ps2_stubs
         uint32_t interlace = getRegU32(ctx, 5);
         uint32_t omode = getRegU32(ctx, 6);
         uint32_t ffmode = getRegU32(ctx, 7);
+
+        static std::atomic<uint32_t> s_resetGraphTraceCount{0u};
+        const uint32_t traceIndex = s_resetGraphTraceCount.fetch_add(1u, std::memory_order_relaxed);
+        if (traceIndex < 32u)
+        {
+            std::fprintf(stderr,
+                         "[gs:sceGsResetGraph] index=%u mode=%u interlace=%u omode=%u ffmode=%u\n",
+                         traceIndex,
+                         mode,
+                         interlace,
+                         omode,
+                         ffmode);
+        }
 
         if (mode == 0)
         {
@@ -1140,6 +1178,18 @@ namespace ps2_stubs
             return;
         }
 
+        static std::atomic<uint32_t> s_swapDbuffDcTraceCount{0u};
+        const uint32_t swapTraceIndex = s_swapDbuffDcTraceCount.fetch_add(1u, std::memory_order_relaxed);
+        if (swapTraceIndex < 64u)
+        {
+            std::fprintf(stderr,
+                         "[gs:sceGsSwapDBuffDc] index=%u env=0x%08x which=%u dispfb=0x%016llx display=0x%016llx\n",
+                         swapTraceIndex,
+                         envAddr,
+                         which,
+                         static_cast<unsigned long long>(db.disp[which].dispfb),
+                         static_cast<unsigned long long>(db.disp[which].display));
+        }
         applyGsDispEnv(runtime, db.disp[which]);
         static uint32_t s_swapDbuffLogCount = 0u;
         if (s_swapDbuffLogCount < 32u)
@@ -1198,6 +1248,18 @@ namespace ps2_stubs
             return;
         }
 
+        static std::atomic<uint32_t> s_swapDbuffTraceCount{0u};
+        const uint32_t swapTraceIndex = s_swapDbuffTraceCount.fetch_add(1u, std::memory_order_relaxed);
+        if (swapTraceIndex < 64u)
+        {
+            std::fprintf(stderr,
+                         "[gs:sceGsSwapDBuff] index=%u env=0x%08x which=%u dispfb=0x%016llx display=0x%016llx\n",
+                         swapTraceIndex,
+                         envAddr,
+                         which,
+                         static_cast<unsigned long long>(db.disp[which].dispfb),
+                         static_cast<unsigned long long>(db.disp[which].display));
+        }
         applyGsDispEnv(runtime, db.disp[which]);
         if (which == 0u)
         {
@@ -1297,6 +1359,16 @@ namespace ps2_stubs
         EeScheduler &ee = runtime->eeScheduler();
         ee.bindMainContextForSyscall(*ctx, rdram);
         const uint32_t oldCallback = ee.setGsVSyncCallback(newCallback, gp, sp);
+
+        std::fprintf(stdout,
+                     "[xmen-gs-vsync:set] new=0x%x old=0x%x callerPc=0x%x callerRa=0x%x gp=0x%x sp=0x%x\n",
+                     newCallback,
+                     oldCallback,
+                     callerPc,
+                     callerRa,
+                     gp,
+                     sp);
+        std::fflush(stdout);
 
         static uint32_t s_syncVCallbackLogCount = 0u;
         if (s_syncVCallbackLogCount < 128u)

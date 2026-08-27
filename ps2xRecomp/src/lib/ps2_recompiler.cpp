@@ -811,6 +811,29 @@ namespace ps2recomp
             m_symbols = m_elfParser->extractSymbols();
             m_sections = m_elfParser->getSections();
             m_relocations = m_elfParser->getRelocations();
+
+            // Address-qualified stubs may point at routines omitted by an incomplete
+            // external function map. Keep those HLE bindings dispatchable anyway.
+            for (uint32_t stubStart : m_stubFunctionStarts)
+            {
+                const bool discovered = std::any_of(
+                    m_functions.begin(), m_functions.end(),
+                    [stubStart](const Function &function) { return function.start == stubStart; });
+                const auto binding = m_stubHandlerBindingsByStart.find(stubStart);
+                if (!discovered && binding != m_stubHandlerBindingsByStart.end())
+                {
+                    Function function{};
+                    function.name = binding->second;
+                    function.start = stubStart;
+                    function.end = stubStart + 4u;
+                    m_functions.push_back(std::move(function));
+                    m_reporter.infoAt(
+                        "stub",
+                        binding->second,
+                        stubStart,
+                        "Synthesized address-qualified stub omitted by the function map");
+                }
+            }
             collectCorrectnessCriticalFunctionStarts();
 
             if (m_functions.empty())
@@ -1792,47 +1815,55 @@ namespace ps2recomp
             return;
         }
 
+        std::vector<const Function *> decodedFunctionsByStart;
+        decodedFunctionsByStart.reserve(m_functions.size());
+        for (const auto &function : m_functions)
+        {
+            if (!function.isRecompiled || function.isStub || function.isSkipped ||
+                isEntryFunctionName(function.name) ||
+                m_decodedFunctions.find(function.start) == m_decodedFunctions.end())
+            {
+                continue;
+            }
+            decodedFunctionsByStart.push_back(&function);
+        }
+        std::sort(decodedFunctionsByStart.begin(), decodedFunctionsByStart.end(),
+                  [](const Function *left, const Function *right)
+                  { return left->start < right->start; });
+
         auto findContainingFunction = [&](uint32_t address) -> const Function *
         {
-            const Function *best = nullptr;
-            for (const auto &function : m_functions)
+            auto functionIt = std::upper_bound(
+                decodedFunctionsByStart.begin(), decodedFunctionsByStart.end(), address,
+                [](uint32_t candidate, const Function *function)
+                { return candidate < function->start; });
+
+            while (functionIt != decodedFunctionsByStart.begin())
             {
-                if (!function.isRecompiled || function.isStub || function.isSkipped)
+                const Function *function = *--functionIt;
+                if (address >= function->end)
                 {
                     continue;
                 }
 
-                if (isEntryFunctionName(function.name))
-                {
-                    continue;
-                }
-
-                if (address < function.start || address >= function.end)
-                {
-                    continue;
-                }
-
-                auto decodedIt = m_decodedFunctions.find(function.start);
+                auto decodedIt = m_decodedFunctions.find(function->start);
                 if (decodedIt == m_decodedFunctions.end())
                 {
                     continue;
                 }
 
                 const auto &decoded = decodedIt->second;
-                const bool hasAddress = std::any_of(decoded.begin(), decoded.end(),
-                                                    [&](const Instruction &candidate)
-                                                    { return candidate.address == address; });
-                if (!hasAddress)
+                const auto instructionIt = std::lower_bound(
+                    decoded.begin(), decoded.end(), address,
+                    [](const Instruction &instruction, uint32_t candidate)
+                    { return instruction.address < candidate; });
+                if (instructionIt == decoded.end() || instructionIt->address != address)
                 {
                     continue;
                 }
-
-                if (!best || function.start > best->start)
-                {
-                    best = &function;
-                }
+                return function;
             }
-            return best;
+            return nullptr;
         };
 
         for (const auto &function : m_functions)
@@ -1881,6 +1912,147 @@ namespace ps2recomp
                 auto &targets = m_resumeEntryTargetsByOwner[owner->start];
                 targets.push_back(target);
             }
+        }
+
+        if (!m_config.resumeEntryPointsPath.empty())
+        {
+            std::ifstream manifest(m_config.resumeEntryPointsPath);
+            if (!manifest)
+            {
+                m_reporter.error(
+                    "resume-entry-manifest",
+                    "Unable to open " + m_config.resumeEntryPointsPath);
+            }
+            else
+            {
+                size_t importedTargets = 0u;
+                size_t lineNumber = 0u;
+                std::string line;
+                while (std::getline(manifest, line))
+                {
+                    ++lineNumber;
+                    const size_t comment = line.find('#');
+                    if (comment != std::string::npos)
+                    {
+                        line.erase(comment);
+                    }
+                    line.erase(std::remove_if(line.begin(), line.end(), [](unsigned char character)
+                                              { return std::isspace(character) != 0; }),
+                               line.end());
+                    if (line.empty())
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        size_t consumed = 0u;
+                        const unsigned long parsed = std::stoul(line, &consumed, 0);
+                        if (consumed != line.size() || parsed > std::numeric_limits<uint32_t>::max())
+                        {
+                            throw std::out_of_range("entry point is not a 32-bit address");
+                        }
+
+                        const uint32_t target = static_cast<uint32_t>(parsed);
+                        const Function *owner = findContainingFunction(target);
+                        if (!owner)
+                        {
+                            std::ostringstream msg;
+                            msg << "Ignoring address 0x" << std::hex << target
+                                << " on line " << std::dec << lineNumber
+                                << "; it is not decoded guest code";
+                            m_reporter.warning("resume-entry-manifest", msg.str());
+                            continue;
+                        }
+                        if (owner->start != target)
+                        {
+                            m_resumeEntryTargetsByOwner[owner->start].push_back(target);
+                            ++importedTargets;
+                        }
+                    }
+                    catch (const std::exception &exception)
+                    {
+                        std::ostringstream msg;
+                        msg << "Ignoring line " << lineNumber << ": " << exception.what();
+                        m_reporter.warning("resume-entry-manifest", msg.str());
+                    }
+                }
+
+                std::ostringstream msg;
+                msg << "imported " << importedTargets << " validated resume entry point(s)";
+                m_reporter.progress(msg.str());
+            }
+        }
+
+        for (const auto &range : m_config.entryPointPointerRanges)
+        {
+            const size_t wordCount = static_cast<size_t>((range.sourceEnd - range.sourceStart) / 4u);
+            std::vector<uint32_t> targets(wordCount, 0u);
+            std::vector<const Function *> owners(wordCount, nullptr);
+            std::vector<size_t> prefixCodePointers(wordCount + 1u, 0u);
+
+            for (size_t index = 0; index < wordCount; ++index)
+            {
+                const uint32_t address = range.sourceStart + static_cast<uint32_t>(index * 4u);
+                try
+                {
+                    const uint32_t target = m_elfParser->readWord(address);
+                    if ((target & 3u) == 0u && target >= range.targetStart && target < range.targetEnd)
+                    {
+                        if (const Function *owner = findContainingFunction(target))
+                        {
+                            targets[index] = target;
+                            owners[index] = owner;
+                        }
+                    }
+                }
+                catch (const std::exception &exception)
+                {
+                    std::ostringstream msg;
+                    msg << "Unable to read pointer source 0x" << std::hex << address
+                        << ": " << exception.what();
+                    m_reporter.warning("entry-point-pointer-range", msg.str());
+                }
+                prefixCodePointers[index + 1u] =
+                    prefixCodePointers[index] + static_cast<size_t>(owners[index] != nullptr);
+            }
+
+            std::vector<int32_t> qualifyingWindowCoverage(wordCount + 1u, 0);
+            for (size_t start = 0; start < wordCount; ++start)
+            {
+                const size_t end = std::min(wordCount, start + static_cast<size_t>(range.windowWords));
+                const size_t codePointerCount = prefixCodePointers[end] - prefixCodePointers[start];
+                if (codePointerCount >= range.minimumCodePointers)
+                {
+                    ++qualifyingWindowCoverage[start];
+                    --qualifyingWindowCoverage[end];
+                }
+            }
+
+            size_t validatedPointers = 0u;
+            size_t importedTargets = 0u;
+            int32_t activeWindows = 0;
+            for (size_t index = 0; index < wordCount; ++index)
+            {
+                activeWindows += qualifyingWindowCoverage[index];
+                if (activeWindows <= 0 || owners[index] == nullptr)
+                {
+                    continue;
+                }
+
+                ++validatedPointers;
+                if (owners[index]->start != targets[index])
+                {
+                    m_resumeEntryTargetsByOwner[owners[index]->start].push_back(targets[index]);
+                    ++importedTargets;
+                }
+            }
+
+            std::ostringstream msg;
+            msg << "validated " << validatedPointers << " clustered code pointer(s) in 0x"
+                << std::hex << range.sourceStart << "-0x" << range.sourceEnd
+                << "; imported " << std::dec << importedTargets << " internal entry point(s)";
+            m_reporter.progress(msg.str());
         }
 
         size_t totalTargets = 0u;
@@ -2094,6 +2266,19 @@ namespace ps2recomp
 
     bool PS2Recompiler::writeToFile(const std::string &path, const std::string &content)
     {
+        {
+            std::ifstream existingFile(path);
+            if (existingFile)
+            {
+                std::ostringstream existingContent;
+                existingContent << existingFile.rdbuf();
+                if (!existingFile.bad() && existingContent.str() == content)
+                {
+                    return true;
+                }
+            }
+        }
+
         std::ofstream file(path);
         if (!file)
         {

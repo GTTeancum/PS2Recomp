@@ -167,7 +167,29 @@ namespace ps2_stubs
 
     void sceDmaRecvN(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceDmaRecvN", rdram, ctx, runtime);
+        if (!runtime)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        const uint32_t channelBase = resolveDmaChannelBase(rdram, getRegU32(ctx, 4));
+        if (channelBase == 0u)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        PS2Memory &mem = runtime->memory();
+        mem.writeIORegister(channelBase + 0x10u, toDmaPhys(getRegU32(ctx, 5)));
+        mem.writeIORegister(channelBase + 0x20u, normalizeQwcFromArg(getRegU32(ctx, 6)));
+        mem.writeIORegister(channelBase + 0x00u, 0x00000100u);
+        mem.processPendingTransfers();
+
+        for (const uint32_t cause : mem.consumeCompletedDmacCauses())
+            ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, cause);
+
+        setReturnS32(ctx, 0);
     }
 
     void sceDmaReset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

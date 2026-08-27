@@ -111,6 +111,21 @@ namespace ps2x::iop::detail
         std::vector<uint32_t> suppressedCompletionCallbacks;
     };
 
+    struct ZaudioBindings
+    {
+        std::string serviceName;
+        uint32_t sid = 0x47u;
+        uint32_t initializeFunction = 0u;
+        uint32_t allocateSampleFunction = 2u;
+        uint32_t uploadSampleFunction = 4u;
+        uint32_t uploadPacketBytes = 0x440u;
+        uint32_t uploadPayloadOffset = 8u;
+        uint32_t uploadPayloadBytes = 0x400u;
+        uint32_t firstHandle = 0x00010000u;
+        uint32_t handleStride = 0x100u;
+        uint32_t firstSpuAddress = 0x00005000u;
+    };
+
     struct SdrdrvBindings
     {
         std::string serviceName;
@@ -149,9 +164,11 @@ namespace ps2x::iop::detail
     std::unique_ptr<IopService> createDbcmanService(IopHost &host);
     std::unique_ptr<IopService> createLibSdService(IopHost &host);
     std::unique_ptr<IopService> createMcservService(IopHost &host);
+    std::unique_ptr<IopService> createMtapService(IopHost &host, bool connected);
     std::unique_ptr<IopService> createTsnddrvService(IopHost &host, TsnddrvBindings bindings);
     std::unique_ptr<IopService> createCriDtxService(IopHost &host, CriDtxBindings bindings);
     std::unique_ptr<IopService> createClFileService(IopHost &host, ClFileBindings bindings);
     std::unique_ptr<IopService> createSoundUpdateStubService(IopHost &host, SoundUpdateStubBindings bindings);
+    std::unique_ptr<IopService> createZaudioService(IopHost &host, ZaudioBindings bindings);
     std::unique_ptr<IopService> createSdrdrvService(IopHost &host, SdrdrvBindings bindings);
 }

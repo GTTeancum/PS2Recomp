@@ -61,6 +61,7 @@ public:
 
     VU1State &state() { return m_state; }
     const VU1State &state() const { return m_state; }
+    [[nodiscard]] bool isRunning() const { return m_running; }
 
 private:
     enum Pipeline : uint8_t
@@ -237,6 +238,7 @@ private:
     GS *m_activeGs = nullptr;
     PS2Memory *m_activeMemory = nullptr;
     bool m_stopRequested = false;
+    bool m_running = false;
     bool m_pendingHaltD = false;
     bool m_pendingHaltT = false;
 

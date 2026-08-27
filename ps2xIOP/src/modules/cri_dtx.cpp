@@ -4,9 +4,11 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -88,6 +90,7 @@ namespace ps2x::iop::detail
                 m_dmaAcks = 0u;
                 m_dmaMisses = 0u;
                 m_urpcCalls = 0u;
+                m_transferTraceCount = 0u;
             }
 
             [[nodiscard]] RpcAbi selectRpcAbi(const RpcAbiRequest &request) const override
@@ -111,6 +114,27 @@ namespace ps2x::iop::detail
                     return result;
                 }
 
+                if (m_bindings.sid == 0x90000200u)
+                {
+                    std::ostringstream message;
+                    message << "X-Men CRI DTX function=0x" << std::hex << request.function
+                            << " send=0x" << request.send.address << "/0x" << request.send.size
+                            << " receive=0x" << request.receive.address << "/0x" << request.receive.size
+                            << " words=";
+                    const uint32_t wordCount = std::min(request.send.size / 4u, 12u);
+                    for (uint32_t index = 0u; index < wordCount; ++index)
+                    {
+                        uint32_t word = 0u;
+                        (void)readGuestPod(m_host, request.send.address + index * 4u, word);
+                        if (index != 0u)
+                        {
+                            message << ',';
+                        }
+                        message << "0x" << word;
+                    }
+                    m_host.log(LogLevel::Info, message.str());
+                }
+
                 // DTX owns this SID. Its base protocol intentionally bypasses generic EE
                 // server dispatch, and URPC dispatch is gated by the guest function table.
                 result.serverDispatchPolicy = ServerDispatchPolicy::Suppress;
@@ -119,7 +143,9 @@ namespace ps2x::iop::detail
                 const uint32_t command = isUrpc ? (request.function & 0xFFu) : 0u;
                 uint32_t urpcFunction = 0u;
                 uint32_t urpcObject = 0u;
-                if (isUrpc && command < 64u)
+                if (isUrpc && command < 64u &&
+                    m_bindings.urpcFunctionTableBase != 0u &&
+                    m_bindings.urpcObjectTableBase != 0u)
                 {
                     (void)readGuestPod(m_host,
                                        m_bindings.urpcFunctionTableBase + (command * sizeof(uint32_t)),
@@ -143,7 +169,7 @@ namespace ps2x::iop::detail
                     return result;
                 }
 
-                if (hasUrpcHandler &&
+                if (hasUrpcHandler && m_bindings.dispatcherFunctionAddress != 0u &&
                     request.send.address != 0u &&
                     request.send.size > 0u)
                 {
@@ -185,17 +211,26 @@ namespace ps2x::iop::detail
                 }
 
                 uint32_t normalizedSource = 0u;
-                uint32_t normalizedDestination = 0u;
-                if (!m_host.normalizeGuestAddress(transfer.sourceAddress, normalizedSource) ||
-                    !m_host.normalizeGuestAddress(transfer.destinationAddress, normalizedDestination))
+                if (!m_host.normalizeGuestAddress(transfer.sourceAddress, normalizedSource))
                 {
                     return;
                 }
+                uint32_t normalizedDestination = transfer.destinationAddress;
+                (void)m_host.normalizeGuestAddress(transfer.destinationAddress,
+                                                   normalizedDestination);
 
                 TransferState matched{};
                 bool found = false;
+                uint32_t trackedSource = 0u;
+                uint32_t trackedSize = 0u;
+                uint32_t traceIndex = 0u;
                 {
                     std::lock_guard<std::mutex> lock(m_mutex);
+                    if (!m_transferById.empty())
+                    {
+                        trackedSource = m_transferById.begin()->second.eeWorkAddress;
+                        trackedSize = m_transferById.begin()->second.workSize;
+                    }
                     for (const auto &[id, state] : m_transferById)
                     {
                         (void)id;
@@ -222,6 +257,21 @@ namespace ps2x::iop::detail
                     {
                         ++m_dmaMisses;
                     }
+                    if (m_bindings.sid == 0x90000200u && m_transferTraceCount < 32u)
+                    {
+                        traceIndex = ++m_transferTraceCount;
+                    }
+                }
+
+                if (traceIndex != 0u)
+                {
+                    std::fprintf(stdout,
+                                 "[xmen-cri-dma] index=%u source=%08x normalized=%08x "
+                                 "destination=%08x normalizedDestination=%08x size=%u "
+                                 "trackedSource=%08x trackedSize=%u found=%u\n",
+                                 traceIndex, transfer.sourceAddress, normalizedSource,
+                                 transfer.destinationAddress, normalizedDestination, transfer.size,
+                                 trackedSource, trackedSize, found ? 1u : 0u);
                 }
 
                 if (!found)
@@ -352,6 +402,15 @@ namespace ps2x::iop::detail
 
                 const uint32_t normalizedEeWorkAddress = normalizeAddress(eeWorkAddress);
                 const uint32_t normalizedIopWorkAddress = normalizeAddress(iopWorkAddress);
+
+                if (m_bindings.sid == 0x90000200u)
+                {
+                    std::fprintf(stdout,
+                                 "[xmen-cri-create] id=%u ee=%08x normalizedEe=%08x "
+                                 "iop=%08x normalizedIop=%08x size=%u\n",
+                                 dtxId, eeWorkAddress, normalizedEeWorkAddress,
+                                 iopWorkAddress, normalizedIopWorkAddress, workSize);
+                }
 
                 uint32_t remoteHandle = 0u;
                 {
@@ -1275,6 +1334,7 @@ namespace ps2x::iop::detail
             uint64_t m_dmaAcks = 0u;
             uint64_t m_dmaMisses = 0u;
             uint64_t m_urpcCalls = 0u;
+            uint32_t m_transferTraceCount = 0u;
             const std::array<uint32_t, 1> m_sids;
         };
     }
@@ -1286,11 +1346,10 @@ namespace ps2x::iop::detail
             bindings.urpcObjectBase == 0u ||
             bindings.urpcObjectLimit <= bindings.urpcObjectBase ||
             bindings.urpcObjectStride == 0u ||
-            bindings.urpcFunctionTableBase == 0u ||
-            bindings.urpcObjectTableBase == 0u ||
-            bindings.dispatcherFunctionAddress == 0u ||
             bindings.rpcServerPoolBase == 0u ||
-            bindings.rpcServerStride == 0u)
+            bindings.rpcServerStride == 0u ||
+            ((bindings.urpcFunctionTableBase == 0u) !=
+             (bindings.urpcObjectTableBase == 0u)))
         {
             throw std::invalid_argument("invalid CRI DTX bindings");
         }

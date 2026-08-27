@@ -56,6 +56,11 @@ namespace ps2recomp
         static bool hasHardwareIOSignalForHeuristics(const std::vector<Instruction> &instructions);
         static bool hasLargeComplexMMISignalForHeuristics(const std::vector<Instruction> &instructions, size_t largeInstructionThreshold = 500);
         static bool hasSelfModifyingSignalForHeuristics(const std::vector<Instruction> &instructions, const std::vector<Section> &sections);
+        static bool resolveBasePlusOffsetForHeuristics(const std::vector<Instruction> &instructions,
+                                                       size_t index,
+                                                       uint32_t baseReg,
+                                                       int16_t offset,
+                                                       uint32_t &outAddr);
 
     public:
         static std::vector<JumpTable> detectJumpTablesForHeuristics(const std::vector<Instruction> &instructions, const std::vector<Section> &sections, const std::function<bool(uint32_t, uint32_t &)> &readWord);
@@ -116,10 +121,10 @@ namespace ps2recomp
                                       uint32_t reg,
                                       int16_t offset,
                                       uint32_t &baseAddr) const;
-        bool tryResolveLuiBase(const std::vector<Instruction> &instructions,
-                               size_t index,
-                               uint32_t reg,
-                               uint32_t &baseAddr) const;
+        static bool tryResolveLuiBase(const std::vector<Instruction> &instructions,
+                                      size_t index,
+                                      uint32_t reg,
+                                      uint32_t &baseAddr);
         bool isCodeAddress(uint32_t addr) const;
 
         void analyzeControlFlow();

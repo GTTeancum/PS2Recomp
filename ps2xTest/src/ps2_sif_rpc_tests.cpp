@@ -36,6 +36,7 @@ namespace
     constexpr uint32_t IOP_SID_LOTR_CLFILE = 0x0000FF01u;
     constexpr uint32_t IOP_SID_LOTR_SOUND = 0x00012345u;
     constexpr uint32_t IOP_SID_MCSERV = 0x80000400u;
+    constexpr uint32_t IOP_SID_CDVD_SEARCH_FILE = 0x80000597u;
     constexpr uint32_t IOP_SID_LIBSD = 0x80000701u;
     constexpr uint32_t IOP_SID_FATAL_FRAME_SDRDRV = 0x19740512u;
     constexpr uint32_t IOP_RPC_SNDDRV_SUBMIT = 0x00000000u;
@@ -319,6 +320,95 @@ void register_ps2_sif_rpc_tests()
 {
     MiniTest::Case("PS2SifRpc", [](TestCase &tc)
     {
+        tc.Run("repeated SifInitRpc preserves IOP profile transport state", [](TestCase &t)
+        {
+            TestEnv env;
+            configureProfile(env, "SLUS_206.56");
+
+            constexpr uint32_t kCriSid = 0x90000200u;
+            constexpr uint32_t kSendAddr = 0x00022000u;
+            constexpr uint32_t kRecvAddr = 0x00022100u;
+            constexpr uint32_t kEeWorkAddr = 0x00024000u;
+            constexpr uint32_t kIopWorkAddr = 0x00028000u;
+            constexpr uint32_t kWorkSize = 0x880u;
+
+            SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            writeGuestU32(env.rdram.data(), kSendAddr + 0u, 1u);
+            writeGuestU32(env.rdram.data(), kSendAddr + 4u, kEeWorkAddr);
+            writeGuestU32(env.rdram.data(), kSendAddr + 8u, kIopWorkAddr);
+            writeGuestU32(env.rdram.data(), kSendAddr + 12u, kWorkSize);
+
+            const ps2x::iop::RpcResult createResult =
+                callIop(env, kCriSid, 2u, kSendAddr, 16u, kRecvAddr, 4u);
+            t.IsTrue(createResult.handled, "X-Men CRI transport creation should be handled");
+
+            writeGuestU32(env.rdram.data(), kEeWorkAddr + kWorkSize - 4u, 1u);
+            SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            PS2IopTransport::notifyTransfer(&env.runtime, env.rdram.data(), {
+                ps2x::iop::SifTransferKind::SetDma,
+                ps2x::iop::SifTransferPhase::AfterCopy,
+                kEeWorkAddr,
+                kIopWorkAddr,
+                kWorkSize,
+            });
+
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kEeWorkAddr + kWorkSize - 4u),
+                     2u,
+                     "repeated SifInitRpc must not discard active IOP profile transfers");
+        });
+
+        tc.Run("synthetic RPC server ignores overwritten guest descriptor", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kClientAddr = 0x00022000u;
+            constexpr uint32_t kSendAddr = 0x00022100u;
+            constexpr uint32_t kRecvAddr = 0x00022200u;
+            constexpr uint32_t kVictimAddr = 0x00022300u;
+            constexpr uint32_t kUnknownSid = 0x80000903u;
+
+            SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
+
+            setRegU32(env.ctx, 4, kClientAddr);
+            setRegU32(env.ctx, 5, kUnknownSid);
+            setRegU32(env.ctx, 6, 0u);
+            SifBindRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifBindRpc should synthesize an unknown server");
+
+            const SifRpcClientData client = readGuestStruct<SifRpcClientData>(env.rdram.data(), kClientAddr);
+            t.IsTrue(client.server != 0u, "synthetic bind should expose a nonzero server pointer");
+            t.Equals(client.buf, 0u, "synthetic bind should not trust a guest server buffer");
+            t.Equals(client.cbuf, 0u, "synthetic bind should not trust a guest callback buffer");
+
+            SifRpcServerData overwrittenServer{};
+            overwrittenServer.sid = static_cast<int32_t>(kUnknownSid);
+            overwrittenServer.buf = kVictimAddr;
+            writeGuestStruct(env.rdram.data(), client.server, overwrittenServer);
+
+            std::array<uint8_t, 16> payload{};
+            std::array<uint8_t, 16> sentinel{};
+            payload.fill(0u);
+            sentinel.fill(0xA5u);
+            std::memcpy(env.rdram.data() + kSendAddr, payload.data(), payload.size());
+            std::memcpy(env.rdram.data() + kVictimAddr, sentinel.data(), sentinel.size());
+
+            setRegU32(env.ctx, 4, kClientAddr);
+            setRegU32(env.ctx, 5, 1u);
+            setRegU32(env.ctx, 6, 0u);
+            setRegU32(env.ctx, 7, kSendAddr);
+            setRegU32(env.ctx, 8, static_cast<uint32_t>(payload.size()));
+            setRegU32(env.ctx, 9, kRecvAddr);
+            setRegU32(env.ctx, 10, static_cast<uint32_t>(payload.size()));
+            setRegU32(env.ctx, 11, 0u);
+            setRegU32(env.ctx, 29, K_STACK_ADDR);
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR, 0u);
+
+            SifCallRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifCallRpc should complete for a synthetic server");
+            t.IsTrue(std::memcmp(env.rdram.data() + kVictimAddr, sentinel.data(), sentinel.size()) == 0,
+                     "overwritten synthetic descriptor must not redirect the server-buffer copy");
+        });
+
         tc.Run("register bind call updates descriptors and payload", [](TestCase &t)
         {
             TestEnv env;
@@ -409,6 +499,66 @@ void register_ps2_sif_rpc_tests()
             setRegU32(env.ctx, 4, kClientAddr);
             SifCheckStatRpc(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegS32(env.ctx, 2), 0, "SifCheckStatRpc should report not busy after synchronous completion");
+        });
+
+        tc.Run("CDVD search RPC resolves an extracted movie and returns sceCdlFILE metadata", [](TestCase &t)
+        {
+            TestEnv env;
+            ScopedTempDir temp("cdvd_search_rpc");
+            const std::filesystem::path movieDirectory = temp.path / "movies" / "ntsc" / "i" / "1";
+            std::filesystem::create_directories(movieDirectory);
+            const std::vector<uint8_t> payload = {'S', 'F', 'D', 0u, 1u, 2u, 3u};
+            writeFile(movieDirectory / "i102.sfd", payload);
+
+            const PS2Runtime::IoPaths oldPaths = PS2Runtime::getIoPaths();
+            PS2Runtime::IoPaths ioPaths;
+            ioPaths.elfDirectory = temp.path;
+            ioPaths.hostRoot = temp.path;
+            ioPaths.cdRoot = temp.path;
+            ioPaths.mcRoot = temp.path / "mc0";
+            PS2Runtime::setIoPaths(ioPaths);
+
+            constexpr uint32_t kClientAddr = 0x00022800u;
+            constexpr uint32_t kSendAddr = 0x00022900u;
+            constexpr uint32_t kRecvAddr = 0x00022B00u;
+            constexpr uint32_t kSendSize = 300u;
+            constexpr uint32_t kPathOffset = 0x24u;
+            const char moviePath[] = "\\MOVIES\\NTSC\\I\\1\\I102.SFD;1";
+
+            std::memset(env.rdram.data() + kSendAddr, 0, kSendSize);
+            std::memcpy(env.rdram.data() + kSendAddr + kPathOffset, moviePath, sizeof(moviePath));
+            writeGuestU32(env.rdram.data(), kSendAddr + 0x124u, kSendAddr);
+            std::memset(env.rdram.data() + kRecvAddr, 0, sizeof(uint32_t));
+
+            SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            setRegU32(env.ctx, 4, kClientAddr);
+            setRegU32(env.ctx, 5, IOP_SID_CDVD_SEARCH_FILE);
+            setRegU32(env.ctx, 6, 0u);
+            SifBindRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifBindRpc should bind the CDVD search service");
+
+            setRegU32(env.ctx, 4, kClientAddr);
+            setRegU32(env.ctx, 5, 0u);
+            setRegU32(env.ctx, 6, 0u);
+            setRegU32(env.ctx, 7, kSendAddr);
+            setRegU32(env.ctx, 8, kSendSize);
+            setRegU32(env.ctx, 9, kRecvAddr);
+            setRegU32(env.ctx, 10, sizeof(uint32_t));
+            setRegU32(env.ctx, 11, 0u);
+            setRegU32(env.ctx, 29, K_STACK_ADDR);
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR, 0u);
+            SifCallRpc(env.rdram.data(), &env.ctx, &env.runtime);
+
+            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifCallRpc should complete the CDVD search request");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr), 1u,
+                     "CDVD search RPC should return success");
+            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kSendAddr + 4u),
+                     static_cast<uint32_t>(payload.size()),
+                     "CDVD search RPC should return the movie size");
+            t.IsTrue(readGuestStruct<uint32_t>(env.rdram.data(), kSendAddr) >= 0x00100000u,
+                     "CDVD search RPC should return a resolvable pseudo LSN");
+
+            PS2Runtime::setIoPaths(oldPaths);
         });
 
         tc.Run("Fatal Frame SDRDRV RPC initializes header and loads body archives", [](TestCase &t)

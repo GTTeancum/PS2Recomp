@@ -42,8 +42,10 @@ namespace ps2_syscalls
 
     static const char *translateFioMode(int ps2Flags)
     {
-        bool read = (ps2Flags & PS2_FIO_O_RDONLY) || (ps2Flags & PS2_FIO_O_RDWR);
-        bool write = (ps2Flags & PS2_FIO_O_WRONLY) || (ps2Flags & PS2_FIO_O_RDWR);
+        const uint32_t flags = static_cast<uint32_t>(ps2Flags);
+        const uint32_t access = flags & PS2_FIO_O_RDWR;
+        bool read = (access == PS2_FIO_O_RDONLY) || (access == PS2_FIO_O_RDWR);
+        bool write = (access == PS2_FIO_O_WRONLY) || (access == PS2_FIO_O_RDWR);
         bool append = (ps2Flags & PS2_FIO_O_APPEND);
         bool create = (ps2Flags & PS2_FIO_O_CREAT);
         bool truncate = (ps2Flags & PS2_FIO_O_TRUNC);

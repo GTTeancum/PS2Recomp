@@ -75,10 +75,84 @@ namespace
         m[10] = 1.0f;
         m[15] = 1.0f;
     }
+
+    float floatFromBits(uint32_t bits)
+    {
+        float value = 0.0f;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
+
+    uint32_t vectorLaneBits(__m128 value, uint32_t lane)
+    {
+        alignas(16) uint32_t bits[4]{};
+        _mm_store_si128(reinterpret_cast<__m128i *>(bits), _mm_castps_si128(value));
+        return bits[lane];
+    }
 }
 
 void register_ps2_vu_tests()
 {
+    MiniTest::Case("PS2VU0FloatSemantics", [](TestCase &tc)
+    {
+        tc.Run("Exponent255OperandClampsBeforeMultiply", [](TestCase &t)
+        {
+            const __m128 operand = _mm_set1_ps(floatFromBits(0xFFFF0000u));
+            const __m128 result = PS2_VMUL(operand, _mm_set1_ps(1.0f));
+            t.IsTrue(vectorLaneBits(result, 0u) == 0xFF7FFFFFu,
+                     "VU0 multiply should clamp a negative exponent-255 operand to signed max finite");
+        });
+
+        tc.Run("DenormalOperandFlushesBeforeArithmetic", [](TestCase &t)
+        {
+            const __m128 operand = _mm_set1_ps(floatFromBits(0x80000001u));
+            const __m128 result = PS2_VADD(operand, _mm_set1_ps(0.0f));
+            t.IsTrue(vectorLaneBits(result, 0u) == 0x00000000u,
+                     "VU0 arithmetic should flush a denormal operand before performing the add");
+        });
+
+        tc.Run("OverflowResultClampsToSignedMax", [](TestCase &t)
+        {
+            const __m128 maximum = _mm_set1_ps(floatFromBits(0x7F7FFFFFu));
+            const __m128 result = PS2_VMUL(maximum, _mm_set1_ps(-2.0f));
+            t.IsTrue(vectorLaneBits(result, 0u) == 0xFF7FFFFFu,
+                     "VU0 arithmetic should clamp an overflow result to signed max finite");
+        });
+
+        tc.Run("ClipFlagsUsePositiveThenNegativeBitsPerAxis", [](TestCase &t)
+        {
+            const __m128 positiveNegativePositive = _mm_set_ps(0.0f, 3.0f, -3.0f, 3.0f);
+            const __m128 negativePositiveNegative = _mm_set_ps(0.0f, -3.0f, 3.0f, -3.0f);
+            const __m128 limit = _mm_set_ps(2.0f, 0.0f, 0.0f, 0.0f);
+
+            t.IsTrue(PS2_VCLIP(0u, positiveNegativePositive, limit) == 0x19u,
+                     "VCLIP should assign positive X/Y/Z to bits 0/2/4 and negative values to bits 1/3/5");
+            t.IsTrue(PS2_VCLIP(0u, negativePositiveNegative, limit) == 0x26u,
+                     "VCLIP should preserve the negative X/Y/Z bit ordering");
+        });
+
+        tc.Run("ClipUsesAbsoluteWAndPreservesFlagHistory", [](TestCase &t)
+        {
+            const __m128 value = _mm_set_ps(0.0f, 1.0f, -3.0f, 3.0f);
+            const __m128 negativeLimit = _mm_set_ps(-2.0f, 0.0f, 0.0f, 0.0f);
+            const uint32_t previous = 0x123456u;
+            const uint32_t expected = ((previous << 6) | 0x09u) & 0x00FFFFFFu;
+
+            t.IsTrue(PS2_VCLIP(previous, value, negativeLimit) == expected,
+                     "VCLIP should compare against abs(W) and retain four generations of six-bit flags");
+        });
+
+        tc.Run("ClipTreatsDenormalWAsMaximumDenormal", [](TestCase &t)
+        {
+            const __m128 value = _mm_set_ps(0.0f, 0.0f, 0.0f, floatFromBits(0x00800000u));
+            const __m128 denormalLimit = _mm_set_ps(floatFromBits(0x80000001u), 0.0f, 0.0f, 0.0f);
+
+            t.IsTrue(PS2_VCLIP(0u, value, denormalLimit) == 0x01u,
+                     "VCLIP should classify the smallest normal value beyond a denormal W limit");
+        });
+
+    });
+
     MiniTest::Case("PS2VU0Math", [](TestCase &tc)
     {
         tc.Run("MulVector_componentwise", [](TestCase &t)

@@ -215,6 +215,13 @@ static_assert(sizeof(GSRegisters) == (20u * sizeof(uint64_t)), "GSRegisters layo
 static_assert(alignof(GSRegisters) == alignof(uint64_t), "GSRegisters alignment must remain 64-bit");
 static_assert(std::atomic<uint64_t>::is_always_lock_free, "GS CSR atomic must be lock-free on all supported targets");
 
+constexpr uint64_t PS2_GS_IMR_RESET_VALUE = 0x7F00ull;
+
+constexpr uint64_t Ps2NormalizeGsImr(uint64_t value) noexcept
+{
+    return (value & 0x1F00ull) | 0x6000ull;
+}
+
 // PS2 VIF (VPU Interface) registers
 struct VIFRegisters
 {
@@ -317,10 +324,16 @@ public:
     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
     void setGifArbiter(GifArbiter *arbiter) { m_gifArbiter = arbiter; }
 
+    using GsInterruptCallback = std::function<void(uint32_t)>;
+    void setGsInterruptCallback(GsInterruptCallback cb) { m_gsInterruptCallback = std::move(cb); }
+    uint64_t writeGsImr(uint64_t value);
+
     using Vu1MscalCallback = std::function<void(uint32_t startPC, uint32_t top, uint32_t itop)>;
     void setVu1MscalCallback(Vu1MscalCallback cb) { m_vu1MscalCallback = std::move(cb); }
     using Vu1MscntCallback = std::function<void(uint32_t top, uint32_t itop)>;
     void setVu1MscntCallback(Vu1MscntCallback cb) { m_vu1MscntCallback = std::move(cb); }
+    using Vu1ServiceCallback = std::function<bool(bool drain)>;
+    void setVu1ServiceCallback(Vu1ServiceCallback cb) { m_vu1ServiceCallback = std::move(cb); }
 
     uint8_t *getVU1Code() { return m_vu1Code; }
     const uint8_t *getVU1Code() const { return m_vu1Code; }
@@ -343,6 +356,7 @@ public:
     void processVIF0Data(const uint8_t *data, uint32_t sizeBytes);
     void processVIF1Data(uint32_t srcPhysAddr, uint32_t sizeBytes);
     void processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
+    bool dispatchPendingVu1Mscal();
     void processPendingTransfers();
     std::vector<uint32_t> consumeCompletedDmacCauses();
 
@@ -399,8 +413,10 @@ public:
 
     GifPacketCallback m_gifPacketCallback;
     GifArbiter *m_gifArbiter = nullptr;
+    GsInterruptCallback m_gsInterruptCallback;
     Vu1MscalCallback m_vu1MscalCallback;
     Vu1MscntCallback m_vu1MscntCallback;
+    Vu1ServiceCallback m_vu1ServiceCallback;
 
     uint8_t *m_vu0Code = nullptr;
     uint8_t *m_vu0Data = nullptr;
@@ -409,6 +425,11 @@ public:
     bool m_path3Masked = false;
     uint32_t m_vif1PendingPath2ImageQwc = 0u;
     bool m_vif1PendingPath2DirectHl = false;
+    bool m_vif1MscalPending = false;
+    uint32_t m_vif1PendingMscalPc = 0u;
+    uint32_t m_vif1PendingMscalTop = 0u;
+    uint32_t m_vif1PendingMscalItop = 0u;
+    uint32_t m_vif1PendingMscalUnpacks = 0u;
     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
 
     struct PendingTransfer

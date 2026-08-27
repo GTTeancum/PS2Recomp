@@ -1,5 +1,7 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include <atomic>
+#include <cstdio>
 #include <cstring>
 
 enum VIFCmd : uint8_t
@@ -29,6 +31,25 @@ enum VIFCmd : uint8_t
 namespace
 {
     constexpr uint8_t kGifFmtImage = 2u;
+
+    void traceVuQwords(const char *tag, uint32_t transferIndex, const uint8_t *vuData,
+                       uint32_t dataSize, uint32_t baseQword, uint32_t count)
+    {
+        if (!vuData || dataSize == 0u)
+            return;
+
+        std::fprintf(stderr, "[vif1:%s] transfer=%u base=0x%x", tag, transferIndex, baseQword);
+        for (uint32_t i = 0u; i < count; ++i)
+        {
+            uint32_t words[4]{};
+            const uint32_t address = ((baseQword + i) * 16u) % dataSize;
+            if (address + sizeof(words) <= dataSize)
+                std::memcpy(words, vuData + address, sizeof(words));
+            std::fprintf(stderr, " q%u=%08x,%08x,%08x,%08x",
+                         i, words[0], words[1], words[2], words[3]);
+        }
+        std::fprintf(stderr, "\n");
+    }
 
     uint32_t gifImageQwcFromTag(const uint8_t *data, uint32_t sizeBytes)
     {
@@ -259,46 +280,64 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
     processVIF1Data(m_rdram + srcPhys, sizeBytes);
 }
 
+bool PS2Memory::dispatchPendingVu1Mscal()
+{
+    if (!m_vif1MscalPending)
+        return false;
+
+    // VIF1 has a one-entry microprogram queue.  Do not reset an active VU1
+    // program when a later MSCAL becomes eligible to start.
+    if (m_vu1ServiceCallback && m_vu1ServiceCallback(false))
+        return false;
+
+    const uint32_t startPC = m_vif1PendingMscalPc;
+    const uint32_t top = m_vif1PendingMscalTop;
+    const uint32_t itop = m_vif1PendingMscalItop;
+    m_vif1MscalPending = false;
+    m_vif1PendingMscalUnpacks = 0u;
+    if (m_vu1MscalCallback)
+        m_vu1MscalCallback(startPC, top, itop);
+    return true;
+}
+
 void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u)
         return;
 
+    static std::atomic<uint32_t> vif1TransferTraceCount{0u};
+    const uint32_t transferIndex = vif1TransferTraceCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (transferIndex <= 12u || (transferIndex & (transferIndex - 1u)) == 0u)
+    {
+        std::fprintf(stderr, "[vif1:transfer] index=%u bytes=%u head=", transferIndex, sizeBytes);
+        const uint32_t headBytes = std::min<uint32_t>(sizeBytes, 32u);
+        for (uint32_t i = 0u; i < headBytes; ++i)
+            std::fprintf(stderr, "%02x", data[i]);
+        std::fprintf(stderr, "\n");
+    }
+
     uint32_t pos = 0;
+
+    const auto drainVu1Pipeline = [&]() -> bool
+    {
+        dispatchPendingVu1Mscal();
+        if (m_vu1ServiceCallback && m_vu1ServiceCallback(true))
+            return false;
+
+        // If an older program was running, the first dispatch attempt left
+        // the queued MSCAL intact.  Start and finish it now that VU1 is idle.
+        if (m_vif1MscalPending)
+        {
+            if (!dispatchPendingVu1Mscal())
+                return false;
+            if (m_vu1ServiceCallback && m_vu1ServiceCallback(true))
+                return false;
+        }
+        return !m_vif1MscalPending;
+    };
 
     while (pos + 4 <= sizeBytes)
     {
-        if (m_vif1PendingPath2ImageQwc != 0u)
-        {
-            const uint32_t availableQw = (sizeBytes - pos) / 16u;
-            if (availableQw == 0u)
-            {
-                break;
-            }
-
-            const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
-            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
-            const uint64_t imageTag =
-                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
-                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
-                (static_cast<uint64_t>(kGifFmtImage) << 58);
-            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
-            std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
-            submitGifPacket(GifPathId::Path2,
-                            imagePacket.data(),
-                            static_cast<uint32_t>(imagePacket.size()),
-                            true,
-                            m_vif1PendingPath2DirectHl);
-
-            pos += chunkQw * 16u;
-            m_vif1PendingPath2ImageQwc -= chunkQw;
-            if (m_vif1PendingPath2ImageQwc == 0u)
-            {
-                m_vif1PendingPath2DirectHl = false;
-            }
-            continue;
-        }
-
         uint32_t cmd;
         memcpy(&cmd, data + pos, 4);
         pos += 4;
@@ -308,6 +347,21 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         uint8_t num = (cmd >> 16) & 0xFF;
         const bool irq = (cmd & 0x80000000u) != 0u;
 
+        static std::atomic<uint32_t> vif1CommandTraceCount{0u};
+        const uint32_t commandIndex = vif1CommandTraceCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (commandIndex <= 160u)
+        {
+            std::fprintf(stderr,
+                         "[vif1:command] index=%u transfer=%u pos=%u raw=0x%08x opcode=0x%02x num=%u imm=0x%04x\n",
+                         commandIndex,
+                         transferIndex,
+                         pos - 4u,
+                         cmd,
+                         opcode,
+                         num,
+                         imm);
+        }
+
         // Track most-recent command for VIFn_CODE emulation.
         vif1_regs.code = cmd;
         vif1_regs.num = num;
@@ -316,6 +370,9 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
         if (opcode == VIF_NOP)
         {
+            dispatchPendingVu1Mscal();
+            if (m_vu1ServiceCallback)
+                m_vu1ServiceCallback(false);
             continue;
         }
         else if (opcode == VIF_STCYCL)
@@ -366,10 +423,18 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_FLUSHE || opcode == VIF_FLUSH || opcode == VIF_FLUSHA)
         {
+            drainVu1Pipeline();
             continue;
         }
         else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
         {
+            if (!drainVu1Pipeline())
+            {
+                std::fprintf(stderr,
+                             "[vif1:mscal-stall] transfer=%u pc=0x%x previous VU1 program did not stop\n",
+                             transferIndex, static_cast<uint32_t>(imm) * 8u);
+                continue;
+            }
             uint32_t startPC = (uint32_t)imm * 8u;
 
             // Values visible to the VU program for this MSCAL.
@@ -380,6 +445,20 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             vif1_regs.top = runTop;
             vif1_regs.itop = runItop;
 
+            static std::atomic<uint32_t> vif1MscalTraceCount{0u};
+            const uint32_t mscalTraceIndex = vif1MscalTraceCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            const bool traceMscal = mscalTraceIndex <= 96u;
+            if (traceMscal)
+            {
+                std::fprintf(stderr,
+                             "[vif1:mscal] transfer=%u pc=0x%x top=0x%x itop=0x%x base=0x%x ofst=0x%x dbf=%u\n",
+                             transferIndex, startPC, runTop, runItop,
+                             vif1_regs.base, vif1_regs.ofst,
+                             (vif1_regs.stat >> 7) & 1u);
+                if (startPC == 0x230u)
+                    traceVuQwords("mscal-data", transferIndex, m_vu1Data, PS2_VU1_DATA_SIZE, runTop, 8u);
+            }
+
             const bool dbf = (vif1_regs.stat & (1u << 7)) != 0u;
             if (dbf)
                 vif1_regs.tops = vif1_regs.base & 0x3FFu;
@@ -387,12 +466,27 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
-            if (m_vu1MscalCallback)
-                m_vu1MscalCallback(startPC, runTop, runItop);
+            m_vif1MscalPending = true;
+            m_vif1PendingMscalPc = startPC;
+            m_vif1PendingMscalTop = runTop;
+            m_vif1PendingMscalItop = runItop;
+            m_vif1PendingMscalUnpacks = 0u;
+            const bool followedByUnpack =
+                pos + sizeof(uint32_t) <= sizeBytes &&
+                (data[pos + 3u] & 0x60u) == 0x60u;
+            if (opcode == VIF_MSCALF || followedByUnpack)
+                dispatchPendingVu1Mscal();
             continue;
         }
         else if (opcode == VIF_MSCNT)
         {
+            if (!drainVu1Pipeline())
+            {
+                std::fprintf(stderr,
+                             "[vif1:mscnt-stall] transfer=%u previous VU1 program did not stop\n",
+                             transferIndex);
+                continue;
+            }
             const uint32_t runTop = vif1_regs.tops & 0x3FFu;
             const uint32_t runItop = vif1_regs.itops & 0x3FFu;
             vif1_regs.top = runTop;
@@ -437,6 +531,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_MPG)
         {
+            drainVu1Pipeline();
             uint32_t destAddr = (uint32_t)imm * 8u;
             // VIF MPG semantics: NUM==0 means 256 instructions (2048 bytes).
             // MPG payload is instruction-packed and should not be QW-aligned.
@@ -471,16 +566,56 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (qwCount > 0)
             {
                 const bool directHl = (opcode == VIF_DIRECTHL);
-                submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
+                uint32_t chunkPos = pos;
+                uint32_t remainingQw = qwCount;
 
-                const uint32_t imageQw = gifImageQwcFromTag(data + pos, qwCount * 16u);
-                if (imageQw != 0u)
+                if (m_vif1PendingPath2ImageQwc != 0u)
                 {
-                    const uint32_t inlineImageQw = (qwCount > 0u) ? (qwCount - 1u) : 0u;
-                    if (imageQw > inlineImageQw)
+                    const uint32_t chunkQw =
+                        std::min<uint32_t>(m_vif1PendingPath2ImageQwc, remainingQw);
+                    std::vector<uint8_t> imagePacket(
+                        16u + static_cast<size_t>(chunkQw) * 16u, 0u);
+                    const uint64_t imageTag =
+                        static_cast<uint64_t>(chunkQw & 0x7FFFu) |
+                        ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
+                        (static_cast<uint64_t>(kGifFmtImage) << 58);
+                    std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
+                    std::memcpy(imagePacket.data() + 16u,
+                                data + chunkPos,
+                                static_cast<size_t>(chunkQw) * 16u);
+                    submitGifPacket(GifPathId::Path2,
+                                    imagePacket.data(),
+                                    static_cast<uint32_t>(imagePacket.size()),
+                                    true,
+                                    m_vif1PendingPath2DirectHl);
+
+                    chunkPos += chunkQw * 16u;
+                    remainingQw -= chunkQw;
+                    m_vif1PendingPath2ImageQwc -= chunkQw;
+                    if (m_vif1PendingPath2ImageQwc == 0u)
                     {
-                        m_vif1PendingPath2ImageQwc = imageQw - inlineImageQw;
-                        m_vif1PendingPath2DirectHl = directHl;
+                        m_vif1PendingPath2DirectHl = false;
+                    }
+                }
+
+                if (remainingQw > 0u)
+                {
+                    submitGifPacket(GifPathId::Path2,
+                                    data + chunkPos,
+                                    remainingQw * 16u,
+                                    true,
+                                    directHl);
+
+                    const uint32_t imageQw =
+                        gifImageQwcFromTag(data + chunkPos, remainingQw * 16u);
+                    if (imageQw != 0u)
+                    {
+                        const uint32_t inlineImageQw = remainingQw - 1u;
+                        if (imageQw > inlineImageQw)
+                        {
+                            m_vif1PendingPath2ImageQwc = imageQw - inlineImageQw;
+                            m_vif1PendingPath2DirectHl = directHl;
+                        }
                     }
                 }
             }
@@ -548,6 +683,25 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vuAddr = (vuAddr + (vif1_regs.tops & 0x3FFu)) & 0x3FFu;
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
+            static std::atomic<uint32_t> vif1UnpackTraceCount{0u};
+            const uint32_t unpackTraceIndex = vif1UnpackTraceCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            const bool topRelative = (imm & 0x8000u) != 0u;
+            const bool traceUnpack = unpackTraceIndex <= 192u;
+
+            if (traceUnpack)
+            {
+                std::fprintf(stderr,
+                             "[vif1:unpack] transfer=%u opcode=0x%02x vn=%u vl=%u mask=%u mode=%u usn=%u num=%u imm=0x%04x addr=0x%x tops=0x%x cl=%u wl=%u write-vectors=%u source-vectors=%u bytes=%u data=",
+                             transferIndex, opcode, vn, vl, maskEnable ? 1u : 0u,
+                             vif1_regs.mode & 3u, zeroExtend ? 1u : 0u,
+                             writeVectorCount, imm, vuAddr, vif1_regs.tops & 0x3FFu,
+                             cl, wl, writeVectorCount, sourceVectorCount, totalBytes);
+                const uint32_t previewBytes = std::min<uint32_t>(
+                    totalBytes, 96u);
+                for (uint32_t i = 0u; i < previewBytes && pos + i < sizeBytes; ++i)
+                    std::fprintf(stderr, "%02x", data[pos + i]);
+                std::fprintf(stderr, "\n");
+            }
 
             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
@@ -745,6 +899,19 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
                     std::memcpy(m_vu1Data + destOff, lanes, sizeof(lanes));
                 }
+
+                if (traceUnpack)
+                {
+                    const uint32_t dumpCount = std::min<uint32_t>(writeVectorCount, 8u);
+                    traceVuQwords("unpack-dst", transferIndex, m_vu1Data, PS2_VU1_DATA_SIZE, vuAddr, dumpCount);
+                    if (topRelative && vuAddr != (vif1_regs.tops & 0x3FFu))
+                        traceVuQwords("unpack-tops", transferIndex, m_vu1Data, PS2_VU1_DATA_SIZE, vif1_regs.tops & 0x3FFu, 8u);
+                }
+                bool dispatchedMscal = false;
+                if (m_vif1MscalPending && ++m_vif1PendingMscalUnpacks > 3u)
+                    dispatchedMscal = dispatchPendingVu1Mscal();
+                if (!dispatchedMscal && m_vu1ServiceCallback)
+                    m_vu1ServiceCallback(false);
             }
             pos += totalBytes;
 
@@ -757,4 +924,5 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             continue;
         }
     }
+    dispatchPendingVu1Mscal();
 }

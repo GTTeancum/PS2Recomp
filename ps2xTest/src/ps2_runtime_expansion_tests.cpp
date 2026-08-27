@@ -17,6 +17,8 @@
 #include "Stubs/GS.h"
 #include "Stubs/VU.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -166,6 +168,21 @@ namespace
         }
     }
 
+    std::atomic<uint32_t> gGuestRecursiveDispatchCount{0u};
+
+    void testGuestBranchRecursiveYieldHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gGuestRecursiveDispatchCount.fetch_add(1u, std::memory_order_relaxed);
+        (void)runtime->dispatchGuestBranch(
+            rdram,
+            ctx,
+            0x3200u,
+            0x3204u,
+            0x3208u,
+            PS2Runtime::GuestBranchKind::DirectCall,
+            "test-recursive-jal");
+    }
+
     std::atomic<uint32_t> gGuestJumpTargetCount{0u};
 
     void testGuestJumpTargetHandler(uint8_t *, R5900Context *, PS2Runtime *)
@@ -195,6 +212,9 @@ namespace
     constexpr uint32_t kMpegNoDuplicateProducerPc = 0x00125050u;
     constexpr uint32_t kMpegNoDuplicateHandle = 0x00124000u;
     constexpr uint32_t kMpegNoDuplicateImage = 0x00131000u;
+    constexpr uint32_t kMpegRaw8Handle = 0x00125000u;
+    constexpr uint32_t kMpegRaw8Inner = 0x00125800u;
+    constexpr uint32_t kMpegRaw8Image = 0x00132000u;
     constexpr uint32_t kIpuInitMainPc = 0x00125100u;
     constexpr uint32_t kIpuInitResumePc = 0x00125104u;
     constexpr uint32_t kIpuSetD4Pc = 0x00126428u;
@@ -453,6 +473,32 @@ void register_ps2_runtime_expansion_tests()
                       "call-like dispatch should stop caller flow when callee transfers elsewhere");
             t.Equals(ctx.pc, 0x33330000u,
                      "callee transfer PC should be preserved");
+        });
+
+        tc.Run("dispatchGuestBranch propagates same-entry recursive depth yields", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            runtime.registerFunction(0x3200u, &testGuestBranchRecursiveYieldHandler);
+            gGuestRecursiveDispatchCount.store(0u, std::memory_order_relaxed);
+
+            R5900Context ctx{};
+            ctx.pc = 0x2000u;
+
+            const bool returnedToFallthrough = runtime.dispatchGuestBranch(
+                nullptr,
+                &ctx,
+                0x3200u,
+                0x2000u,
+                0x2008u,
+                PS2Runtime::GuestBranchKind::DirectCall,
+                "test-recursive-root");
+
+            t.IsFalse(returnedToFallthrough,
+                      "dispatch-depth yield should unwind every native caller");
+            t.Equals(ctx.pc, 0x3200u,
+                     "same-entry recursive yield should preserve the nested guest PC");
+            t.IsTrue(gGuestRecursiveDispatchCount.load(std::memory_order_relaxed) >= 32u,
+                     "test should reach the native dispatch depth ceiling");
         });
 
         tc.Run("dispatchGuestBranch rejects missing exact targets", [](TestCase &t)
@@ -783,6 +829,129 @@ void register_ps2_runtime_expansion_tests()
                      "EOF should resume the blocked GetPicture continuation");
             t.Equals(Ps2FastRead32(rdram.data(), kMpegNoDuplicateHandle + 0x08u), 1u,
                      "only the injected decoder frame should be counted as served");
+        });
+
+        tc.Run("sceMpegGetPictureRAW8 writes planar Y Cb Cr macroblocks", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+            ps2_stubs::notifyMpegCdStreamStart();
+            ps2_stubs::enqueueMpegDecodedFrameForTesting(kMpegRaw8Handle);
+
+            *reinterpret_cast<uint32_t *>(rdram.data() + kMpegRaw8Handle + 0x40u) = kMpegRaw8Inner;
+            *reinterpret_cast<uint32_t *>(rdram.data() + kMpegRaw8Inner + 0xB0u) = 0xB0B0B0B0u;
+            *reinterpret_cast<uint32_t *>(rdram.data() + kMpegRaw8Inner + 0xD8u) = 0xD8D8D8D8u;
+            *reinterpret_cast<uint32_t *>(rdram.data() + kMpegRaw8Inner + 0xDCu) = 0xDCDCDCDCu;
+            *reinterpret_cast<uint32_t *>(rdram.data() + kMpegRaw8Inner + 0xE0u) = 0xE0E0E0E0u;
+            *reinterpret_cast<uint32_t *>(rdram.data() + kMpegRaw8Inner + 0xE4u) = 0xE4E4E4E4u;
+
+            R5900Context ctx{};
+            setRegU32(ctx, 4, kMpegRaw8Handle);
+            setRegU32(ctx, 5, kMpegRaw8Image);
+            setRegU32(ctx, 6, 1u);
+            ps2_stubs::sceMpegGetPictureRAW8(rdram.data(), &ctx, &runtime);
+
+            std::array<uint8_t, 384u> expected{};
+            for (size_t i = 0u; i < 256u; ++i)
+            {
+                expected[i] = static_cast<uint8_t>(i);
+            }
+            for (size_t i = 0u; i < 64u; ++i)
+            {
+                expected[256u + i] = static_cast<uint8_t>(0x40u + i);
+                expected[320u + i] = static_cast<uint8_t>(0x80u + i);
+            }
+
+            t.Equals(getRegS32(ctx, 2), 0,
+                     "RAW8 picture output should report success");
+            t.IsTrue(
+                std::equal(expected.begin(), expected.end(), rdram.begin() + kMpegRaw8Image),
+                "RAW8 output should contain one 16x16 Y plane followed by 8x8 Cb and Cr planes");
+            t.Equals(Ps2FastRead32(rdram.data(), kMpegRaw8Inner + 0xC8u), 0u,
+                     "RAW8 output should select the linked library's planar output mode");
+            t.Equals(Ps2FastRead32(rdram.data(), kMpegRaw8Inner + 0xF0u),
+                     kMpegRaw8Image | 0x20000000u,
+                     "RAW8 output should publish the destination in the linked library request block");
+            t.Equals(Ps2FastRead32(rdram.data(), kMpegRaw8Inner + 0xF4u), 0u,
+                     "RAW8 output should clear the request X offset");
+            t.Equals(Ps2FastRead32(rdram.data(), kMpegRaw8Inner + 0xF8u), 0u,
+                     "RAW8 output should clear the request Y offset");
+            t.Equals(Ps2FastRead32(rdram.data(), kMpegRaw8Inner + 0xFCu), 1u,
+                     "RAW8 output should publish the requested macroblock count");
+            t.Equals(Ps2FastRead32(rdram.data(), kMpegRaw8Inner + 0xB0u), 0xB0B0B0B0u,
+                     "RAW8 output should not overwrite the foreign library's mode field");
+            t.Equals(Ps2FastRead32(rdram.data(), kMpegRaw8Inner + 0xD8u), 0xD8D8D8D8u,
+                     "RAW8 output should not overwrite the foreign library's destination field");
+            t.Equals(Ps2FastRead32(rdram.data(), kMpegRaw8Inner + 0xDCu), 0xDCDCDCDCu,
+                     "RAW8 output should not overwrite the foreign library's X field");
+            t.Equals(Ps2FastRead32(rdram.data(), kMpegRaw8Inner + 0xE0u), 0xE0E0E0E0u,
+                     "RAW8 output should not overwrite the foreign library's Y field");
+            t.Equals(Ps2FastRead32(rdram.data(), kMpegRaw8Inner + 0xE4u), 0xE4E4E4E4u,
+                     "RAW8 output should not overwrite the foreign library's macroblock field");
+        });
+
+        tc.Run("MPEG lifecycle stubs preserve the linked libmpeg work-area ABI", [](TestCase &t)
+        {
+            constexpr uint32_t kHandle = 0x00140000u;
+            constexpr uint32_t kWork = 0x00150001u;
+            constexpr uint32_t kWorkSize = 0x3000u;
+            constexpr uint32_t kInner = 0x00150004u;
+            constexpr uint32_t kForeignCreateGlobal = 0x001717BCu;
+            constexpr uint32_t kForeignResetGlobal = 0x00171904u;
+
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0xCDu);
+            ps2_stubs::resetMpegStubState();
+            *reinterpret_cast<uint32_t *>(rdram.data() + kForeignCreateGlobal) = 0x11223344u;
+            *reinterpret_cast<uint32_t *>(rdram.data() + kForeignResetGlobal) = 0x55667788u;
+
+            R5900Context createCtx{};
+            setRegU32(createCtx, 4, kHandle);
+            setRegU32(createCtx, 5, kWork);
+            setRegU32(createCtx, 6, kWorkSize);
+            ps2_stubs::sceMpegCreate(rdram.data(), &createCtx, nullptr);
+
+            t.Equals(::getRegU32(&createCtx, 2), 1u,
+                     "sceMpegCreate should return the linked library's success value");
+            t.Equals(Ps2FastRead32(rdram.data(), kHandle + 0x40u), kInner,
+                     "sceMpegCreate should publish the aligned work-area address");
+            t.Equals(Ps2FastRead32(rdram.data(), kInner + 0xC8u), 1u,
+                     "sceMpegCreate should initialize RGBA picture mode at offset C8");
+            t.Equals(Ps2FastRead32(rdram.data(), kInner + 0xF0u), 0u,
+                     "sceMpegCreate should leave the picture destination clear");
+            t.Equals(Ps2FastRead32(rdram.data(), kInner + 0x120u), kInner + 0x10C0u,
+                     "sceMpegCreate should initialize the dynamic allocator base");
+            t.Equals(Ps2FastRead32(rdram.data(), kInner + 0x124u),
+                     kWorkSize - (kInner - kWork) - 0x10C0u,
+                     "sceMpegCreate should initialize the dynamic allocator size");
+            t.Equals(Ps2FastRead32(rdram.data(), kInner + 0x1D0u), kInner + 0x200u,
+                     "sceMpegCreate should initialize the first reference buffer pointer");
+            t.Equals(Ps2FastRead32(rdram.data(), kForeignCreateGlobal), 0x11223344u,
+                     "sceMpegCreate should not write another libmpeg version's global address");
+
+            R5900Context resetCtx{};
+            setRegU32(resetCtx, 4, kHandle);
+            ps2_stubs::sceMpegReset(rdram.data(), &resetCtx, nullptr);
+            t.Equals(::getRegU32(&resetCtx, 2), 1u,
+                     "sceMpegReset should return the linked library's success value");
+            t.Equals(Ps2FastRead32(rdram.data(), kInner + 0x98u), 0xFFFFFFFFu,
+                     "sceMpegReset should reset the decoder reference index");
+            t.Equals(Ps2FastRead32(rdram.data(), kInner + 0x10A0u), 0u,
+                     "sceMpegReset should clear the picture completion flag");
+            t.Equals(Ps2FastRead32(rdram.data(), kForeignResetGlobal), 0x55667788u,
+                     "sceMpegReset should not write another libmpeg version's global address");
+
+            *reinterpret_cast<uint32_t *>(rdram.data() + kInner + 0x200u + 0x28u) = 0xA5A5A5A5u;
+            *reinterpret_cast<uint32_t *>(rdram.data() + kInner + 0x338u + 0x28u) = 0x5A5A5A5Au;
+            R5900Context clearCtx{};
+            setRegU32(clearCtx, 4, kHandle);
+            ps2_stubs::sceMpegClearRefBuff(rdram.data(), &clearCtx, nullptr);
+            t.Equals(::getRegU32(&clearCtx, 2), 1u,
+                     "sceMpegClearRefBuff should report success");
+            t.Equals(Ps2FastRead32(rdram.data(), kInner + 0x200u + 0x28u), 0u,
+                     "sceMpegClearRefBuff should clear the first reference buffer");
+            t.Equals(Ps2FastRead32(rdram.data(), kInner + 0x338u + 0x28u), 0u,
+                     "sceMpegClearRefBuff should clear the second reference-buffer bank");
         });
 
         tc.Run("sceSdRemote isolates voice transfers from block streaming state", [](TestCase &t)

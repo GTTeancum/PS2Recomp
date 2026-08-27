@@ -315,6 +315,17 @@ namespace ps2_stubs
 
         if (ok)
         {
+            static uint32_t movieHeaderLogCount = 0u;
+            if (selected.lbn == 0x00100000u && movieHeaderLogCount++ < 4u)
+            {
+                const uint32_t offset = selected.buf & PS2_RAM_MASK;
+                std::fprintf(stderr,
+                             "[xmen-sfd-read] lbn=0x%x sectors=0x%x buffer=0x%x head=",
+                             selected.lbn, selected.sectors, selected.buf);
+                for (uint32_t index = 0u; index < 32u; ++index)
+                    std::fprintf(stderr, "%02x", rdram[offset + index]);
+                std::fprintf(stderr, "\n");
+            }
             g_cdStreamingLbn = selected.lbn + selected.sectors;
             setReturnS32(ctx, 1); // command accepted/success
             return;

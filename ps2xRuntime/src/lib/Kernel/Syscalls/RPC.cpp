@@ -2,6 +2,8 @@
 #include "RPC.h"
 #include "../../ps2_iop_transport.h"
 
+void ps2xArmXmenTitleBranchTrace();
+
 namespace ps2_syscalls
 {
     namespace
@@ -127,6 +129,8 @@ namespace ps2_syscalls
 
             const std::string modules = loadedIopModuleTraceSummary();
             std::cerr << "[IOP/RPC trace:unhandled]"
+                      << " client=0x" << std::hex << event.clientPtr
+                      << " server=0x" << event.serverPtr
                       << " sid=0x" << std::hex << event.sid
                       << " rpc=0x" << event.rpcNum
                       << " pc=0x" << event.pc
@@ -146,6 +150,298 @@ namespace ps2_syscalls
                 return false;
             }
             return runtime->eeScheduler().signalSemaphore(static_cast<int>(semaId), true) >= 0;
+        }
+
+        constexpr uint32_t kCdvdSearchFileSid = 0x80000597u;
+        constexpr uint32_t kCdvdSearchFilePathOffset = 0x24u;
+        constexpr uint32_t kXmenLegendsIgFileIoSid = 0x00012114u;
+
+        bool handleCdvdSearchFileRpc(uint8_t *rdram,
+                                     R5900Context *ctx,
+                                     PS2Runtime *runtime,
+                                     uint32_t sid,
+                                     uint32_t rpcNum,
+                                     uint32_t sendBuf,
+                                     uint32_t sendSize,
+                                     uint32_t receiveBuffer,
+                                     uint32_t receiveSize,
+                                     ps2x::iop::RpcResult &result)
+        {
+            uint32_t sendOffset = 0u;
+            bool sendScratch = false;
+            if (result.handled || sid != kCdvdSearchFileSid || rpcNum != 0u || !rdram ||
+                sendSize <= kCdvdSearchFilePathOffset ||
+                !resolveEeGuestRange(sendBuf, sendSize, sendOffset, sendScratch) || sendScratch)
+            {
+                return false;
+            }
+
+            R5900Context searchContext{};
+            if (ctx)
+            {
+                searchContext = *ctx;
+            }
+            SET_GPR_U32(&searchContext, 4, sendBuf);
+            SET_GPR_U32(&searchContext, 5, sendBuf + kCdvdSearchFilePathOffset);
+            ps2_stubs::sceCdSearchFile(rdram, &searchContext, runtime);
+
+            const int32_t searchResult = static_cast<int32_t>(getRegU32(&searchContext, 2));
+            if (receiveSize >= sizeof(searchResult))
+            {
+                if (uint8_t *receive = getMemPtr(rdram, receiveBuffer))
+                {
+                    std::memcpy(receive, &searchResult, sizeof(searchResult));
+                }
+            }
+
+            result.handled = true;
+            result.resultAddress = receiveBuffer;
+            result.serverDispatchPolicy = ps2x::iop::ServerDispatchPolicy::Suppress;
+            std::cerr << "[cdvd-search-rpc] result=" << searchResult
+                      << " send=0x" << std::hex << sendBuf
+                      << " recv=0x" << receiveBuffer << std::dec << std::endl;
+            return true;
+        }
+
+        struct XmenLegendsIgFileIoState
+        {
+            std::mutex mutex;
+            std::unordered_map<int32_t, FILE *> files;
+            std::unordered_map<int32_t, std::string> paths;
+        };
+
+        XmenLegendsIgFileIoState g_xmenLegendsIgFileIo;
+
+        bool xmenGuestRangeValid(uint32_t address, uint32_t size)
+        {
+            return address < PS2_RAM_SIZE && size <= PS2_RAM_SIZE - address;
+        }
+
+        uint32_t xmenReadGuestU32(const uint8_t *rdram, uint32_t address)
+        {
+            uint32_t value = 0u;
+            if (rdram && xmenGuestRangeValid(address, sizeof(value)))
+            {
+                std::memcpy(&value, rdram + address, sizeof(value));
+            }
+            return value;
+        }
+
+        void xmenWriteGuestS32(uint8_t *rdram, uint32_t address, int32_t value)
+        {
+            if (rdram && address != 0u && xmenGuestRangeValid(address, sizeof(value)))
+            {
+                std::memcpy(rdram + address, &value, sizeof(value));
+            }
+        }
+
+        std::string xmenReadIgFileIoPath(const uint8_t *rdram, uint32_t sendBuf, uint32_t sendSize)
+        {
+            if (!rdram || sendSize <= sizeof(uint32_t) ||
+                !xmenGuestRangeValid(sendBuf, sendSize))
+            {
+                return {};
+            }
+
+            const char *bytes = reinterpret_cast<const char *>(rdram + sendBuf + sizeof(uint32_t));
+            const size_t capacity = sendSize - sizeof(uint32_t);
+            size_t length = 0u;
+            while (length < capacity && bytes[length] != '\0')
+            {
+                ++length;
+            }
+            return std::string(bytes, length);
+        }
+
+        bool handleXmenLegendsIgFileIoRpc(uint8_t *rdram,
+                                         PS2Runtime *runtime,
+                                         uint32_t sid,
+                                         uint32_t rpcNum,
+                                         uint32_t sendBuf,
+                                         uint32_t sendSize,
+                                         uint32_t receiveBuffer,
+                                         uint32_t receiveSize,
+                                         ps2x::iop::RpcResult &result)
+        {
+            if (sid != kXmenLegendsIgFileIoSid || !rdram)
+            {
+                return false;
+            }
+
+            int32_t operationResult = -1;
+            std::string operation;
+            std::string detail;
+            const uint64_t vsyncTick = runtime
+                ? runtime->memory().gs().vsyncTick.load(std::memory_order_relaxed)
+                : 0u;
+
+            if (rpcNum == 0x2u)
+            {
+                operation = "open";
+                const std::string ps2Path = xmenReadIgFileIoPath(rdram, sendBuf, sendSize);
+                const std::string hostPath = translatePs2Path(ps2Path.c_str());
+                FILE *file = hostPath.empty() ? nullptr : ::fopen(hostPath.c_str(), "rb");
+                if (file)
+                {
+                    std::lock_guard<std::mutex> lock(g_xmenLegendsIgFileIo.mutex);
+                    operationResult = 7;
+                    while (g_xmenLegendsIgFileIo.files.find(operationResult) !=
+                           g_xmenLegendsIgFileIo.files.end())
+                    {
+                        ++operationResult;
+                    }
+                    g_xmenLegendsIgFileIo.files.emplace(operationResult, file);
+                    g_xmenLegendsIgFileIo.paths.emplace(operationResult, ps2Path);
+                }
+                detail = "path=" + ps2Path + " host=" + hostPath;
+            }
+            else if (rpcNum == 0x3u && sendSize >= sizeof(uint32_t) &&
+                     xmenGuestRangeValid(sendBuf, sizeof(uint32_t)))
+            {
+                operation = "close";
+                const int32_t handle = static_cast<int32_t>(xmenReadGuestU32(rdram, sendBuf));
+
+                std::lock_guard<std::mutex> lock(g_xmenLegendsIgFileIo.mutex);
+                const auto it = g_xmenLegendsIgFileIo.files.find(handle);
+                if (it != g_xmenLegendsIgFileIo.files.end())
+                {
+                    const auto pathIt = g_xmenLegendsIgFileIo.paths.find(handle);
+                    if (pathIt != g_xmenLegendsIgFileIo.paths.end())
+                    {
+                        detail = "handle=" + std::to_string(handle) + " path=" + pathIt->second;
+                    }
+                    operationResult = ::fclose(it->second) == 0 ? 0 : -1;
+                    g_xmenLegendsIgFileIo.files.erase(it);
+                    g_xmenLegendsIgFileIo.paths.erase(handle);
+                }
+                if (detail.empty())
+                {
+                    detail = "handle=" + std::to_string(handle);
+                }
+            }
+            else if (rpcNum == 0x4u && sendSize >= 3u * sizeof(uint32_t) &&
+                     xmenGuestRangeValid(sendBuf, 3u * sizeof(uint32_t)))
+            {
+                operation = "seek";
+                const int32_t handle = static_cast<int32_t>(xmenReadGuestU32(rdram, sendBuf));
+                const int32_t offset = static_cast<int32_t>(xmenReadGuestU32(rdram, sendBuf + 4u));
+                const uint32_t origin = xmenReadGuestU32(rdram, sendBuf + 8u);
+                const int hostOrigin = origin == 0u ? SEEK_SET : (origin == 1u ? SEEK_CUR : SEEK_END);
+                long before = -1;
+                long after = -1;
+                std::string path;
+
+                std::lock_guard<std::mutex> lock(g_xmenLegendsIgFileIo.mutex);
+                const auto it = g_xmenLegendsIgFileIo.files.find(handle);
+                if (it != g_xmenLegendsIgFileIo.files.end())
+                {
+                    const auto pathIt = g_xmenLegendsIgFileIo.paths.find(handle);
+                    if (pathIt != g_xmenLegendsIgFileIo.paths.end())
+                    {
+                        path = pathIt->second;
+                    }
+                    before = ::ftell(it->second);
+                    if (origin <= 2u && ::fseek(it->second, static_cast<long>(offset), hostOrigin) == 0)
+                    {
+                        after = ::ftell(it->second);
+                        if (after >= 0 && static_cast<unsigned long>(after) <= UINT32_MAX)
+                        {
+                            operationResult = static_cast<int32_t>(after);
+                        }
+                    }
+                }
+                detail = "handle=" + std::to_string(handle) +
+                         " path=" + path +
+                         " offset=" + std::to_string(offset) +
+                         " origin=" + std::to_string(origin) +
+                         " before=" + std::to_string(before) +
+                         " after=" + std::to_string(after);
+            }
+            else if (rpcNum == 0x6u && sendSize >= 8u * sizeof(uint32_t) &&
+                     xmenGuestRangeValid(sendBuf, 8u * sizeof(uint32_t)))
+            {
+                operation = "read";
+                const int32_t handle = static_cast<int32_t>(xmenReadGuestU32(rdram, sendBuf));
+                const uint32_t destination = xmenReadGuestU32(rdram, sendBuf + 4u);
+                const uint32_t byteCount = xmenReadGuestU32(rdram, sendBuf + 8u);
+                const uint32_t threadId = xmenReadGuestU32(rdram, sendBuf + 24u);
+                const uint32_t resultAddress = xmenReadGuestU32(rdram, sendBuf + 28u);
+                long before = -1;
+                long after = -1;
+                std::string path;
+
+                if (xmenGuestRangeValid(destination, byteCount))
+                {
+                    std::lock_guard<std::mutex> lock(g_xmenLegendsIgFileIo.mutex);
+                    const auto it = g_xmenLegendsIgFileIo.files.find(handle);
+                    if (it != g_xmenLegendsIgFileIo.files.end())
+                    {
+                        const auto pathIt = g_xmenLegendsIgFileIo.paths.find(handle);
+                        if (pathIt != g_xmenLegendsIgFileIo.paths.end())
+                        {
+                            path = pathIt->second;
+                        }
+                        before = ::ftell(it->second);
+                        const size_t bytesRead = ::fread(rdram + destination, 1u, byteCount, it->second);
+                        after = ::ftell(it->second);
+                        operationResult = (bytesRead < byteCount && ::ferror(it->second))
+                                              ? -1
+                                              : static_cast<int32_t>(bytesRead);
+                        if (operationResult < 0)
+                        {
+                            ::clearerr(it->second);
+                        }
+                        if (runtime && before == 281651790l && operationResult > 0)
+                        {
+                            ps2xArmXmenTitleBranchTrace();
+                        }
+                    }
+                }
+
+                xmenWriteGuestS32(rdram, resultAddress, operationResult);
+                if (runtime && threadId != 0u)
+                {
+                    (void)runtime->eeScheduler().queueThreadWakeup(static_cast<int>(threadId), true);
+                }
+                detail = "handle=" + std::to_string(handle) +
+                         " path=" + path +
+                         " bytes=" + std::to_string(byteCount) +
+                         " before=" + std::to_string(before) +
+                         " after=" + std::to_string(after) +
+                         " dst=0x" + [&]()
+                         {
+                             char buffer[16]{};
+                             std::snprintf(buffer, sizeof(buffer), "%08x", destination);
+                             return std::string(buffer);
+                         }() +
+                         " thread=" + std::to_string(threadId);
+            }
+            else
+            {
+                return false;
+            }
+
+            if (receiveSize >= sizeof(int32_t))
+            {
+                xmenWriteGuestS32(rdram, receiveBuffer, operationResult);
+            }
+            result.handled = true;
+            result.resultAddress = receiveBuffer;
+            result.serverDispatchPolicy = ps2x::iop::ServerDispatchPolicy::Suppress;
+
+            std::cerr << "[xmen-igfileio-rpc] op=" << operation
+                      << " rpc=0x" << std::hex << rpcNum
+                      << " result=" << std::dec << operationResult
+                      << " " << detail << std::endl;
+            if (operation == "open" || operation == "close" || vsyncTick >= 1900u)
+            {
+                std::cout << "[xmen-igfileio-focus] tick=" << vsyncTick
+                          << " op=" << operation
+                          << " rpc=0x" << std::hex << rpcNum
+                          << " result=" << std::dec << operationResult
+                          << " " << detail << std::endl;
+            }
+            return true;
         }
 
     } // namespace
@@ -219,12 +515,12 @@ namespace ps2_syscalls
     void SifInitRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         std::lock_guard<std::mutex> lock(g_rpc_mutex);
-        if (runtime)
-        {
-            PS2IopTransport::reset(runtime);
-        }
         if (!g_rpc_initialized)
         {
+            if (runtime)
+            {
+                PS2IopTransport::reset(runtime);
+            }
             g_rpc_servers.clear();
             g_rpc_clients.clear();
             g_rpc_next_id = 1;
@@ -278,6 +574,7 @@ namespace ps2_syscalls
         client->hdr.mode = mode;
 
         uint32_t serverPtr = 0;
+        bool serverIsSynthetic = false;
         {
             std::lock_guard<std::mutex> lock(g_rpc_mutex);
             client->hdr.rpc_id = g_rpc_next_id++;
@@ -285,6 +582,7 @@ namespace ps2_syscalls
             if (it != g_rpc_servers.end())
             {
                 serverPtr = it->second.sd_ptr;
+                serverIsSynthetic = it->second.synthetic;
             }
             g_rpc_clients[clientPtr] = {};
             g_rpc_clients[clientPtr].sid = rpcId;
@@ -303,16 +601,25 @@ namespace ps2_syscalls
                     dummy->sid = static_cast<int>(rpcId);
                 }
                 std::lock_guard<std::mutex> lock(g_rpc_mutex);
-                g_rpc_servers[rpcId] = {rpcId, serverPtr};
+                g_rpc_servers[rpcId] = {rpcId, serverPtr, true};
+                serverIsSynthetic = true;
             }
         }
 
         if (serverPtr)
         {
-            t_SifRpcServerData *sd = reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, serverPtr));
             client->server = serverPtr;
-            client->buf = sd ? sd->buf : 0;
-            client->cbuf = sd ? sd->cbuf : 0;
+            if (serverIsSynthetic)
+            {
+                client->buf = 0;
+                client->cbuf = 0;
+            }
+            else
+            {
+                t_SifRpcServerData *sd = reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, serverPtr));
+                client->buf = sd ? sd->buf : 0;
+                client->cbuf = sd ? sd->cbuf : 0;
+            }
         }
         else
         {
@@ -328,6 +635,15 @@ namespace ps2_syscalls
         event.mode = mode;
         event.result = 0;
         pushSifRpcDebugEvent(event);
+#if PS2X_ENABLE_IOP_RPC_TRACE
+        std::cerr << "[IOP/RPC trace:bind]"
+                  << " client=0x" << std::hex << clientPtr
+                  << " server=0x" << serverPtr
+                  << " sid=0x" << rpcId
+                  << " pc=0x" << event.pc
+                  << " ra=0x" << event.ra
+                  << std::dec << std::endl;
+#endif
         setReturnS32(ctx, 0);
     }
 
@@ -449,6 +765,26 @@ namespace ps2_syscalls
         const uint32_t endFunction = useRegisterConvention ? endFunctionRegisters : endFunctionStack;
         const uint32_t endParameter = useRegisterConvention ? endParameterRegisters : endParameterStack;
 
+#if PS2X_ENABLE_IOP_RPC_TRACE
+        static std::atomic<uint32_t> s_rpcCallTraceCount{0u};
+        const uint32_t rpcTraceIndex = s_rpcCallTraceCount.fetch_add(1u, std::memory_order_relaxed);
+        if (rpcTraceIndex < 128u)
+        {
+            std::cerr << "[IOP/RPC trace:call] client=0x" << std::hex << clientPtr
+                      << " sid=0x" << sidHint
+                      << " rpc=0x" << rpcNum
+                      << " mode=0x" << mode
+                      << " send=0x" << sendBuf << "+0x" << sendSize
+                      << " recv=0x" << receiveBuffer << "+0x" << receiveSize
+                      << " end=0x" << endFunction
+                      << " param=0x" << endParameter
+                      << " abi=" << (useRegisterConvention ? "registers" : "stack")
+                      << " pc=0x" << ctx->pc
+                      << " ra=0x" << getRegU32(ctx, 31)
+                      << std::dec << std::endl;
+        }
+#endif
+
         auto *client = reinterpret_cast<t_SifRpcClientData *>(getMemPtr(rdram, clientPtr));
         if (!client)
         {
@@ -476,25 +812,29 @@ namespace ps2_syscalls
         client->hdr.mode = mode;
 
         uint32_t sid = 0u;
+        bool serverIsSynthetic = false;
         {
             std::lock_guard<std::mutex> lock(g_rpc_mutex);
             auto &state = g_rpc_clients[clientPtr];
             state.busy = true;
             state.last_rpc = rpcNum;
             sid = state.sid;
-            if (sid != 0u)
+            const auto serverIt = g_rpc_servers.find(sid);
+            if (serverIt != g_rpc_servers.end())
             {
-                const auto serverIt = g_rpc_servers.find(sid);
-                if (serverIt != g_rpc_servers.end() &&
-                    serverIt->second.sd_ptr != 0u)
+                if (sid != 0u && serverIt->second.sd_ptr != 0u)
                 {
                     client->server = serverIt->second.sd_ptr;
+                }
+                if (serverIt->second.sd_ptr == client->server)
+                {
+                    serverIsSynthetic = serverIt->second.synthetic;
                 }
             }
         }
 
         const uint32_t serverPtr = client->server;
-        auto *server = serverPtr
+        auto *server = serverPtr && !serverIsSynthetic
                            ? reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, serverPtr))
                            : nullptr;
         if (server)
@@ -536,6 +876,27 @@ namespace ps2_syscalls
             request.endParameter = endParameter;
 
             iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
+
+            (void)handleCdvdSearchFileRpc(rdram,
+                                          ctx,
+                                          runtime,
+                                          sid,
+                                          rpcNum,
+                                          sendBuf,
+                                          sendSize,
+                                          receiveBuffer,
+                                          receiveSize,
+                                          iopResult);
+
+            (void)handleXmenLegendsIgFileIoRpc(rdram,
+                                               runtime,
+                                               sid,
+                                               rpcNum,
+                                               sendBuf,
+                                               sendSize,
+                                               receiveBuffer,
+                                               receiveSize,
+                                               iopResult);
 
             if (iopResult.signalNowaitCompletion &&
                 (mode & kSifRpcModeNowait) != 0u)
@@ -640,6 +1001,19 @@ namespace ps2_syscalls
             };
 
             setReturnS32(&parent, 0);
+#if PS2X_ENABLE_IOP_RPC_TRACE
+            if (rpcTraceIndex < 128u)
+            {
+                std::cerr << "[IOP/RPC trace:finish] sid=0x" << std::hex << sid
+                          << " rpc=0x" << rpcNum
+                          << " handled=" << (handled ? 1 : 0)
+                          << " end=0x" << endFunction
+                          << " callbackPolicy=" << static_cast<unsigned>(iopResult.callbackPolicy)
+                          << " signalCompletion=" << (iopResult.signalCompletion ? 1 : 0)
+                          << " signalNowait=" << (iopResult.signalNowaitCompletion ? 1 : 0)
+                          << std::dec << std::endl;
+            }
+#endif
             if (endFunction == 0u || iopResult.callbackPolicy == ps2x::iop::CallbackPolicy::Suppress)
             {
                 completeClient(parent, endFunction != 0u);
@@ -777,7 +1151,7 @@ namespace ps2_syscalls
                 }
             }
 
-            g_rpc_servers[sid] = {sid, sdPtr};
+            g_rpc_servers[sid] = {sid, sdPtr, false};
             for (auto &entry : g_rpc_clients)
             {
                 if (entry.second.sid == sid)

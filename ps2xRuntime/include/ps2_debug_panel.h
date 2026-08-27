@@ -16,7 +16,7 @@ public:
 
 private:
     bool m_initialized = false;
-    bool m_visible = true;
+    bool m_visible = false;
     bool m_showRegisters = true;
     unsigned int m_memoryAddress = 0x00100000u;
     unsigned int m_memoryBytes = 0x100u;

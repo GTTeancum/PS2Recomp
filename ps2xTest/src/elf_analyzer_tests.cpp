@@ -175,6 +175,62 @@ void register_elf_analyzer_tests()
             (void)hasLargeComplexMMI;
             (void)hasSelfModifying; });
 
+                       tc.Run("MMIO address resolution preserves interleaved LUI ORI constants", [](TestCase &t)
+                              {
+            Instruction luiTarget = makeInstruction(0x3500, OPCODE_LUI);
+            luiTarget.rt = 2;
+            luiTarget.immediate = 0x1000;
+            luiTarget.modificationInfo.modifiesGPR = true;
+
+            Instruction oriTarget = makeInstruction(0x3504, OPCODE_ORI);
+            oriTarget.rs = 2;
+            oriTarget.rt = 2;
+            oriTarget.immediate = 0xB410;
+            oriTarget.modificationInfo.modifiesGPR = true;
+
+            Instruction interleavedLui = makeInstruction(0x3508, OPCODE_LUI);
+            interleavedLui.rt = 4;
+            interleavedLui.rd = 2; // Raw I-type rd bits must not look like a GPR write.
+            interleavedLui.immediate = 0x1000;
+            interleavedLui.modificationInfo.modifiesGPR = true;
+
+            Instruction load = makeInstruction(0x350C, OPCODE_LW);
+            load.rs = 2;
+
+            const std::vector<Instruction> instructions{luiTarget, oriTarget, interleavedLui, load};
+            uint32_t address = 0u;
+            t.IsTrue(
+                ElfAnalyzer::resolveBasePlusOffsetForHeuristics(instructions, 3u, 2u, 0, address),
+                "interleaved setup for another register should not hide the target constant");
+            t.Equals(address, 0x1000B410u,
+                     "LUI and ORI should contribute both halves of the MMIO address"); });
+
+                       tc.Run("MMIO address resolution applies signed ADDIU and memory offsets", [](TestCase &t)
+                              {
+            Instruction luiTarget = makeInstruction(0x3600, OPCODE_LUI);
+            luiTarget.rt = 3;
+            luiTarget.immediate = 0x1001;
+            luiTarget.modificationInfo.modifiesGPR = true;
+
+            Instruction addiuTarget = makeInstruction(0x3604, OPCODE_ADDIU);
+            addiuTarget.rs = 3;
+            addiuTarget.rt = 3;
+            addiuTarget.immediate = 0xFFE0;
+            addiuTarget.modificationInfo.modifiesGPR = true;
+
+            Instruction load = makeInstruction(0x3608, OPCODE_LW);
+            load.rs = 3;
+            load.immediate = 0x30;
+
+            const std::vector<Instruction> instructions{luiTarget, addiuTarget, load};
+            uint32_t address = 0u;
+            t.IsTrue(
+                ElfAnalyzer::resolveBasePlusOffsetForHeuristics(
+                    instructions, 2u, 3u, static_cast<int16_t>(load.immediate), address),
+                "LUI and ADDIU should resolve with the load displacement");
+            t.Equals(address, 0x10010010u,
+                     "signed ADDIU and load offsets should both contribute to the address"); });
+
                        tc.Run("jump-table detection finds canonical sltiu/bne/lw/jr pattern", [](TestCase &t)
                               {
             // sltiu -> bne/beq bounds check -> ... -> lui/addiu base -> lw -> jr loadedReg

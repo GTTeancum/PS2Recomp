@@ -254,6 +254,8 @@ struct GSPrimitiveBatch
     std::array<GSVertex, 3> vertices{};
     uint8_t vertexCount = 0;
     GSDrawState state{};
+    uint64_t debugVsyncTick = 0;
+    uint32_t debugPresentCount = 0;
 };
 
 struct GSTransferCommand

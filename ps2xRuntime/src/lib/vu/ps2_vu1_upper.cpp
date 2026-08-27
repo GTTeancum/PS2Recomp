@@ -2,6 +2,7 @@
 #include "ps2_vu1_detail.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -407,7 +408,10 @@ void VU1Interpreter::execUpper(uint32_t instr)
                 flags |= 0x04u;
             if (exceedsClipPlane(m_state.vf[fs][1], 0x80000000u))
                 flags |= 0x08u;
-            if (exceedsClipPlane(m_state.vf[fs][2], 0x00000000u))
+            static const bool ignorePositiveZClip =
+                std::getenv("PS2X_VU_DIAG_IGNORE_POSITIVE_Z_CLIP") != nullptr;
+            if (!ignorePositiveZClip &&
+                exceedsClipPlane(m_state.vf[fs][2], 0x00000000u))
                 flags |= 0x10u;
             if (exceedsClipPlane(m_state.vf[fs][2], 0x80000000u))
                 flags |= 0x20u;
