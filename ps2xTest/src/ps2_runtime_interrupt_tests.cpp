@@ -62,6 +62,9 @@ namespace
     constexpr uint32_t kTimer2WaitPc = 0x00160500u;
     constexpr uint32_t kTimer2ResumePc = 0x00160510u;
     constexpr uint32_t kTimer2HandlerPc = 0x00160520u;
+    constexpr uint32_t kDelayedDmacWaitPc = 0x00160600u;
+    constexpr uint32_t kDelayedDmacResumePc = 0x00160610u;
+    constexpr uint32_t kDelayedDmacHandlerPc = 0x00160620u;
 
     constexpr uint32_t kTimer2Count = 0x10001000u;
     constexpr uint32_t kTimer2Mode = 0x10001010u;
@@ -83,6 +86,8 @@ namespace
     uint64_t g_vsyncTick = 0;
     uint64_t g_vsyncCsr = 0;
     std::atomic<bool> g_timer2Resumed{false};
+    uint64_t g_delayedDmacStartCycle = 0u;
+    uint64_t g_delayedDmacHandlerCycle = 0u;
 
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
@@ -294,6 +299,33 @@ namespace
         ctx->pc = 0u;
         runtime->requestStop();
     }
+
+    void schedulerDelayedDmacHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dispatchTrace.push_back(2);
+        g_delayedDmacHandlerCycle = runtime->eeScheduler().currentEeCycle();
+        runtime->eeScheduler().signalSemaphore(g_testSemaphoreId, true);
+        ctx->pc = 0u;
+    }
+
+    void schedulerDelayedDmacWait(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dispatchTrace.push_back(1);
+        EeScheduler &scheduler = runtime->eeScheduler();
+        g_testSemaphoreId = scheduler.createSemaphore(0, 1, 0u, 0u);
+        scheduler.addIrqHandler(true, 8u, kDelayedDmacHandlerPc, true, 0u, 0u, 0u);
+        g_delayedDmacStartCycle = scheduler.currentEeCycle();
+        scheduler.scheduleDmacIrq(8u, 1024u);
+        ctx->pc = kDelayedDmacResumePc;
+        scheduler.waitSemaphore(g_testSemaphoreId);
+    }
+
+    void schedulerDelayedDmacResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dispatchTrace.push_back(3);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
 }
 
 void register_ps2_runtime_interrupt_tests()
@@ -465,6 +497,28 @@ void register_ps2_runtime_interrupt_tests()
                      "the dispatcher should run wait, IRQ frame, then the resumed base context in exact order");
             t.Equals(g_lastIntcArg.load(std::memory_order_relaxed), 0xCAFEu,
                      "the IRQ frame should receive its registered argument");
+        });
+
+        tc.Run("scheduled DMAC IRQ waits for its EE cycle deadline", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kDelayedDmacWaitPc, schedulerDelayedDmacWait);
+            env.runtime.registerFunction(kDelayedDmacResumePc, schedulerDelayedDmacResume);
+            env.runtime.registerFunction(kDelayedDmacHandlerPc, schedulerDelayedDmacHandler);
+
+            g_dispatchTrace.clear();
+            g_delayedDmacStartCycle = 0u;
+            g_delayedDmacHandlerCycle = 0u;
+            R5900Context mainContext{};
+            mainContext.pc = kDelayedDmacWaitPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            const std::vector<int> expected{1, 2, 3};
+            t.IsTrue(g_dispatchTrace == expected,
+                     "scheduled DMAC IRQ should run its handler before resuming the waiter");
+            t.IsTrue(g_delayedDmacHandlerCycle >= g_delayedDmacStartCycle + 1024u,
+                     "DMAC handler must not run before its requested EE cycle deadline");
         });
 
         tc.Run("iSignalSema defers selection until IRQ return", [](TestCase &t)

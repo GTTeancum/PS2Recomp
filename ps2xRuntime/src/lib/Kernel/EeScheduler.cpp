@@ -1284,6 +1284,20 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     }
 }
 
+void EeScheduler::scheduleDmacIrq(uint32_t cause, uint64_t delayCycles)
+{
+    assertExecutor();
+    const uint64_t delay = std::max<uint64_t>(delayCycles, 1u);
+    scheduleEvent(m_eeCycle + delay,
+                  std::chrono::steady_clock::now() + eeCyclesToHostDuration(delay),
+                  EeEvent{EeEventType::Dmac, cause, 0u});
+}
+
+uint64_t EeScheduler::currentEeCycle() const noexcept
+{
+    return m_eeCycle;
+}
+
 void EeScheduler::setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress)
 {
     assertExecutor();
@@ -1901,6 +1915,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         dispatchIrq(false, 3u);
         break;
     case EeEventType::Dmac:
+        dispatchIrq(true, event.id);
         break;
     case EeEventType::Alarm:
     {
