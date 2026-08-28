@@ -326,6 +326,34 @@ namespace ps2_stubs
                     std::fprintf(stderr, "%02x", rdram[offset + index]);
                 std::fprintf(stderr, "\n");
             }
+
+            CdFileEntry entry{};
+            if (findRegisteredCdFileForLbn(selected.lbn, entry))
+            {
+                std::string extension = entry.hostPath.extension().string();
+                std::transform(extension.begin(), extension.end(), extension.begin(),
+                               [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+                if (extension == ".sfd")
+                {
+                    const uint64_t fileOffset =
+                        static_cast<uint64_t>(selected.lbn - entry.baseLbn) * kCdSectorSize;
+                    const uint64_t available = fileOffset < entry.sizeBytes
+                                                   ? static_cast<uint64_t>(entry.sizeBytes) - fileOffset
+                                                   : 0u;
+                    const uint32_t bytesRead = static_cast<uint32_t>(std::min<uint64_t>(
+                        static_cast<uint64_t>(selected.sectors) * kCdSectorSize,
+                        available));
+                    notifyMpegCdRead(
+                        rdram,
+                        ctx,
+                        runtime,
+                        selected.buf,
+                        bytesRead,
+                        selected.lbn,
+                        entry.baseLbn,
+                        entry.sizeBytes);
+                }
+            }
             g_cdStreamingLbn = selected.lbn + selected.sectors;
             setReturnS32(ctx, 1); // command accepted/success
             return;

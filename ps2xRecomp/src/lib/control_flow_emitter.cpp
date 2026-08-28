@@ -262,7 +262,7 @@ namespace ps2recomp
                  << "u, 0u, PS2Runtime::GuestBranchKind::Return, \"JR $ra\");\n";
             m_ss << indent << "return;\n";
             m_ss << indent << "#else\n";
-            m_ss << indent << "ctx->pc = " << jumpTargetExpression << ";\n";
+            m_ss << indent << "runtime->dispatchGuestReturn(ctx, " << jumpTargetExpression << ");\n";
             m_ss << indent << "return;\n";
             m_ss << indent << "#endif\n";
             return;

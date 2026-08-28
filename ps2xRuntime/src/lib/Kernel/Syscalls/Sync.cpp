@@ -38,7 +38,8 @@ namespace ps2_syscalls
             EeScheduler &ee = scheduler(rdram, ctx, runtime);
             const int id = static_cast<int>(getRegU32(ctx, 4));
             const EeSemaphore *before = ee.semaphore(id);
-            if (id >= 20)
+            static uint32_t signalLogs = 0u;
+            if (signalLogs++ < 128u)
             {
                 std::cerr << "[ee-sema:signal] id=" << id
                           << " count=" << (before ? before->count : -1)
@@ -135,7 +136,7 @@ namespace ps2_syscalls
         const int id = static_cast<int>(getRegU32(ctx, 4));
         const EeSemaphore *object = runtime->eeScheduler().semaphore(id);
         static uint32_t waitLogs = 0u;
-        if (id >= 20 || waitLogs++ < 64u)
+        if (waitLogs++ < 128u)
         {
             std::cerr << "[ee-sema:wait] id=" << id
                       << " count=" << (object ? object->count : -1)

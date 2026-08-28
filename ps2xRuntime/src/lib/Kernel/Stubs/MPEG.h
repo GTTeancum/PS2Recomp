@@ -9,6 +9,14 @@ namespace ps2_stubs
     void notifyMpegCdStreamStart(PS2Runtime *runtime = nullptr);
     void notifyMpegCdStreamDataProduced(uint32_t byteCount, bool endOfStream);
     void notifyMpegCdStreamEof(PS2Runtime *runtime = nullptr);
+    void notifyMpegCdRead(uint8_t *rdram,
+                          R5900Context *ctx,
+                          PS2Runtime *runtime,
+                          uint32_t dataAddr,
+                          uint32_t byteCount,
+                          uint32_t lbn,
+                          uint32_t fileBaseLbn,
+                          uint32_t fileSizeBytes);
     void sceMpegFlush(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMpegAddBs(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceMpegAddCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

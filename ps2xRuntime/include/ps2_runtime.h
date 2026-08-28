@@ -279,6 +279,55 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                                const char *op,
                                const R5900Context *ctx)
 {
+    static const bool enabled = std::getenv("PS2X_XMEN_MEMORY_WATCHES") != nullptr;
+    static const bool movieStateEnabled =
+        std::getenv("PS2X_XMEN_MOVIE_STATE_WATCH") != nullptr;
+    if (!enabled && !movieStateEnabled)
+    {
+        return;
+    }
+
+    if (movieStateEnabled)
+    {
+        constexpr uint32_t movieStateStart = 0x0146C644u;
+        constexpr uint32_t movieStateEnd = 0x0146C654u;
+        const uint32_t writeStart = guestAddr & PS2_RAM_MASK;
+        const uint64_t writeEnd = static_cast<uint64_t>(writeStart) + size;
+        if (writeStart < movieStateEnd && writeEnd > movieStateStart)
+        {
+            static std::atomic<uint32_t> movieStateLogCount{0u};
+            const uint32_t index =
+                movieStateLogCount.fetch_add(1u, std::memory_order_relaxed);
+            if (index < 256u)
+            {
+                std::cerr << "[xmen-movie-manager-state-write] index=" << std::dec << index
+                          << " op=" << op
+                          << " addr=0x" << std::hex << writeStart
+                          << " size=0x" << size
+                          << " previous44=0x" << *reinterpret_cast<const uint32_t *>(rdram + 0x0146C644u)
+                          << " previous48=0x" << *reinterpret_cast<const uint32_t *>(rdram + 0x0146C648u)
+                          << " previous4c=0x" << *reinterpret_cast<const uint32_t *>(rdram + 0x0146C64Cu)
+                          << " previous50=0x" << *reinterpret_cast<const uint32_t *>(rdram + 0x0146C650u)
+                          << " lo=0x" << valueLo
+                          << " hi=0x" << valueHi
+                          << " pc=0x" << (ctx ? ctx->pc : 0u)
+                          << " ra=0x" << ps2TraceGuestRegisterLo32(ctx, 31)
+                          << " sp=0x" << ps2TraceGuestRegisterLo32(ctx, 29)
+                          << " s0=0x" << ps2TraceGuestRegisterLo32(ctx, 16)
+                          << " s1=0x" << ps2TraceGuestRegisterLo32(ctx, 17)
+                          << " a0=0x" << ps2TraceGuestRegisterLo32(ctx, 4)
+                          << " a1=0x" << ps2TraceGuestRegisterLo32(ctx, 5)
+                          << " a2=0x" << ps2TraceGuestRegisterLo32(ctx, 6)
+                          << " a3=0x" << ps2TraceGuestRegisterLo32(ctx, 7)
+                          << std::dec << std::endl;
+            }
+        }
+    }
+    if (!enabled)
+    {
+        return;
+    }
+
     const uint32_t textureHeapWriteStart = guestAddr & PS2_RAM_MASK;
     const uint32_t textureHeapWordCount = std::min(size / 4u, 4u);
     for (uint32_t word = 0u; word < textureHeapWordCount; ++word)
@@ -572,6 +621,12 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
                                     const char *op,
                                     const R5900Context *ctx)
 {
+    static const bool enabled = std::getenv("PS2X_XMEN_MEMORY_WATCHES") != nullptr;
+    if (!enabled)
+    {
+        return;
+    }
+
     static std::atomic<uint32_t> rangeWatchLogCount{0};
     constexpr uint32_t watchStartD = 0x00747250u;
     constexpr uint32_t watchEndD = 0x007472B0u;
@@ -781,6 +836,7 @@ public:
                              uint32_t fallthroughPc,
                              GuestBranchKind kind,
                              const char *debugName);
+    void dispatchGuestReturn(R5900Context *ctx, uint32_t targetPc) noexcept;
     void reportMissingFunction(uint8_t *rdram,
                                R5900Context *ctx,
                                uint32_t targetPc,

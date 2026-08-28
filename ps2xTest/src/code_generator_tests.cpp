@@ -1731,6 +1731,8 @@ void register_code_generator_tests()
                      "internal JAL return address should still be emitted as a label");
             t.IsTrue(generated.find("        return;") != std::string::npos,
                      "JR $31 should return to the dispatcher/runtime after setting ctx->pc");
+            t.IsTrue(generated.find("runtime->dispatchGuestReturn(ctx, jumpTarget);") != std::string::npos,
+                     "non-strict JR $31 should preserve the guest return checkpoint");
             t.IsTrue(generated.find("PS2Runtime::GuestBranchKind::Return") != std::string::npos,
                      "JR $31 should use the Return branch kind for precise diagnostics");
             t.IsTrue(generated.find("\"JR $ra\"") != std::string::npos,
@@ -1765,6 +1767,8 @@ void register_code_generator_tests()
                      "truncated trailing JR must not degrade to comment-only output");
             t.IsTrue(generated.find("PS2Runtime::GuestBranchKind::Return") != std::string::npos,
                      "truncated JR $31 should still use return diagnostics");
+            t.IsTrue(generated.find("runtime->dispatchGuestReturn(ctx, jumpTarget);") != std::string::npos,
+                     "truncated non-strict JR $31 should preserve the guest return checkpoint");
         });
 
         tc.Run("unresolved JR non-RA uses dispatcher resume entries without broad local switch", [](TestCase &t) {

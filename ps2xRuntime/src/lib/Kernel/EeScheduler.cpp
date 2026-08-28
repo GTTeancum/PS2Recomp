@@ -1312,6 +1312,9 @@ int EeScheduler::wakeupThread(int id, bool interruptSafe)
                      target->activeContext().pc,
                      static_cast<unsigned long long>(m_eeCycle));
     }
+    const bool traceXmenWakeup = std::getenv("PS2X_XMEN_WAKEUP_TRACE") != nullptr &&
+                                 target->entry == 0x005793B8u;
+    const uint32_t wakeupsBefore = target->wakeupCount;
     if ((target->status == EeThreadStatus::Waiting || target->status == EeThreadStatus::WaitingSuspended) &&
         target->wait.reason == EeWaitReason::Sleep)
     {
@@ -1320,6 +1323,30 @@ int EeScheduler::wakeupThread(int id, bool interruptSafe)
     else
     {
         ++target->wakeupCount;
+    }
+    if (traceXmenWakeup)
+    {
+        static uint64_t traceCount = 0u;
+        const uint64_t index = traceCount++;
+        if (index < 16u || (index != 0u && (index & (index - 1u)) == 0u))
+        {
+            const R5900Context *callerContext = caller ? &caller->activeContext() : nullptr;
+            std::fprintf(stderr,
+                         "[xmen-wakeup-source] index=%llu source=guest caller=%d pc=0x%x ra=0x%x "
+                         "target=%d status=%u wait=%u before=%u after=%u interrupt=%u insideInterrupt=%u cycle=%llu\n",
+                         static_cast<unsigned long long>(index),
+                         caller ? caller->id : 0,
+                         callerContext ? callerContext->pc : 0u,
+                         callerContext ? getRegU32(callerContext, 31) : 0u,
+                         id,
+                         static_cast<unsigned>(target->status),
+                         static_cast<unsigned>(target->wait.reason),
+                         wakeupsBefore,
+                         target->wakeupCount,
+                         interruptSafe ? 1u : 0u,
+                         m_insideInterrupt ? 1u : 0u,
+                         static_cast<unsigned long long>(m_eeCycle));
+        }
     }
     publishSnapshot();
     return KE_OK;
@@ -1333,6 +1360,9 @@ int EeScheduler::queueThreadWakeup(int id, bool interruptSafe)
     {
         return KE_UNKNOWN_THID;
     }
+    const bool traceXmenWakeup = std::getenv("PS2X_XMEN_WAKEUP_TRACE") != nullptr &&
+                                 target->entry == 0x005793B8u;
+    const uint32_t wakeupsBefore = target->wakeupCount;
     if (target->status == EeThreadStatus::Waiting && target->wait.reason == EeWaitReason::Sleep)
     {
         makeReady(*target, KE_OK, interruptSafe);
@@ -1340,6 +1370,31 @@ int EeScheduler::queueThreadWakeup(int id, bool interruptSafe)
     else
     {
         ++target->wakeupCount;
+    }
+    if (traceXmenWakeup)
+    {
+        static uint64_t traceCount = 0u;
+        const uint64_t index = traceCount++;
+        if (index < 16u || (index != 0u && (index & (index - 1u)) == 0u))
+        {
+            const GuestThread *caller = currentThread();
+            const R5900Context *callerContext = caller ? &caller->activeContext() : nullptr;
+            std::fprintf(stderr,
+                         "[xmen-wakeup-source] index=%llu source=host caller=%d pc=0x%x ra=0x%x "
+                         "target=%d status=%u wait=%u before=%u after=%u interrupt=%u insideInterrupt=%u cycle=%llu\n",
+                         static_cast<unsigned long long>(index),
+                         caller ? caller->id : 0,
+                         callerContext ? callerContext->pc : 0u,
+                         callerContext ? getRegU32(callerContext, 31) : 0u,
+                         id,
+                         static_cast<unsigned>(target->status),
+                         static_cast<unsigned>(target->wait.reason),
+                         wakeupsBefore,
+                         target->wakeupCount,
+                         interruptSafe ? 1u : 0u,
+                         m_insideInterrupt ? 1u : 0u,
+                         static_cast<unsigned long long>(m_eeCycle));
+        }
     }
     publishSnapshot();
     return KE_OK;
