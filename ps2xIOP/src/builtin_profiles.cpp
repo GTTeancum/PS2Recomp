@@ -85,6 +85,8 @@ namespace ps2x::iop::detail
                 .urpcObjectStride = 0x20u,
                 .rpcServerPoolBase = 0x01F10000u,
                 .rpcServerStride = 0x80u,
+                .sjrmtUniDataOffset = 0x100u,
+                .sjrmtUniCapacity = 0x4000u,
             };
         }
 

@@ -739,6 +739,53 @@ void register_ps2_iop_tests()
                      "the X-Men CRI service should count the matched DMA");
         });
 
+        tc.Run("X-Men CRI maps SJRMT UNI metadata before the audio ring", [](TestCase &t)
+        {
+            FakeIopHost host(0x02000000u);
+            ps2x::iop::IopSubsystem subsystem(host);
+            std::string error;
+            t.IsTrue(subsystem.configure({"SLUS_206.56", 0u, 0u}, &error),
+                     "X-Men Legends profile should configure");
+
+            constexpr uint32_t kSendAddress = 0x2000u;
+            constexpr uint32_t kReceiveAddress = 0x2100u;
+            constexpr uint32_t kUniWorkAddress = 0x4000u;
+            constexpr uint32_t kUniMetadataBytes = 0x100u;
+            constexpr uint32_t kAudioRingBytes = 0x4000u;
+            constexpr uint32_t kRequestedBytes = 0xA00u;
+
+            host.writeWord(kSendAddress + 0u, 1u);
+            host.writeWord(kSendAddress + 4u, kUniWorkAddress);
+            host.writeWord(kSendAddress + 8u, kUniMetadataBytes);
+
+            ps2x::iop::RpcRequest request{};
+            request.sid = 0x90000200u;
+            request.function = 0x422u;
+            request.send = {kSendAddress, 12u};
+            request.receive = {kReceiveAddress, sizeof(uint32_t)};
+            t.IsTrue(subsystem.handleRpc(request).handled,
+                     "X-Men SJRMT_UNI_CREATE should be handled");
+            const uint32_t handle = host.readWord(kReceiveAddress);
+            t.IsTrue(handle != 0u, "X-Men SJRMT_UNI_CREATE should return a handle");
+
+            host.writeWord(kSendAddress + 0u, handle);
+            host.writeWord(kSendAddress + 4u, 0u);
+            host.writeWord(kSendAddress + 8u, kRequestedBytes);
+            request.function = 0x426u;
+            request.send.size = 12u;
+            request.receive.size = 2u * sizeof(uint32_t);
+            t.IsTrue(subsystem.handleRpc(request).handled,
+                     "X-Men SJRMT_GET_CHUNK should be handled");
+            t.Equals(host.readWord(kReceiveAddress),
+                     kUniWorkAddress + kUniMetadataBytes,
+                     "the first audio chunk should begin after SJRMT metadata");
+            t.Equals(host.readWord(kReceiveAddress + sizeof(uint32_t)),
+                     kRequestedBytes,
+                     "the X-Men audio ring should expose more than its metadata size");
+            t.IsTrue(kRequestedBytes < kAudioRingBytes,
+                     "the requested chunk should fit within the observed audio ring");
+        });
+
         tc.Run("reset closes profile-owned host file handles", [](TestCase &t)
         {
             FakeIopHost host;
