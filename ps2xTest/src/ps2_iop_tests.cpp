@@ -501,6 +501,20 @@ void register_ps2_iop_tests()
             t.Equals(host.lastAudioFunction, 4u,
                      "the host audio backend should receive the upload command");
 
+            const std::array<uint32_t, 6> streamRequest{0x12u, 0u, 0x1000u, 0x8853C0u, 0x885460u, 0u};
+            t.IsTrue(host.writeGuest(kSendAddress, streamRequest.data(), sizeof(streamRequest)),
+                     "ZAUDIO stream allocation packet should fit in guest memory");
+            request.function = 8u;
+            request.send.size = static_cast<uint32_t>(sizeof(streamRequest));
+            request.receive = {kReceiveAddress, 0x200u};
+            t.IsTrue(subsystem.handleRpc(request).handled,
+                     "ZAUDIO stream allocation should be handled");
+            const uint32_t streamHandle = host.readWord(kReceiveAddress);
+            t.IsTrue(streamHandle != 0u && streamHandle != handle,
+                     "stream allocation should return a distinct opaque handle");
+            t.Equals(host.lastAudioFunction, 8u,
+                     "the host audio backend should receive the stream allocation command");
+
             const ps2x::iop::DebugSnapshot snapshot = subsystem.debugSnapshot();
             const ps2x::iop::DebugService *service = findService(snapshot, "X-Men Legends ZAUDIO");
             t.IsNotNull(service, "X-Men profile should expose ZAUDIO diagnostics");

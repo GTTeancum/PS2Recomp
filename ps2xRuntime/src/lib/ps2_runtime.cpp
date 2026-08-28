@@ -1016,8 +1016,9 @@ PS2Runtime::~PS2Runtime()
 #else
         if (IsAudioDeviceReady())
         {
-            CloseAudioDevice();
+            m_audioBackend.stopAll();
             m_audioBackend.setAudioReady(false);
+            CloseAudioDevice();
         }
 #endif
         if (m_debugUiInitialized && m_debugUiShutdownCallback)
@@ -3012,6 +3013,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                       << " upload=0x" << upload
                       << " descriptor=0x" << descriptor
                       << " data=0x" << readRdramProbeU32(rdram, descriptor + 0x30u)
+                      << " destination=0x" << readRdramProbeU32(rdram, descriptor + 0x38u)
                       << " width=0x" << width
                       << " height=0x" << height
                       << " format=0x" << format
@@ -5920,8 +5922,11 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         if (table == g_xmenMainBackIgbPackage.load(std::memory_order_relaxed) &&
             objectTable != 0u &&
             (index == 10u || index == 31u || index == 92u || index == 116u ||
-             index == 119u || index == 179u || index == 210u || index == 213u ||
-             index == 318u || index == 334u || index == 341u || index == 390u))
+             index == 119u || index == 129u || index == 167u || index == 179u ||
+             index == 183u || index == 210u || index == 213u || index == 233u ||
+             index == 301u || index == 318u || index == 334u || index == 336u ||
+             index == 341u || index == 366u || index == 367u || index == 385u ||
+             index == 390u))
         {
             static std::atomic<uint32_t> s_xmenMainBackObjectTraceCount{0u};
             const uint32_t traceIndex =
@@ -5948,7 +5953,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                           << " objectEntries=0x" << objectEntries
                           << " object=0x" << object
                           << " objectVtable=0x" << readRdramProbeU32(rdram, object);
-                for (uint32_t offset = 0u; offset < 0x40u; offset += 4u)
+                for (uint32_t offset = 0u; offset < 0xA0u; offset += 4u)
                 {
                     std::cout << " object" << std::dec << offset
                               << "=0x" << std::hex
@@ -5979,6 +5984,63 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                       << " sp=0x" << GPR_U32(ctx, 29)
                       << " ra=0x" << GPR_U32(ctx, 31)
                       << std::dec << std::endl;
+        }
+    }
+    if (isCall && xmenBranchTick >= 120u && xmenBranchTick <= 180u)
+    {
+        constexpr std::array<uint32_t, 9> imageIndices = {
+            129u, 167u, 183u, 233u, 301u, 336u, 366u, 367u, 385u,
+        };
+        const uint32_t imageObjectEntries =
+            g_xmenMainBackIgbObjectEntries.load(std::memory_order_relaxed);
+        if (imageObjectEntries != 0u)
+        {
+            const std::array<uint32_t, 8> candidateRegisters = {
+                GPR_U32(ctx, 4), GPR_U32(ctx, 5), GPR_U32(ctx, 6), GPR_U32(ctx, 7),
+                GPR_U32(ctx, 16), GPR_U32(ctx, 17), GPR_U32(ctx, 18), GPR_U32(ctx, 19),
+            };
+            constexpr std::array<const char *, 8> candidateNames = {
+                "a0", "a1", "a2", "a3", "s0", "s1", "s2", "s3",
+            };
+            for (const uint32_t imageIndex : imageIndices)
+            {
+                const uint32_t imageObject =
+                    readRdramProbeU32(rdram, imageObjectEntries + imageIndex * 4u);
+                if (imageObject == 0u)
+                    continue;
+
+                for (size_t registerIndex = 0u;
+                     registerIndex < candidateRegisters.size();
+                     ++registerIndex)
+                {
+                    if (candidateRegisters[registerIndex] != imageObject)
+                        continue;
+
+                    static std::atomic<uint32_t> s_xmenImageCallTraceCount{0u};
+                    const uint32_t traceIndex =
+                        s_xmenImageCallTraceCount.fetch_add(1u, std::memory_order_relaxed);
+                    if (traceIndex < 512u)
+                    {
+                        std::cout << "[xmen-main-back-image-call] index=" << std::dec
+                                  << traceIndex
+                                  << " tick=" << xmenBranchTick
+                                  << " image=" << imageIndex
+                                  << " register=" << candidateNames[registerIndex]
+                                  << " source=0x" << std::hex << sourcePc
+                                  << " target=0x" << targetPc
+                                  << " return=0x" << fallthroughPc
+                                  << " object=0x" << imageObject
+                                  << " vtable=0x" << readRdramProbeU32(rdram, imageObject)
+                                  << " a0=0x" << GPR_U32(ctx, 4)
+                                  << " a1=0x" << GPR_U32(ctx, 5)
+                                  << " a2=0x" << GPR_U32(ctx, 6)
+                                  << " a3=0x" << GPR_U32(ctx, 7)
+                                  << " ra=0x" << GPR_U32(ctx, 31)
+                                  << std::dec << std::endl;
+                    }
+                    break;
+                }
+            }
         }
     }
     if (isCall && (targetPc == 0x00219750u || sourcePc == 0x0021979Cu))
@@ -8457,9 +8519,10 @@ void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
 
 void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
 {
-    for (uint32_t cause : m_memory.consumeCompletedDmacCauses())
+    for (const PS2Memory::DmacCompletion completion : m_memory.consumeCompletedDmacCauses())
     {
-        ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
+        ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, completion.cause,
+                                                   completion.delayCycles);
     }
 }
 
@@ -9602,6 +9665,7 @@ void PS2Runtime::run()
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
+        m_audioBackend.update();
 
         BeginDrawing();
         ClearBackground(BLACK);

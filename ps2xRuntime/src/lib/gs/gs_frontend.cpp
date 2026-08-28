@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -127,6 +128,16 @@ namespace
     std::atomic<uint32_t> s_debugCvFontUploadCount{0};
     std::atomic<uint32_t> s_debugLocalCopyCount{0};
     std::atomic<uint32_t> s_xmenPresentTraceCount{0};
+
+    bool traceTextureBinding()
+    {
+        static const bool enabled = []()
+        {
+            const char *value = std::getenv("PS2X_TRACE_TEXTURE_BINDING");
+            return value != nullptr && value[0] != '\0' && value[0] != '0';
+        }();
+        return enabled;
+    }
 }
 
 
@@ -613,6 +624,17 @@ void GS::latchHostPresentationFrame()
     const uint32_t height = frame.height;
     const bool usedPreferred = frame.usedPreferred;
     const uint32_t presentIndex = s_xmenPresentTraceCount.fetch_add(1u, std::memory_order_relaxed);
+    static const std::pair<uint32_t, uint32_t> requestedDumpRange = []
+    {
+        uint32_t start = UINT32_MAX;
+        uint32_t end = 0u;
+        const char *value = std::getenv("PS2X_DUMP_PRESENT_RANGE");
+        if (value && std::sscanf(value, "%u-%u", &start, &end) == 2 && start <= end)
+            return std::pair<uint32_t, uint32_t>{start, end};
+        return std::pair<uint32_t, uint32_t>{UINT32_MAX, 0u};
+    }();
+    const bool dumpRequestedPresent = presentIndex >= requestedDumpRange.first &&
+                                      presentIndex <= requestedDumpRange.second;
     static std::atomic<bool> dumpedFirstNonBlack{false};
     if (hasFrame && !dumpedFirstNonBlack.load(std::memory_order_relaxed) &&
         frame.pixels.size() >= static_cast<size_t>(width) * height * 4u)
@@ -635,7 +657,7 @@ void GS::latchHostPresentationFrame()
                          presentIndex, path.c_str(), wrote ? 1u : 0u);
         }
     }
-    if (hasFrame && (presentIndex == 23u || presentIndex == 24u || presentIndex == 128u ||
+    if (hasFrame && (dumpRequestedPresent || presentIndex == 23u || presentIndex == 24u || presentIndex == 128u ||
                      presentIndex == 256u || presentIndex == 384u || presentIndex == 640u ||
                      presentIndex == 768u || presentIndex == 896u ||
                      presentIndex == 1420u || presentIndex == 1450u || presentIndex == 1500u) &&
@@ -1354,6 +1376,53 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             }
         }
     });
+
+    if (traceTextureBinding() &&
+        (regAddr == GS_REG_TEX0_1 || regAddr == GS_REG_TEX0_2 ||
+         regAddr == GS_REG_TEX2_1 || regAddr == GS_REG_TEX2_2))
+    {
+        const bool tex0Write = regAddr == GS_REG_TEX0_1 || regAddr == GS_REG_TEX0_2;
+        const uint32_t contextIndex =
+            (regAddr == GS_REG_TEX0_2 || regAddr == GS_REG_TEX2_2) ? 1u : 0u;
+        const uint32_t tbp0 = tex0Write
+                                  ? static_cast<uint32_t>(value & 0x3FFFu)
+                                  : m_ctx[contextIndex].tex0.tbp0;
+        const uint32_t cbp = static_cast<uint32_t>((value >> 37u) & 0x3FFFu);
+        const bool targetBinding =
+            tbp0 == 11584u || tbp0 == 16320u || cbp == 11616u || cbp == 16352u;
+        if (targetBinding)
+        {
+            static std::atomic<uint32_t> traceCount{0u};
+            const uint32_t index = traceCount.fetch_add(1u, std::memory_order_relaxed);
+            if (index < 512u)
+            {
+                const uint64_t vsyncTick = m_privRegs
+                                               ? m_privRegs->vsyncTick.load(std::memory_order_relaxed)
+                                               : 0u;
+                std::fprintf(stderr,
+                             "[gs:texture-binding] index=%u present=%u tick=%llu reg=0x%x context=%u raw=0x%016llx tbp=%u tbw=%u psm=0x%x tw=%u th=%u cbp=%u cpsm=0x%x csm=%u csa=%u cld=%u\n",
+                             index,
+                             s_xmenPresentTraceCount.load(std::memory_order_relaxed),
+                             static_cast<unsigned long long>(vsyncTick),
+                             static_cast<unsigned>(regAddr),
+                             contextIndex,
+                             static_cast<unsigned long long>(value),
+                             tbp0,
+                             tex0Write ? static_cast<unsigned>((value >> 14u) & 0x3Fu)
+                                       : static_cast<unsigned>(m_ctx[contextIndex].tex0.tbw),
+                             static_cast<unsigned>((value >> 20u) & 0x3Fu),
+                             tex0Write ? static_cast<unsigned>((value >> 26u) & 0xFu)
+                                       : static_cast<unsigned>(m_ctx[contextIndex].tex0.tw),
+                             tex0Write ? static_cast<unsigned>((value >> 30u) & 0xFu)
+                                       : static_cast<unsigned>(m_ctx[contextIndex].tex0.th),
+                             cbp,
+                             static_cast<unsigned>((value >> 51u) & 0xFu),
+                             static_cast<unsigned>((value >> 55u) & 0x1u),
+                             static_cast<unsigned>((value >> 56u) & 0x1Fu),
+                             static_cast<unsigned>((value >> 61u) & 0x7u));
+            }
+        }
+    }
 
     const bool isCopyRelevantReg =
         regAddr == GS_REG_PRIM ||

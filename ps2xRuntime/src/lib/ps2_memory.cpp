@@ -3,6 +3,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
 #include <atomic>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -13,6 +14,26 @@
 
 namespace
 {
+    constexpr uint64_t gifDmacCompletionCycles(uint64_t qwc, uint64_t tagCount)
+    {
+        constexpr uint64_t kBusCyclesPerQword = 2u;
+        constexpr uint64_t kCyclesPerTag = 2u;
+        constexpr uint64_t kTerminalCycles = 16u;
+        // Generated guest code accounts time in coarse checkpoints. Keep short
+        // GIF transfers asynchronous long enough for chained packet producers
+        // to reach a checkpoint before their completion handler can run.
+        constexpr uint64_t kMinimumCompletionCycles = 1024u;
+        const uint64_t transferCycles =
+            qwc * kBusCyclesPerQword + tagCount * kCyclesPerTag + kTerminalCycles;
+        return std::max(transferCycles, kMinimumCompletionCycles);
+    }
+
+    bool traceGifDmaChains()
+    {
+        static const bool enabled = std::getenv("PS2X_TRACE_GIF_DMA") != nullptr;
+        return enabled;
+    }
+
     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
     {
         if (static_cast<uint64_t>(offset) + static_cast<uint64_t>(bytes) > static_cast<uint64_t>(regionSize))
@@ -1434,6 +1455,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     const bool traceXmenVifChain =
                         channelBase == 0x10009000u &&
                         (tagAddr == 0x00970D80u || tagAddr == 0x00984E80u);
+                    const bool traceGifChain =
+                        channelBase == 0x1000A000u && traceGifDmaChains();
                     uint32_t asr0 = m_ioRegisters[channelBase + 0x40];
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
@@ -1553,6 +1576,16 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         uint32_t addr = static_cast<uint32_t>(tag >> 32);
                         lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
                         ++tagsProcessed;
+
+                        if (traceGifChain)
+                        {
+                            std::fprintf(stderr,
+                                         "[gif-dma-chain-tag] start=%08x index=%d current=%08x "
+                                         "raw=%016llx id=%u qwc=%u addr=%08x irq=%u tte=%u\n",
+                                         chainStartTagAddr, tagsProcessed, currentTagAddr,
+                                         static_cast<unsigned long long>(tag), id, tagQwc, addr,
+                                         irq ? 1u : 0u, tagTransferEnabled ? 1u : 0u);
+                        }
 
                         uint32_t dataAddr = 0;
                         bool hasPayload = (tagQwc > 0);
@@ -1706,14 +1739,25 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             chainStartTagAddr, tagAddr, tagsProcessed, kMaxChainTags,
                             chainBuf.size(), asp, tieEnabled ? 1u : 0u, lastTagUpper);
                     }
-                    if (channelBase == 0x1000A000u && dmaStartIndex >= 70u)
+                    if (channelBase == 0x1000A000u &&
+                        (dmaStartIndex >= 70u || traceGifChain))
                     {
+                        uint64_t chainHash = 1469598103934665603ull;
+                        for (const uint8_t byte : chainBuf)
+                        {
+                            chainHash ^= byte;
+                            chainHash *= 1099511628211ull;
+                        }
                         std::fprintf(stderr,
                                      "[xmen-gif-chain-complete] index=%u start=%08x end=%08x tags=%d bytes=%zu "
-                                     "asp=%u tie=%u chcr=%08x queued=%u\n",
+                                     "asp=%u tie=%u chcr=%08x queued=%u hash=%016llx head=",
                                      dmaStartIndex, chainStartTagAddr, tagAddr, tagsProcessed,
                                      chainBuf.size(), asp, tieEnabled ? 1u : 0u, chcr,
-                                     chainBuf.empty() ? 0u : 1u);
+                                     chainBuf.empty() ? 0u : 1u,
+                                     static_cast<unsigned long long>(chainHash));
+                        for (size_t i = 0u; i < std::min<size_t>(chainBuf.size(), 32u); ++i)
+                            std::fprintf(stderr, "%02x", static_cast<unsigned>(chainBuf[i]));
+                        std::fprintf(stderr, "\n");
                     }
 
                     if (xmenVifChainMap)
@@ -1741,6 +1785,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         pt.fromScratchpad = false;
                         pt.srcAddr = 0;
                         pt.qwc = 0;
+                        pt.dmaTagCount = static_cast<uint32_t>(tagsProcessed);
                         pt.chainData = std::move(chainBuf);
                         if (channelBase == 0x1000A000)
                         {
@@ -1867,17 +1912,22 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 void PS2Memory::processPendingTransfers()
 {
     const bool hadGif = !m_pendingGifTransfers.empty();
+    uint64_t gifTransferQwc = 0u;
+    uint64_t gifDmaTagCount = 0u;
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
     {
         auto &p = m_pendingGifTransfers[idx];
+        gifDmaTagCount += p.dmaTagCount;
         if (!p.chainData.empty())
         {
+            gifTransferQwc += (p.chainData.size() + 15u) / 16u;
             m_seenGifCopy = true;
             m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
             submitGifPacket(GifPathId::Path3, p.chainData.data(), static_cast<uint32_t>(p.chainData.size()), false);
         }
         else if (p.qwc > 0)
         {
+            gifTransferQwc += p.qwc;
             const uint64_t bytes64 = static_cast<uint64_t>(p.qwc) * 16ull;
             uint32_t sizeBytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
             uint32_t srcPhys = 0;
@@ -2073,7 +2123,7 @@ void PS2Memory::processPendingTransfers()
     if (hadGif)
     {
         raiseDStatChannel(2u); // GIF channel
-        queueCompletedDmacCause(2u);
+        queueCompletedDmacCause(2u, gifDmacCompletionCycles(gifTransferQwc, gifDmaTagCount));
         m_ioRegisters[GIF_CHANNEL + 0x00] &= ~0x100u;
         m_ioRegisters[GIF_CHANNEL + 0x20] = 0;
     }
@@ -2093,16 +2143,16 @@ void PS2Memory::processPendingTransfers()
     }
 }
 
-void PS2Memory::queueCompletedDmacCause(uint32_t cause)
+void PS2Memory::queueCompletedDmacCause(uint32_t cause, uint64_t delayCycles)
 {
     std::lock_guard<std::mutex> lock(m_completedDmacMutex);
-    m_completedDmacCauses.push_back(cause);
+    m_completedDmacCauses.push_back(DmacCompletion{cause, delayCycles});
 }
 
-std::vector<uint32_t> PS2Memory::consumeCompletedDmacCauses()
+std::vector<PS2Memory::DmacCompletion> PS2Memory::consumeCompletedDmacCauses()
 {
     std::lock_guard<std::mutex> lock(m_completedDmacMutex);
-    std::vector<uint32_t> causes;
+    std::vector<DmacCompletion> causes;
     causes.swap(m_completedDmacCauses);
     return causes;
 }
@@ -2257,7 +2307,7 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
     {
         static std::atomic<uint32_t> s_rejectTraceCount{0u};
         const uint32_t traceIndex = s_rejectTraceCount.fetch_add(1u, std::memory_order_relaxed);
-        if (traceIndex < 96u)
+        if (traceIndex < 96u || traceGifDmaChains())
         {
             std::fprintf(stderr,
                          "[gif-native-image-reject] index=%u reason=%s tadr=%08x chcr=%08x "
@@ -2436,15 +2486,26 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
     const uint32_t uploadDbp = static_cast<uint32_t>((setupRegs[0] >> 32u) & 0x3FFFu);
     static std::atomic<uint32_t> s_acceptTraceCount{0u};
     const uint32_t acceptIndex = s_acceptTraceCount.fetch_add(1u, std::memory_order_relaxed);
-    if (acceptIndex < 96u || uploadDbp == 11200u || uploadDbp == 12224u)
+    if (acceptIndex < 96u || uploadDbp == 11200u || uploadDbp == 12224u ||
+        traceGifDmaChains())
     {
+        uint64_t imageHash = 1469598103934665603ull;
+        for (uint32_t i = 0u; i < imageBytes; ++i)
+        {
+            imageHash ^= imageData[i];
+            imageHash *= 1099511628211ull;
+        }
         std::fprintf(stderr,
                      "[gif-native-image-accept] index=%u dbp=%u tadr=%08x setup=%08x image-tag=%08x payload-tag=%08x "
-                     "data=%08x qwc=%u bytes=%u trxreg=%016llx bitblt=%016llx\n",
+                     "data=%08x qwc=%u bytes=%u trxreg=%016llx bitblt=%016llx hash=%016llx head=",
                      acceptIndex, uploadDbp, tadr, setupPayloadAddr, imageTagDmaAddr, payloadTagAddr,
                      imageDataAddr, imageQwc, imageBytes,
                      static_cast<unsigned long long>(setupRegs[2]),
-                     static_cast<unsigned long long>(setupRegs[0]));
+                     static_cast<unsigned long long>(setupRegs[0]),
+                     static_cast<unsigned long long>(imageHash));
+        for (uint32_t i = 0u; i < std::min<uint32_t>(imageBytes, 32u); ++i)
+            std::fprintf(stderr, "%02x", static_cast<unsigned>(imageData[i]));
+        std::fprintf(stderr, "\n");
     }
 
     m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
@@ -2467,7 +2528,9 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
     else
         dstat &= ~(1u << 31u);
     m_ioRegisters[D_STAT] = dstat;
-    queueCompletedDmacCause(2u);
+    const uint64_t transferredQwc = 5u + 1u + imageQwc;
+    const uint64_t dmaTagCount = (payloadTag.id == 7u) ? 3u : 4u;
+    queueCompletedDmacCause(2u, gifDmacCompletionCycles(transferredQwc, dmaTagCount));
     return true;
 }
 
@@ -2547,7 +2610,7 @@ bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t c
     else
         dstat &= ~(1u << 31u);
     m_ioRegisters[D_STAT] = dstat;
-    queueCompletedDmacCause(2u);
+    queueCompletedDmacCause(2u, gifDmacCompletionCycles(tag.qwc, 1u));
     return true;
 }
 

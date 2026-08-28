@@ -13,6 +13,7 @@ void register_ps2_memory_tests();
 void register_ps2_vu1_tests();
 void register_ps2_vu_tests();
 void register_ps2_gs_tests();
+void register_ps2_audio_vag_tests();
 void register_ps2_iop_tests();
 void register_ps2_sif_rpc_tests();
 void register_ps2_sif_dma_tests();
@@ -35,6 +36,7 @@ int main()
     register_ps2_vu1_tests();
     register_ps2_vu_tests();
     register_ps2_gs_tests();
+    register_ps2_audio_vag_tests();
     register_ps2_iop_tests();
     register_ps2_sif_rpc_tests();
     register_ps2_sif_dma_tests();

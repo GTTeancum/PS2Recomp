@@ -1,4 +1,4 @@
-#include "runtime/ps2_memory.h"
+#include "runtime/ps2_audio_vag.h"
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -23,45 +23,20 @@ namespace
 
 namespace ps2_vag
 {
-    bool decode(const uint8_t *data, uint32_t sizeBytes,
-                std::vector<int16_t> &outPcm, uint32_t &outSampleRate)
+    bool decodeBlocks(const uint8_t *data, uint32_t sizeBytes,
+                      std::vector<int16_t> &outPcm)
     {
-        if (!data || sizeBytes < 48)
+        if (!data || sizeBytes < 16)
             return false;
 
-        const uint32_t magic = (static_cast<uint32_t>(data[0]) << 24) |
-                               (static_cast<uint32_t>(data[1]) << 16) |
-                               (static_cast<uint32_t>(data[2]) << 8) |
-                               static_cast<uint32_t>(data[3]);
-        if (magic != 0x56414770u)
-        {
-            const uint32_t magicLE = (static_cast<uint32_t>(data[3]) << 24) |
-                                     (static_cast<uint32_t>(data[2]) << 16) |
-                                     (static_cast<uint32_t>(data[1]) << 8) |
-                                     static_cast<uint32_t>(data[0]);
-            if (magicLE != 0x56414770u)
-                return false;
-        }
-
-        uint32_t dataSize = (static_cast<uint32_t>(data[0x0c]) << 24) |
-                            (static_cast<uint32_t>(data[0x0d]) << 16) |
-                            (static_cast<uint32_t>(data[0x0e]) << 8) |
-                            static_cast<uint32_t>(data[0x0f]);
-        outSampleRate = (static_cast<uint32_t>(data[0x10]) << 24) |
-                        (static_cast<uint32_t>(data[0x11]) << 16) |
-                        (static_cast<uint32_t>(data[0x12]) << 8) |
-                        static_cast<uint32_t>(data[0x13]);
-        if (outSampleRate == 0)
-            outSampleRate = 44100;
-
-        const uint32_t numBlocks = (dataSize + 15) / 16;
+        const uint32_t numBlocks = sizeBytes / 16;
         outPcm.clear();
         outPcm.reserve(numBlocks * 28);
 
         int16_t s1 = 0, s2 = 0;
-        const uint8_t *block = data + 48;
+        const uint8_t *block = data;
 
-        for (uint32_t b = 0; b < numBlocks && (block + 16) <= data + sizeBytes; ++b, block += 16)
+        for (uint32_t b = 0; b < numBlocks; ++b, block += 16)
         {
             uint8_t shift = block[0] & 0x0F;
             if (shift > 12)
@@ -75,7 +50,7 @@ namespace ps2_vag
                 const uint8_t byte = block[2 + sampleIdx / 2];
                 const uint8_t nibble = (sampleIdx & 1) ? (byte >> 4) : (byte & 0x0F);
                 const int8_t rawSample = signExtend4(nibble);
-                const int32_t shiftedSample = rawSample << (12 - shift);
+                const int32_t shiftedSample = static_cast<int32_t>(rawSample) * (1 << (12 - shift));
 
                 int32_t filteredSample;
                 const int32_t old = s1;
@@ -109,6 +84,91 @@ namespace ps2_vag
             }
         }
 
+        return !outPcm.empty();
+    }
+
+    bool decodeInterleavedBlocks(const uint8_t *data, uint32_t sizeBytes,
+                                 uint32_t channels, uint32_t interleaveBytes,
+                                 std::vector<int16_t> &outPcm)
+    {
+        if (!data || channels == 0u || interleaveBytes < 16u ||
+            (interleaveBytes & 15u) != 0u || sizeBytes < channels * 16u)
+        {
+            return false;
+        }
+
+        std::vector<std::vector<uint8_t>> encodedChannels(channels);
+        for (uint32_t offset = 0u, channel = 0u; offset < sizeBytes;
+             channel = (channel + 1u) % channels)
+        {
+            const uint32_t remaining = sizeBytes - offset;
+            const uint32_t blockBytes = std::min(interleaveBytes, remaining) & ~15u;
+            if (blockBytes == 0u)
+                break;
+            auto &encoded = encodedChannels[channel];
+            encoded.insert(encoded.end(), data + offset, data + offset + blockBytes);
+            offset += blockBytes;
+        }
+
+        std::vector<std::vector<int16_t>> decodedChannels(channels);
+        for (uint32_t channel = 0u; channel < channels; ++channel)
+        {
+            if (!decodeBlocks(encodedChannels[channel].data(),
+                              static_cast<uint32_t>(encodedChannels[channel].size()),
+                              decodedChannels[channel]))
+            {
+                return false;
+            }
+        }
+
+        const size_t frameCount = static_cast<size_t>(sizeBytes / channels / 16u) * 28u;
+        if (frameCount == 0u)
+            return false;
+
+        outPcm.assign(frameCount * channels, 0);
+        for (size_t frame = 0u; frame < frameCount; ++frame)
+        {
+            for (uint32_t channel = 0u; channel < channels; ++channel)
+            {
+                if (frame < decodedChannels[channel].size())
+                    outPcm[frame * channels + channel] = decodedChannels[channel][frame];
+            }
+        }
         return true;
+    }
+
+    bool decode(const uint8_t *data, uint32_t sizeBytes,
+                std::vector<int16_t> &outPcm, uint32_t &outSampleRate)
+    {
+        if (!data || sizeBytes < 48)
+            return false;
+
+        const uint32_t magic = (static_cast<uint32_t>(data[0]) << 24) |
+                               (static_cast<uint32_t>(data[1]) << 16) |
+                               (static_cast<uint32_t>(data[2]) << 8) |
+                               static_cast<uint32_t>(data[3]);
+        if (magic != 0x56414770u)
+        {
+            const uint32_t magicLE = (static_cast<uint32_t>(data[3]) << 24) |
+                                     (static_cast<uint32_t>(data[2]) << 16) |
+                                     (static_cast<uint32_t>(data[1]) << 8) |
+                                     static_cast<uint32_t>(data[0]);
+            if (magicLE != 0x56414770u)
+                return false;
+        }
+
+        uint32_t dataSize = (static_cast<uint32_t>(data[0x0c]) << 24) |
+                            (static_cast<uint32_t>(data[0x0d]) << 16) |
+                            (static_cast<uint32_t>(data[0x0e]) << 8) |
+                            static_cast<uint32_t>(data[0x0f]);
+        outSampleRate = (static_cast<uint32_t>(data[0x10]) << 24) |
+                        (static_cast<uint32_t>(data[0x11]) << 16) |
+                        (static_cast<uint32_t>(data[0x12]) << 8) |
+                        static_cast<uint32_t>(data[0x13]);
+        if (outSampleRate == 0)
+            outSampleRate = 44100;
+
+        dataSize = std::min<uint32_t>(dataSize, sizeBytes - 48u);
+        return decodeBlocks(data + 48u, dataSize, outPcm);
     }
 }

@@ -25,6 +25,12 @@ namespace ps2x::iop::detail
             uint32_t uploadedBytes = 0u;
         };
 
+        struct StreamAllocation
+        {
+            uint32_t flags = 0u;
+            uint32_t channels = 1u;
+        };
+
         class ZaudioService final : public IopService
         {
         public:
@@ -48,7 +54,9 @@ namespace ps2x::iop::detail
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 m_samples.clear();
+                m_streams.clear();
                 m_nextHandle = m_bindings.firstHandle;
+                m_nextStreamHandle = 0x00100000u;
                 m_nextSpuAddress = m_bindings.firstSpuAddress;
                 m_rpcCount = 0u;
                 m_uploadCount = 0u;
@@ -85,6 +93,14 @@ namespace ps2x::iop::detail
                 {
                     accountUpload(request);
                 }
+                else if (request.function == 8u)
+                {
+                    allocateStream(request);
+                }
+                else if (request.function == 9u)
+                {
+                    freeStream(request);
+                }
 
                 bool firstFunctionCall = false;
                 {
@@ -111,6 +127,7 @@ namespace ps2x::iop::detail
                 std::lock_guard<std::mutex> lock(m_mutex);
                 metrics.push_back({"rpc_calls", m_rpcCount, false});
                 metrics.push_back({"sample_banks", m_samples.size(), false});
+                metrics.push_back({"streams", m_streams.size(), false});
                 metrics.push_back({"upload_packets", m_uploadCount, false});
                 metrics.push_back({"rejected_uploads", m_rejectedUploadCount, false});
             }
@@ -191,12 +208,52 @@ namespace ps2x::iop::detail
                 }
             }
 
+            void allocateStream(const RpcRequest &request)
+            {
+                uint32_t flags = 0u;
+                if (request.send.address == 0u || request.send.size < 24u ||
+                    !m_host.readGuest(request.send.address, &flags, sizeof(flags)))
+                {
+                    return;
+                }
+
+                const uint32_t channels = (flags & 0x20u) != 0u ? 4u
+                                          : (flags & 0x02u) != 0u ? 2u
+                                                                  : 1u;
+                uint32_t handle = 0u;
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    handle = m_nextStreamHandle;
+                    m_nextStreamHandle += 0x100u;
+                    m_streams.emplace(handle, StreamAllocation{flags, channels});
+                }
+                writeResponseWord(request, 0u, handle);
+                m_host.log(LogLevel::Info,
+                           "ZAUDIO allocated stream handle=" + std::to_string(handle) +
+                               " channels=" + std::to_string(channels));
+            }
+
+            void freeStream(const RpcRequest &request)
+            {
+                uint32_t handle = 0u;
+                if (request.send.address == 0u || request.send.size < sizeof(handle) ||
+                    !m_host.readGuest(request.send.address, &handle, sizeof(handle)))
+                {
+                    return;
+                }
+
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_streams.erase(handle);
+            }
+
             IopHost &m_host;
             ZaudioBindings m_bindings;
             std::array<uint32_t, 1> m_sids;
             mutable std::mutex m_mutex;
             std::unordered_map<uint32_t, SampleAllocation> m_samples;
+            std::unordered_map<uint32_t, StreamAllocation> m_streams;
             uint32_t m_nextHandle = 0u;
+            uint32_t m_nextStreamHandle = 0u;
             uint32_t m_nextSpuAddress = 0u;
             uint64_t m_rpcCount = 0u;
             uint64_t m_uploadCount = 0u;

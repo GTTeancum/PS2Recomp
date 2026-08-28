@@ -186,8 +186,9 @@ namespace ps2_stubs
         mem.writeIORegister(channelBase + 0x00u, 0x00000100u);
         mem.processPendingTransfers();
 
-        for (const uint32_t cause : mem.consumeCompletedDmacCauses())
-            ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, cause);
+        for (const PS2Memory::DmacCompletion completion : mem.consumeCompletedDmacCauses())
+            ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, completion.cause,
+                                                       completion.delayCycles);
 
         setReturnS32(ctx, 0);
     }

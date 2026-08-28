@@ -23,6 +23,7 @@ public:
               uint32_t voiceIndex = 0xFFFFFFFFu);
     void stop(uint32_t voiceId);
     void stopAll();
+    void update();
     void setAudioReady(bool ready) { m_audioReady = ready; }
 
 private:
@@ -42,7 +43,7 @@ private:
     std::mutex m_mutex;
 
     void playDecodedSample(uint32_t sampleKey, DecodedSample &sample, float pitch, float volume,
-                          bool isBgm = false);
+                          bool isBgm = false, uint32_t voiceId = 0xFFFFFFFFu);
     void pruneFinishedSounds();
 };
 
