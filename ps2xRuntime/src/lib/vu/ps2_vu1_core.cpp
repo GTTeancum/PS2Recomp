@@ -5,6 +5,7 @@
 #include "ps2_vu1_detail.h"
 
 #include <algorithm>
+#include <array>
 #include <cfenv>
 #include <cmath>
 #include <cstdio>
@@ -17,6 +18,76 @@
 namespace
 {
     thread_local bool xmenTraceVu1Program = false;
+    thread_local uint32_t xmenCurrentVuProgramStart = UINT32_MAX;
+    thread_local uint64_t xmenCurrentVuTick = 0u;
+    thread_local uint32_t xmenXgkickProgramStart = UINT32_MAX;
+    thread_local uint32_t xmenXgkickIssuePc = UINT32_MAX;
+    thread_local uint64_t xmenXgkickIssueTick = 0u;
+
+    struct XmenTargetXgkickConfig
+    {
+        bool enabled = false;
+        uint64_t tagLo = 0u;
+        uint64_t minTick = 0u;
+        uint32_t programStart = UINT32_MAX;
+        uint32_t issuePc = UINT32_MAX;
+    };
+
+    const XmenTargetXgkickConfig &xmenTargetXgkickConfig()
+    {
+        static const XmenTargetXgkickConfig config = []()
+        {
+            XmenTargetXgkickConfig result{};
+            const char *tagValue = std::getenv("PS2X_TRACE_XGKICK_TAG_LO");
+            if (!tagValue || tagValue[0] == '\0')
+                return result;
+
+            char *tagEnd = nullptr;
+            result.tagLo = std::strtoull(tagValue, &tagEnd, 0);
+            if (!tagEnd || tagEnd == tagValue || *tagEnd != '\0')
+                return XmenTargetXgkickConfig{};
+
+            const char *tickValue = std::getenv("PS2X_TRACE_XGKICK_MIN_TICK");
+            if (tickValue && tickValue[0] != '\0')
+            {
+                char *tickEnd = nullptr;
+                const uint64_t parsedTick = std::strtoull(tickValue, &tickEnd, 0);
+                if (tickEnd && tickEnd != tickValue && *tickEnd == '\0')
+                    result.minTick = parsedTick;
+            }
+
+            const char *programValue =
+                std::getenv("PS2X_TRACE_XGKICK_PROGRAM_START");
+            if (programValue && programValue[0] != '\0')
+            {
+                char *programEnd = nullptr;
+                const unsigned long parsedProgram =
+                    std::strtoul(programValue, &programEnd, 0);
+                if (programEnd && programEnd != programValue &&
+                    *programEnd == '\0')
+                {
+                    result.programStart = static_cast<uint32_t>(parsedProgram);
+                }
+            }
+
+            const char *issuePcValue =
+                std::getenv("PS2X_TRACE_XGKICK_ISSUE_PC");
+            if (issuePcValue && issuePcValue[0] != '\0')
+            {
+                char *issuePcEnd = nullptr;
+                const unsigned long parsedIssuePc =
+                    std::strtoul(issuePcValue, &issuePcEnd, 0);
+                if (issuePcEnd && issuePcEnd != issuePcValue &&
+                    *issuePcEnd == '\0')
+                {
+                    result.issuePc = static_cast<uint32_t>(parsedIssuePc);
+                }
+            }
+            result.enabled = true;
+            return result;
+        }();
+        return config;
+    }
 
     struct XmenTitleVuTrace
     {
@@ -54,6 +125,7 @@ namespace
     };
 
     thread_local XmenGameplayVuSummary xmenGameplayVuSummary{};
+    thread_local std::array<uint8_t, 2048> xmenVuCensusCounts{};
 
     void finishXmenGameplayVuSummary(const VU1State &state, uint64_t endCycle)
     {
@@ -981,7 +1053,7 @@ void VU1Interpreter::progressXgkick()
                 tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
             else if (format == 1u)
                 tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
-            else if (format == 2u)
+            else if (format == GIF_FMT_IMAGE || format == GIF_FMT_IMAGE2)
                 tagBytes += static_cast<uint64_t>(nloop) * 16u;
             else
             {
@@ -1020,6 +1092,42 @@ void VU1Interpreter::finishXgkick()
 {
     if (!m_xgkick.active)
         return;
+
+    const XmenTargetXgkickConfig &targetConfig = xmenTargetXgkickConfig();
+    if (targetConfig.enabled && m_xgkick.totalBytes >= 16u &&
+        xmenXgkickIssueTick >= targetConfig.minTick)
+    {
+        uint64_t targetTagLo = 0u;
+        uint64_t targetTagHi = 0u;
+        std::memcpy(&targetTagLo, m_xgkick.packet.data(), sizeof(targetTagLo));
+        std::memcpy(&targetTagHi,
+                    m_xgkick.packet.data() + sizeof(targetTagLo),
+                    sizeof(targetTagHi));
+        static uint32_t targetTraceCount = 0u;
+        const bool programMatches = targetConfig.programStart == UINT32_MAX ||
+                                    xmenXgkickProgramStart == targetConfig.programStart;
+        const bool issuePcMatches = targetConfig.issuePc == UINT32_MAX ||
+                                    xmenXgkickIssuePc == targetConfig.issuePc;
+        if (targetTagLo == targetConfig.tagLo && programMatches && issuePcMatches &&
+            targetTraceCount++ < 64u)
+        {
+            std::fprintf(stderr,
+                         "[xmen-vu1:target-xgkick] tick=%llu program=0x%x issuePc=0x%x "
+                         "source=0x%x bytes=%u copied=%u issueCycle=%llu finishCycle=%llu "
+                         "tagLo=0x%016llx tagHi=0x%016llx\n",
+                         static_cast<unsigned long long>(xmenXgkickIssueTick),
+                         xmenXgkickProgramStart,
+                         xmenXgkickIssuePc,
+                         m_xgkick.sourceAddress,
+                         m_xgkick.totalBytes,
+                         m_xgkick.copiedBytes,
+                         static_cast<unsigned long long>(m_xgkick.issueCycle),
+                         static_cast<unsigned long long>(m_cycle),
+                         static_cast<unsigned long long>(targetTagLo),
+                         static_cast<unsigned long long>(targetTagHi));
+            std::fflush(stderr);
+        }
+    }
 
     static uint32_t finishTraceCount = 0u;
     if (xmenTraceVu1Program || finishTraceCount++ < 32u)
@@ -1109,6 +1217,9 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
         return;
 
     const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
+    xmenXgkickProgramStart = xmenCurrentVuProgramStart;
+    xmenXgkickIssuePc = m_state.pc;
+    xmenXgkickIssueTick = xmenCurrentVuTick;
     if (xmenTitleVuTrace.active)
         ++xmenTitleVuTrace.xgkickStarts;
     if (xmenGameplayVuSummary.active)
@@ -1785,7 +1896,29 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     const uint64_t titleTick = memory
         ? memory->gs().vsyncTick.load(std::memory_order_relaxed)
         : 0u;
-    if (m_unit == Unit::VU1 && titleTick == 635u)
+    if (m_unit == Unit::VU1)
+    {
+        xmenCurrentVuProgramStart = startPC;
+        xmenCurrentVuTick = titleTick;
+    }
+    static const uint64_t xmenVuCensusMinTick = []()
+    {
+        const char *value = std::getenv("PS2X_XMEN_VU_CENSUS_MIN_TICK");
+        if (!value || value[0] == '\0')
+            return uint64_t{600u};
+
+        char *end = nullptr;
+        const uint64_t parsed = std::strtoull(value, &end, 0);
+        return end && end != value && *end == '\0' ? parsed : uint64_t{600u};
+    }();
+    const uint32_t censusIndex = (startPC & microAddressMask()) / 8u;
+    const bool traceVuCensus =
+        m_unit == Unit::VU1 && std::getenv("PS2X_XMEN_VU_CENSUS") != nullptr &&
+        titleTick >= xmenVuCensusMinTick && censusIndex < xmenVuCensusCounts.size() &&
+        xmenVuCensusCounts[censusIndex] < 8u;
+    if (traceVuCensus)
+        ++xmenVuCensusCounts[censusIndex];
+    if (m_unit == Unit::VU1 && (titleTick == 635u || traceVuCensus))
     {
         xmenGameplayVuSummary = {};
         xmenGameplayVuSummary.active = true;
@@ -1844,22 +1977,49 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     }
     static uint32_t tracedXmenMeshProgram = 0u;
     static uint32_t tracedXmenGameplayKickPrograms = 0u;
+    static uint32_t tracedXmenTargetProgram = 0u;
+    const char *targetProgramEnvironment =
+        std::getenv("PS2X_XMEN_VU_TRACE_START");
+    const uint32_t targetProgram = targetProgramEnvironment
+        ? static_cast<uint32_t>(std::strtoul(targetProgramEnvironment, nullptr, 0))
+        : UINT32_MAX;
+    static const uint32_t targetProgramTraceLimit = []()
+    {
+        const char *value = std::getenv("PS2X_XMEN_VU_TRACE_COUNT");
+        if (!value || value[0] == '\0')
+            return 1u;
+
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 0);
+        return end && end != value && *end == '\0'
+            ? static_cast<uint32_t>(std::min<unsigned long>(parsed, 256u))
+            : 1u;
+    }();
     const bool traceMeshProgram =
         m_unit == Unit::VU1 && startPC == 0x230u && tracedXmenMeshProgram < 8u;
     const bool traceGameplayKickProgram =
         m_unit == Unit::VU1 && startPC == 0x230u && titleTick >= 640u &&
         tracedXmenGameplayKickPrograms < 24u;
-    const bool traceThisProgram = traceMeshProgram || traceGameplayKickProgram;
+    const bool traceTargetProgram =
+        m_unit == Unit::VU1 && targetProgramEnvironment != nullptr &&
+        startPC == (targetProgram & microAddressMask()) && titleTick >= xmenVuCensusMinTick &&
+        tracedXmenTargetProgram < targetProgramTraceLimit;
+    const bool traceThisProgram =
+        traceMeshProgram || traceGameplayKickProgram || traceTargetProgram;
     if (traceThisProgram)
     {
         if (traceMeshProgram)
             ++tracedXmenMeshProgram;
         if (traceGameplayKickProgram)
             ++tracedXmenGameplayKickPrograms;
+        if (traceTargetProgram)
+            ++tracedXmenTargetProgram;
         xmenTraceVu1Program = true;
         std::fprintf(stderr,
-                     "[xmen-vu1:begin] kind=%s start=0x%x top=0x%x itop=0x%x\n",
-                     traceGameplayKickProgram ? "gameplay-kick" : "mesh",
+                     "[xmen-vu1:begin] kind=%s tick=%llu start=0x%x top=0x%x itop=0x%x\n",
+                     traceTargetProgram ? "target" :
+                         (traceGameplayKickProgram ? "gameplay-kick" : "mesh"),
+                     static_cast<unsigned long long>(titleTick),
                      startPC, top, itop);
 
         const auto dumpDataRange = [&](uint32_t firstQword, uint32_t lastQword)
@@ -1878,6 +2038,27 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
         };
 
         dumpDataRange(top, top + 7u);
+
+        const char *dumpFirstValue =
+            std::getenv("PS2X_XMEN_VU_TRACE_DATA_FIRST");
+        const char *dumpLastValue =
+            std::getenv("PS2X_XMEN_VU_TRACE_DATA_LAST");
+        if (dumpFirstValue && dumpLastValue)
+        {
+            char *firstEnd = nullptr;
+            char *lastEnd = nullptr;
+            const unsigned long first =
+                std::strtoul(dumpFirstValue, &firstEnd, 0);
+            const unsigned long last =
+                std::strtoul(dumpLastValue, &lastEnd, 0);
+            if (firstEnd && firstEnd != dumpFirstValue && *firstEnd == '\0' &&
+                lastEnd && lastEnd != dumpLastValue && *lastEnd == '\0' &&
+                first <= last && last - first < 256u)
+            {
+                dumpDataRange(static_cast<uint32_t>(first),
+                              static_cast<uint32_t>(last));
+            }
+        }
     }
     resetScheduler();
     m_state.pc = startPC & microAddressMask();
@@ -1952,6 +2133,8 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
                             GS &gs, PS2Memory *memory,
                             uint32_t top, uint32_t itop, uint32_t maxCycles)
 {
+    if (m_unit == Unit::VU1 && memory)
+        xmenCurrentVuTick = memory->gs().vsyncTick.load(std::memory_order_relaxed);
     m_state.top = top;
     m_state.itop = itop;
     m_state.stoppedByD = false;

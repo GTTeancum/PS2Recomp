@@ -138,6 +138,36 @@ namespace
         }();
         return enabled;
     }
+
+    uint64_t tracedGifTagLo()
+    {
+        static const uint64_t tag = []()
+        {
+            const char *value = std::getenv("PS2X_TRACE_GIF_TAG_LO");
+            if (!value || value[0] == '\0')
+                return UINT64_MAX;
+
+            char *end = nullptr;
+            const uint64_t parsed = std::strtoull(value, &end, 0);
+            return end && end != value && *end == '\0' ? parsed : UINT64_MAX;
+        }();
+        return tag;
+    }
+
+    uint64_t tracedGifMinTick()
+    {
+        static const uint64_t tick = []()
+        {
+            const char *value = std::getenv("PS2X_TRACE_GIF_MIN_TICK");
+            if (!value || value[0] == '\0')
+                return uint64_t{0u};
+
+            char *end = nullptr;
+            const uint64_t parsed = std::strtoull(value, &end, 0);
+            return end && end != value && *end == '\0' ? parsed : uint64_t{0u};
+        }();
+        return tick;
+    }
 }
 
 
@@ -192,6 +222,8 @@ void GS::reset()
     m_trxdir = 3;
     m_vtxCount = 0;
     m_vtxIndex = 0;
+    m_currentGifTagLo = 0;
+    m_traceCurrentGifPacket = false;
     m_preferredDisplaySourceFrame = {};
     m_preferredDisplayDestFbp = 0;
     m_hasPreferredDisplaySource = false;
@@ -797,7 +829,17 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         firstNreg = 16u;
     static std::atomic<uint32_t> processTraceCount{0u};
     const uint32_t processTraceIndex = processTraceCount.fetch_add(1u, std::memory_order_relaxed);
-    const bool traceThisPacket = processTraceIndex < 128u;
+    const uint64_t targetTagLo = tracedGifTagLo();
+    const uint64_t currentTick = m_privRegs
+        ? m_privRegs->vsyncTick.load(std::memory_order_relaxed)
+        : 0u;
+    const bool matchesTargetPacket =
+        targetTagLo != UINT64_MAX && firstTagLo == targetTagLo &&
+        currentTick >= tracedGifMinTick();
+    static std::atomic<uint32_t> targetPacketTraceCount{0u};
+    const bool traceTargetPacket = matchesTargetPacket &&
+        targetPacketTraceCount.fetch_add(1u, std::memory_order_relaxed) == 0u;
+    const bool traceThisPacket = processTraceIndex < 128u || traceTargetPacket;
     if (traceThisPacket)
     {
         std::fprintf(stderr,
@@ -845,6 +887,11 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         }
         return;
     }
+
+    const uint64_t previousGifTagLo = m_currentGifTagLo;
+    const bool previousTracePacket = m_traceCurrentGifPacket;
+    m_currentGifTagLo = firstTagLo;
+    m_traceCurrentGifPacket = traceTargetPacket;
 
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t packetIndex = s_debugGifPacketCount.fetch_add(1, std::memory_order_relaxed);
@@ -928,6 +975,8 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                                          nloop,
                                          nreg);
                         }
+                        m_currentGifTagLo = previousGifTagLo;
+                        m_traceCurrentGifPacket = previousTracePacket;
                         return;
                     }
                     uint64_t lo = loadLE64(data + offset);
@@ -969,6 +1018,8 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                                          nloop,
                                          nreg);
                         }
+                        m_currentGifTagLo = previousGifTagLo;
+                        m_traceCurrentGifPacket = previousTracePacket;
                         return;
                     }
                     {
@@ -990,7 +1041,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
             if ((nloop * nreg) & 1)
                 offset += 8;
         }
-        else if (flg == GIF_FMT_IMAGE)
+        else if (flg == GIF_FMT_IMAGE || flg == GIF_FMT_IMAGE2)
         {
             uint32_t imageBytes = nloop * 16;
             if (offset + imageBytes > sizeBytes)
@@ -999,6 +1050,8 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
             offset += imageBytes;
         }
     }
+    m_currentGifTagLo = previousGifTagLo;
+    m_traceCurrentGifPacket = previousTracePacket;
 }
 
 bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
@@ -1010,8 +1063,10 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     if (!validatePackedGifPacket(data, sizeBytes))
         return false;
 
+    const uint64_t previousGifTagLo = m_currentGifTagLo;
     const bool processed = visitPackedGifPacket(data, sizeBytes, [&](const PackedGifPacketTag &tag)
                                                 {
+        m_currentGifTagLo = tag.lo;
         m_curQ = 1.0f;
 
         recordGifTagDebugEventUnlocked(sizeBytes, tag.nloop, GIF_FMT_PACKED, tag.nreg);
@@ -1033,6 +1088,7 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         }
 
         return true; });
+    m_currentGifTagLo = previousGifTagLo;
 
     if (!processed)
         return false;
@@ -1125,7 +1181,7 @@ bool GS::tryProcessNativeImageUploadPacket(const uint8_t *data, uint32_t sizeByt
     const uint64_t imageTagLo = loadLE64(data + offset);
     const uint8_t imageFlg = static_cast<uint8_t>((imageTagLo >> 58u) & 0x3u);
     const uint32_t imageNloop = static_cast<uint32_t>(imageTagLo & 0x7FFFu);
-    if (imageFlg != GIF_FMT_IMAGE || imageNloop == 0u)
+    if ((imageFlg != GIF_FMT_IMAGE && imageFlg != GIF_FMT_IMAGE2) || imageNloop == 0u)
         return false;
 
     offset += 16u;
@@ -1946,6 +2002,75 @@ void GS::vertexKick(bool drawing)
     if (drawing && m_backend)
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
+        if (m_traceCurrentGifPacket)
+        {
+            static std::atomic<uint32_t> targetSubmitCount{0u};
+            const uint32_t targetIndex = targetSubmitCount.fetch_add(1u, std::memory_order_relaxed);
+            const GSContext &ctx = batch.state.context;
+            const GSVertex &v0 = batch.vertices[0];
+            const GSVertex &v1 = batch.vertices[1];
+            const GSVertex &v2 = batch.vertices[batch.vertexCount - 1u];
+            std::fprintf(stderr,
+                         "[gs-target-submit] index=%u present=%u tick=%llu prim=%u ctxt=%u tme=%u abe=%u fst=%u iip=%u frame=%u/%u/%u/0x%x zbuf=%u/%u/%u tex0=%u/%u/%u/%u/%u/%u/%u/%u/%u/%u/%u tex1=0x%016llx clamp=0x%016llx test=0x%016llx alpha=0x%016llx scissor=%u,%u-%u,%u offset=%u,%u v0=%.1f,%.1f,%.0f/%u,%u,%u,%u v1=%.1f,%.1f,%.0f/%u,%u,%u,%u v2=%.1f,%.1f,%.0f/%u,%u,%u,%u\n",
+                         targetIndex,
+                         batch.debugPresentCount,
+                         static_cast<unsigned long long>(batch.debugVsyncTick),
+                         static_cast<unsigned>(batch.state.prim.type),
+                         static_cast<unsigned>(batch.state.prim.ctxt),
+                         batch.state.prim.tme ? 1u : 0u,
+                         batch.state.prim.abe ? 1u : 0u,
+                         batch.state.prim.fst ? 1u : 0u,
+                         batch.state.prim.iip ? 1u : 0u,
+                         ctx.frame.fbp,
+                         ctx.frame.fbw,
+                         ctx.frame.psm,
+                         ctx.frame.fbmsk,
+                         ctx.zbuf.zbp,
+                         ctx.zbuf.psm,
+                         ctx.zbuf.zmask ? 1u : 0u,
+                         ctx.tex0.tbp0,
+                         static_cast<unsigned>(ctx.tex0.tbw),
+                         static_cast<unsigned>(ctx.tex0.psm),
+                         static_cast<unsigned>(ctx.tex0.tw),
+                         static_cast<unsigned>(ctx.tex0.th),
+                         static_cast<unsigned>(ctx.tex0.tcc),
+                         static_cast<unsigned>(ctx.tex0.tfx),
+                         ctx.tex0.cbp,
+                         static_cast<unsigned>(ctx.tex0.cpsm),
+                         static_cast<unsigned>(ctx.tex0.csm),
+                         static_cast<unsigned>(ctx.tex0.csa),
+                         static_cast<unsigned long long>(ctx.tex1),
+                         static_cast<unsigned long long>(ctx.clamp),
+                         static_cast<unsigned long long>(ctx.test),
+                         static_cast<unsigned long long>(ctx.alpha),
+                         ctx.scissor.x0,
+                         ctx.scissor.y0,
+                         ctx.scissor.x1,
+                         ctx.scissor.y1,
+                         ctx.xyoffset.ofx,
+                         ctx.xyoffset.ofy,
+                         v0.x,
+                         v0.y,
+                         v0.z,
+                         v0.r,
+                         v0.g,
+                         v0.b,
+                         v0.a,
+                         v1.x,
+                         v1.y,
+                         v1.z,
+                         v1.r,
+                         v1.g,
+                         v1.b,
+                         v1.a,
+                         v2.x,
+                         v2.y,
+                         v2.z,
+                         v2.r,
+                         v2.g,
+                         v2.b,
+                         v2.a);
+        }
         static std::atomic<uint32_t> submittedDrawTraceCount{0u};
         static std::atomic<uint32_t> interestingDrawTraceCount{0u};
         static std::atomic<uint32_t> nonSpriteDrawCount{0u};
@@ -2295,6 +2420,7 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
     batch.debugVsyncTick = m_privRegs
         ? m_privRegs->vsyncTick.load(std::memory_order_relaxed)
         : 0u;
+    batch.debugGifTagLo = m_currentGifTagLo;
     batch.debugPresentCount = s_xmenPresentTraceCount.load(std::memory_order_relaxed);
     return batch;
 }

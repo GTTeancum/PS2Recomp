@@ -25,6 +25,7 @@
 #include <atomic>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <sstream>
 #include <cstdio>
 #include <zlib.h>
@@ -3251,12 +3252,13 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         const uint32_t width = readRdramProbeU16(rdram, descriptor + 0x3Cu);
         const uint32_t height = readRdramProbeU16(rdram, descriptor + 0x3Eu);
         const uint32_t format = readRdramProbeU16(rdram, descriptor + 0x42u);
+        const uint32_t destination = readRdramProbeU32(rdram, descriptor + 0x38u);
         const uint32_t multiplier =
             readRdramProbeU32(rdram, 0x0065A520u + (format * 4u));
         const uint32_t rowBytes = width * multiplier;
         const uint32_t chunkRows = rowBytes != 0u ? 0x000FFFE0u / rowBytes
                                                    : 0xFFFFFFFFu;
-        if (index < 64u || chunkRows == 0u)
+        if (index < 64u || chunkRows == 0u || destination == 0x2D84u || destination == 0x2D88u)
         {
             const uint32_t manager = readRdramProbeU32(rdram, 0x00750778u);
             std::cerr << "[xmen-texture-upload:entry] index=" << std::dec << index
@@ -3264,7 +3266,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                       << " upload=0x" << upload
                       << " descriptor=0x" << descriptor
                       << " data=0x" << readRdramProbeU32(rdram, descriptor + 0x30u)
-                      << " destination=0x" << readRdramProbeU32(rdram, descriptor + 0x38u)
+                      << " destination=0x" << destination
                       << " width=0x" << width
                       << " height=0x" << height
                       << " format=0x" << format
@@ -3313,11 +3315,13 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                        ? s_xmenZeroTextureChunkCount.fetch_add(
                                              1u, std::memory_order_relaxed)
                                        : 0u;
-        if (index < 256u || (chunk == 0u && zeroIndex < 32u))
+        const uint32_t upload = GPR_U32(ctx, 22);
+        const uint32_t descriptor = readRdramProbeU32(rdram, upload);
+        const uint32_t destination = readRdramProbeU32(rdram, descriptor + 0x38u);
+        if (index < 256u || (chunk == 0u && zeroIndex < 32u) ||
+            destination == 0x2D84u || destination == 0x2D88u)
         {
             const uint32_t manager = readRdramProbeU32(rdram, 0x00750778u);
-            const uint32_t upload = GPR_U32(ctx, 22);
-            const uint32_t descriptor = readRdramProbeU32(rdram, upload);
             const uint32_t width = readRdramProbeU16(rdram, descriptor + 0x3Cu);
             const uint32_t height = readRdramProbeU16(rdram, descriptor + 0x3Eu);
             const uint32_t format = readRdramProbeU16(rdram, descriptor + 0x42u);
@@ -3332,6 +3336,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                       << " upload=0x" << upload
                       << " descriptor=0x" << descriptor
                       << " data=0x" << readRdramProbeU32(rdram, descriptor + 0x30u)
+                      << " destination=0x" << destination
                       << " width=0x" << width
                       << " height=0x" << height
                       << " format=0x" << format
@@ -4531,6 +4536,73 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                       << " table=0x" << std::hex << table
                       << " target=0x" << readRdramProbeU32(rdram, table + selector * 4u)
                       << " payload=0x" << GPR_U32(ctx, 7)
+                      << std::dec << std::endl;
+        }
+    }
+    constexpr std::array<uint32_t, 20> xmenMovieAudioTargets = {
+        0x00556010u, 0x00556150u, 0x00581840u, 0x00580810u,
+        0x00568580u, 0x005685B0u, 0x00563010u, 0x005555F0u,
+        0x005816E0u, 0x00555818u, 0x00554C70u, 0x00565EE8u,
+        0x00555800u, 0x00582E60u, 0x0057AD08u, 0x0057AD20u,
+        0x0057BEA8u, 0x0057B1C8u, 0x0057ACD8u, 0x005836F8u,
+    };
+    const auto xmenMovieAudioIt = std::find(
+        xmenMovieAudioTargets.begin(), xmenMovieAudioTargets.end(), targetPc);
+    const size_t xmenMovieAudioTargetIndex = static_cast<size_t>(
+        xmenMovieAudioIt - xmenMovieAudioTargets.begin());
+    const bool isXmenMovieAudioCall =
+        std::getenv("PS2X_XMEN_MOVIE_AUDIO_TRACE") != nullptr && isCall &&
+        xmenMovieAudioTargetIndex < xmenMovieAudioTargets.size();
+    uint32_t xmenMovieAudioTraceIndex = UINT32_MAX;
+    uint32_t xmenMovieAudioObject = 0u;
+    if (isXmenMovieAudioCall)
+    {
+        static std::array<std::atomic<uint32_t>, 20> s_xmenMovieAudioCounts{};
+        xmenMovieAudioTraceIndex =
+            s_xmenMovieAudioCounts[xmenMovieAudioTargetIndex].fetch_add(
+                1u, std::memory_order_relaxed);
+        xmenMovieAudioObject = GPR_U32(ctx, 4);
+        if (xmenMovieAudioTraceIndex < 96u)
+        {
+            constexpr uint32_t owner = 0x0146C600u;
+            const uint32_t streamHolder = readRdramProbeU32(rdram, owner + 0x1CACu);
+            const uint32_t stream = readRdramProbeU32(rdram, streamHolder);
+            const uint32_t audioIndex = readRdramProbeU32(rdram, owner + 0x1CB8u);
+            const uint32_t audioRecord = owner + 0x1278u + audioIndex * 116u;
+            std::cerr << "[xmen-movie-audio:enter] stage=" << std::dec
+                      << xmenMovieAudioTargetIndex
+                      << " call=" << xmenMovieAudioTraceIndex
+                      << " thread=" << eeScheduler().currentThreadId()
+                      << " source=0x" << std::hex << sourcePc
+                      << " target=0x" << targetPc
+                      << " return=0x" << fallthroughPc
+                      << " a0=0x" << GPR_U32(ctx, 4)
+                      << " a1=0x" << GPR_U32(ctx, 5)
+                      << " a2=0x" << GPR_U32(ctx, 6)
+                      << " a3=0x" << GPR_U32(ctx, 7)
+                      << " state=0x" << readRdramProbeU32(rdram, owner + 0x48u)
+                      << " desired=0x" << readRdramProbeU32(rdram, owner + 0x4Cu)
+                      << " row6a=0x" << readRdramProbeU32(rdram, owner + 0x1D70u)
+                      << " row6b=0x" << readRdramProbeU32(rdram, owner + 0x1D74u)
+                      << " row7a=0x" << readRdramProbeU32(rdram, owner + 0x1DB4u)
+                      << " row7b=0x" << readRdramProbeU32(rdram, owner + 0x1DB8u)
+                      << " holder=0x" << streamHolder
+                      << " stream=0x" << stream
+                      << " stream0=0x" << readRdramProbeU32(rdram, stream)
+                      << " streamSource=0x" << readRdramProbeU32(rdram, stream + 4u)
+                      << " streamRing=0x" << readRdramProbeU32(rdram, stream + 0xCu)
+                      << " streamThreshold=0x" << readRdramProbeU32(rdram, stream + 0x48u)
+                      << " stream70=0x" << static_cast<uint32_t>(rdram[stream + 0x70u])
+                      << " stream71=0x" << static_cast<uint32_t>(rdram[stream + 0x71u])
+                      << " objectByte1=0x" << static_cast<uint32_t>(rdram[xmenMovieAudioObject + 1u])
+                      << " object60=0x" << static_cast<uint32_t>(*reinterpret_cast<const uint16_t *>(rdram + xmenMovieAudioObject + 0x60u))
+                      << " audioIndex=0x" << audioIndex
+                      << " audioA=0x" << readRdramProbeU32(rdram, audioRecord + 8u)
+                      << " audioB=0x" << readRdramProbeU32(rdram, audioRecord + 0xCu)
+                      << " stream2c=0x" << readRdramProbeU32(rdram, stream + 0x2Cu)
+                      << " stream30=0x" << readRdramProbeU32(rdram, stream + 0x30u)
+                      << " stream72=0x"
+                      << ((readRdramProbeU32(rdram, stream + 0x70u) >> 16u) & 0xFFu)
                       << std::dec << std::endl;
         }
     }
@@ -6609,10 +6681,27 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                     static std::atomic<uint32_t> s_xmenImageCallTraceCount{0u};
                     const uint32_t traceIndex =
                         s_xmenImageCallTraceCount.fetch_add(1u, std::memory_order_relaxed);
-                    if (traceIndex < 512u)
+                    static std::atomic<uint32_t> s_xmenConsoleImageCallTraceCount{0u};
+                    const uint32_t consoleTraceIndex = imageIndex == 385u
+                        ? s_xmenConsoleImageCallTraceCount.fetch_add(1u, std::memory_order_relaxed)
+                        : UINT32_MAX;
+                    static std::atomic<uint32_t> s_xmenReferenceImageCallTraceCount{0u};
+                    const uint32_t referenceTraceIndex = imageIndex == 367u
+                        ? s_xmenReferenceImageCallTraceCount.fetch_add(1u, std::memory_order_relaxed)
+                        : UINT32_MAX;
+                    if (traceIndex < 512u || consoleTraceIndex < 256u || referenceTraceIndex < 256u)
                     {
+                        uint32_t cacheEntry = 0u;
+                        if (targetPc == 0x00282D40u)
+                        {
+                            const uint32_t cacheTable = readRdramProbeU32(rdram, GPR_U32(ctx, 4) + 0x144u);
+                            cacheEntry = readRdramProbeU32(rdram, cacheTable + 0x10u) +
+                                         GPR_U32(ctx, 5) * 0x88u;
+                        }
                         std::cout << "[xmen-main-back-image-call] index=" << std::dec
                                   << traceIndex
+                                  << " consoleIndex=" << consoleTraceIndex
+                                  << " referenceIndex=" << referenceTraceIndex
                                   << " tick=" << xmenBranchTick
                                   << " image=" << imageIndex
                                   << " register=" << candidateNames[registerIndex]
@@ -6625,6 +6714,88 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                   << " a1=0x" << GPR_U32(ctx, 5)
                                   << " a2=0x" << GPR_U32(ctx, 6)
                                   << " a3=0x" << GPR_U32(ctx, 7)
+                                  << " v0=0x" << GPR_U32(ctx, 2)
+                                  << " v1=0x" << GPR_U32(ctx, 3)
+                                  << " s0=0x" << GPR_U32(ctx, 16)
+                                  << " s1=0x" << GPR_U32(ctx, 17)
+                                  << " s2=0x" << GPR_U32(ctx, 18)
+                                  << " s3=0x" << GPR_U32(ctx, 19)
+                                  << " cache=0x" << cacheEntry;
+                        if (cacheEntry != 0u)
+                        {
+                            for (uint32_t offset = 0u; offset <= 0x84u; offset += 4u)
+                            {
+                                std::cout << " cache" << std::dec << offset
+                                          << "=0x" << std::hex
+                                          << readRdramProbeU32(rdram, cacheEntry + offset);
+                            }
+                        }
+                        if (targetPc == 0x00282D40u && imageIndex == 385u)
+                        {
+                            const uint32_t imageData = readRdramProbeU32(rdram, imageObject + 0x34u);
+                            const uint32_t imageSize = readRdramProbeU32(rdram, imageObject + 0x30u);
+                            const uint32_t clutObject = readRdramProbeU32(rdram, imageObject + 0x44u);
+                            const uint32_t clutData = readRdramProbeU32(rdram, clutObject + 0x14u);
+                            const uint32_t clutSize = readRdramProbeU32(rdram, clutObject + 0x18u);
+                            auto hashGuestBytes = [&](uint32_t address, uint32_t size)
+                            {
+                                uint64_t hash = 1469598103934665603ull;
+                                if (!rdram || address > PS2_RAM_SIZE || size > PS2_RAM_SIZE - address)
+                                    return uint64_t{0u};
+                                for (uint32_t i = 0u; i < size; ++i)
+                                {
+                                    hash ^= rdram[address + i];
+                                    hash *= 1099511628211ull;
+                                }
+                                return hash;
+                            };
+                            std::cout << " imageData=0x" << std::hex << imageData
+                                      << " imageSize=0x" << imageSize
+                                      << " imageHash=0x" << hashGuestBytes(imageData, imageSize)
+                                      << " clutObject=0x" << clutObject
+                                      << " clutData=0x" << clutData
+                                      << " clutSize=0x" << clutSize
+                                      << " clutHash=0x" << hashGuestBytes(clutData, clutSize);
+                            for (uint32_t offset = 0u; offset <= 0x5Cu; offset += 4u)
+                            {
+                                std::cout << " clut" << std::dec << offset
+                                          << "=0x" << std::hex
+                                          << readRdramProbeU32(rdram, clutObject + offset);
+                            }
+                            static std::atomic<bool> s_xmenConsoleTextureRepaired{false};
+                            if (std::getenv("PS2X_XMEN_REPAIR_CONSOLE_TEXTURE") != nullptr &&
+                                !s_xmenConsoleTextureRepaired.exchange(true, std::memory_order_relaxed) &&
+                                rdram && imageSize == 0x400u && clutSize == 0x400u &&
+                                imageData <= PS2_RAM_SIZE - imageSize &&
+                                clutData <= PS2_RAM_SIZE - clutSize)
+                            {
+                                const uint64_t textureBitblt =
+                                    (static_cast<uint64_t>(11652u) << 32u) |
+                                    (static_cast<uint64_t>(1u) << 48u) |
+                                    (static_cast<uint64_t>(0x13u) << 56u);
+                                const uint64_t textureTrxreg = 32u | (static_cast<uint64_t>(32u) << 32u);
+                                m_gs.uploadImageNative(textureBitblt, 0u, textureTrxreg, 0u,
+                                                       rdram + imageData, imageSize);
+
+                                std::array<uint8_t, 0x400u> swizzledClut{};
+                                for (uint32_t i = 0u; i < 256u; ++i)
+                                {
+                                    const uint32_t sourceIndex =
+                                        (i & 0xE7u) | ((i & 0x08u) << 1u) | ((i & 0x10u) >> 1u);
+                                    std::memcpy(swizzledClut.data() + i * 4u,
+                                                rdram + clutData + sourceIndex * 4u, 4u);
+                                }
+                                const uint64_t clutBitblt =
+                                    (static_cast<uint64_t>(11656u) << 32u) |
+                                    (static_cast<uint64_t>(1u) << 48u);
+                                const uint64_t clutTrxreg = 16u | (static_cast<uint64_t>(16u) << 32u);
+                                m_gs.uploadImageNative(clutBitblt, 0u, clutTrxreg, 0u,
+                                                       swizzledClut.data(),
+                                                       static_cast<uint32_t>(swizzledClut.size()));
+                                std::cout << " repair=uploaded";
+                            }
+                        }
+                        std::cout
                                   << " ra=0x" << GPR_U32(ctx, 31)
                                   << std::dec << std::endl;
                     }
@@ -7056,7 +7227,9 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     static thread_local bool s_xmenHostClockActive = false;
     static thread_local uint64_t s_xmenHostClockBaseNanoseconds = 0u;
     static thread_local std::chrono::steady_clock::time_point s_xmenHostClockOrigin;
-    if (!s_xmenHostClockActive && isCall && sourcePc == 0x0014B89Cu)
+    if (!s_xmenHostClockActive &&
+        std::getenv("PS2X_XMEN_HOST_CLOCK") != nullptr &&
+        isCall && sourcePc == 0x0014B89Cu)
     {
         const double guestSeconds = std::max(0.0, static_cast<double>(ctx->f[0]));
         s_xmenHostClockBaseNanoseconds = static_cast<uint64_t>(guestSeconds * 1'000'000'000.0);
@@ -8185,8 +8358,20 @@ xmen_component_attach_trace_done:
         const uint32_t probeIndex = s_xmenFrameProbeCount.fetch_add(1u, std::memory_order_relaxed);
         static const bool xmenSteadyCoverageEnabled =
             std::getenv("PS2X_XMEN_STEADY_COVERAGE") != nullptr;
-        if (probeIndex == 2u && xmenSteadyCoverageEnabled)
+        static const uint64_t xmenSteadyCoverageMinTick = [] {
+            const char *value = std::getenv("PS2X_XMEN_STEADY_COVERAGE_MIN_TICK");
+            return value && *value
+                ? static_cast<uint64_t>(std::strtoull(value, nullptr, 0))
+                : 0u;
+        }();
+        if (xmenSteadyCoverageEnabled &&
+            ((xmenSteadyCoverageMinTick == 0u && probeIndex == 2u) ||
+             (xmenSteadyCoverageMinTick != 0u &&
+              m_memory.gs().vsyncTick.load(std::memory_order_relaxed) >=
+                  xmenSteadyCoverageMinTick)))
+        {
             s_xmenSteadyFrameCoverageEnabled.store(true, std::memory_order_release);
+        }
         const uint32_t completed = readRdramProbeU32(rdram, 0x007537E0u);
         const uint32_t submitted = readRdramProbeU32(rdram, 0x007537E8u);
         if (probeIndex < 128u || submitted >= 0x50u)
@@ -8222,26 +8407,27 @@ xmen_component_attach_trace_done:
     if (isCall && s_xmenSteadyFrameCoverageEnabled.load(std::memory_order_acquire))
     {
         static std::mutex s_xmenSteadyFrameCoverageMutex;
-        static std::array<uint32_t, 2048> s_xmenSteadyFrameCoverageTargets{};
-        static uint32_t s_xmenSteadyFrameCoverageCount = 0u;
+        static std::unordered_set<uint64_t> s_xmenSteadyFrameCoverageEdges;
         std::lock_guard<std::mutex> lock(s_xmenSteadyFrameCoverageMutex);
-        bool seen = false;
-        for (uint32_t i = 0u; i < s_xmenSteadyFrameCoverageCount; ++i)
+        if (s_xmenSteadyFrameCoverageEdges.empty())
         {
-            if (s_xmenSteadyFrameCoverageTargets[i] == targetPc)
-            {
-                seen = true;
-                break;
-            }
+            s_xmenSteadyFrameCoverageEdges.reserve(16384u);
         }
-        if (!seen && s_xmenSteadyFrameCoverageCount < s_xmenSteadyFrameCoverageTargets.size())
+        const uint64_t edge = (static_cast<uint64_t>(sourcePc) << 32u) | targetPc;
+        const auto [iterator, inserted] = s_xmenSteadyFrameCoverageEdges.insert(edge);
+        if (inserted)
         {
-            s_xmenSteadyFrameCoverageTargets[s_xmenSteadyFrameCoverageCount++] = targetPc;
-            std::cerr << "[xmen-steady-call] index=" << (s_xmenSteadyFrameCoverageCount - 1u)
+            std::cerr << "[xmen-steady-call] index=" << (s_xmenSteadyFrameCoverageEdges.size() - 1u)
+                      << " tick="
+                      << m_memory.gs().vsyncTick.load(std::memory_order_relaxed)
                       << " source=0x" << std::hex << sourcePc
                       << " target=0x" << targetPc
                       << " return=0x" << fallthroughPc
                       << " kind=" << describeGuestBranchKind(kind)
+                      << " a0=0x" << GPR_U32(ctx, 4)
+                      << " a1=0x" << GPR_U32(ctx, 5)
+                      << " a2=0x" << GPR_U32(ctx, 6)
+                      << " a3=0x" << GPR_U32(ctx, 7)
                       << std::dec << std::endl;
         }
     }
@@ -8682,6 +8868,47 @@ xmen_component_attach_trace_done:
         previousLiveChainObserved};
 
     targetFn(rdram, ctx, this);
+    if (isXmenMovieAudioCall && xmenMovieAudioTraceIndex < 96u)
+    {
+        constexpr uint32_t owner = 0x0146C600u;
+        const uint32_t streamHolder = readRdramProbeU32(rdram, owner + 0x1CACu);
+        const uint32_t stream = readRdramProbeU32(rdram, streamHolder);
+        const uint32_t audioIndex = readRdramProbeU32(rdram, owner + 0x1CB8u);
+        const uint32_t audioRecord = owner + 0x1278u + audioIndex * 116u;
+        std::cerr << "[xmen-movie-audio:exit] stage=" << std::dec
+                  << xmenMovieAudioTargetIndex
+                  << " call=" << xmenMovieAudioTraceIndex
+                  << " thread=" << eeScheduler().currentThreadId()
+                  << " source=0x" << std::hex << sourcePc
+                  << " target=0x" << targetPc
+                  << " pc=0x" << ctx->pc
+                  << " v0=0x" << GPR_U32(ctx, 2)
+                  << " object=0x" << xmenMovieAudioObject
+                  << " state=0x" << readRdramProbeU32(rdram, owner + 0x48u)
+                  << " desired=0x" << readRdramProbeU32(rdram, owner + 0x4Cu)
+                  << " row6a=0x" << readRdramProbeU32(rdram, owner + 0x1D70u)
+                  << " row6b=0x" << readRdramProbeU32(rdram, owner + 0x1D74u)
+                  << " row7a=0x" << readRdramProbeU32(rdram, owner + 0x1DB4u)
+                  << " row7b=0x" << readRdramProbeU32(rdram, owner + 0x1DB8u)
+                  << " holder=0x" << streamHolder
+                  << " stream=0x" << stream
+                  << " stream0=0x" << readRdramProbeU32(rdram, stream)
+                  << " streamSource=0x" << readRdramProbeU32(rdram, stream + 4u)
+                  << " streamRing=0x" << readRdramProbeU32(rdram, stream + 0xCu)
+                  << " streamThreshold=0x" << readRdramProbeU32(rdram, stream + 0x48u)
+                  << " stream70=0x" << static_cast<uint32_t>(rdram[stream + 0x70u])
+                  << " stream71=0x" << static_cast<uint32_t>(rdram[stream + 0x71u])
+                  << " objectByte1=0x" << static_cast<uint32_t>(rdram[xmenMovieAudioObject + 1u])
+                  << " object60=0x" << static_cast<uint32_t>(*reinterpret_cast<const uint16_t *>(rdram + xmenMovieAudioObject + 0x60u))
+                  << " audioIndex=0x" << audioIndex
+                  << " audioA=0x" << readRdramProbeU32(rdram, audioRecord + 8u)
+                  << " audioB=0x" << readRdramProbeU32(rdram, audioRecord + 0xCu)
+                  << " stream2c=0x" << readRdramProbeU32(rdram, stream + 0x2Cu)
+                  << " stream30=0x" << readRdramProbeU32(rdram, stream + 0x30u)
+                  << " stream72=0x"
+                  << ((readRdramProbeU32(rdram, stream + 0x70u) >> 16u) & 0xFFu)
+                  << std::dec << std::endl;
+    }
     if (isXmenMediaReadinessCall && xmenMediaReadinessTraceIndex < 128u)
     {
         constexpr uint32_t owner = 0x0146C600u;

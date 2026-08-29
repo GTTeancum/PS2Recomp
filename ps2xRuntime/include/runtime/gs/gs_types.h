@@ -38,7 +38,7 @@ enum GSGifFormat : uint8_t
     GIF_FMT_PACKED = 0,
     GIF_FMT_REGLIST = 1,
     GIF_FMT_IMAGE = 2,
-    GIF_FMT_DISABLED = 3,
+    GIF_FMT_IMAGE2 = 3,
 };
 
 enum GSRegId : uint8_t
@@ -255,6 +255,7 @@ struct GSPrimitiveBatch
     uint8_t vertexCount = 0;
     GSDrawState state{};
     uint64_t debugVsyncTick = 0;
+    uint64_t debugGifTagLo = 0;
     uint32_t debugPresentCount = 0;
 };
 

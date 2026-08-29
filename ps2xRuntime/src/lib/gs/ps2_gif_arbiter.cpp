@@ -4,6 +4,56 @@
 #include <cstdio>
 #include <cstring>
 
+namespace
+{
+bool targetsXmenConsoleTexture(const uint8_t *data, uint32_t sizeBytes, uint32_t &dbpOut, uint32_t &offsetOut)
+{
+    for (uint32_t offset = 8u; offset + 8u <= sizeBytes; offset += 8u)
+    {
+        uint64_t value = 0u;
+        uint64_t reg = 0u;
+        std::memcpy(&value, data + offset - 8u, sizeof(value));
+        std::memcpy(&reg, data + offset, sizeof(reg));
+        const uint32_t dbp = static_cast<uint32_t>((value >> 32u) & 0x3FFFu);
+        if ((reg & 0xFFu) == 0x50u && (dbp == 11652u || dbp == 11656u))
+        {
+            dbpOut = dbp;
+            offsetOut = offset - 8u;
+            return true;
+        }
+    }
+    return false;
+}
+
+void traceXmenConsoleTexturePacket(const char *stage,
+                                   GifPathId pathId,
+                                   bool path2DirectHl,
+                                   const uint8_t *data,
+                                   uint32_t sizeBytes)
+{
+    uint32_t dbp = 0u;
+    uint32_t offset = 0u;
+    if (!targetsXmenConsoleTexture(data, sizeBytes, dbp, offset))
+        return;
+
+    uint64_t hash = 1469598103934665603ull;
+    for (uint32_t i = 0u; i < sizeBytes; ++i)
+    {
+        hash ^= data[i];
+        hash *= 1099511628211ull;
+    }
+
+    std::fprintf(stderr,
+                 "[xmen-console-gif:%s] path=%u directHl=%u dbp=%u bytes=%u adOffset=0x%x hash=%016llx head=",
+                 stage, static_cast<unsigned>(pathId), path2DirectHl ? 1u : 0u,
+                 dbp, sizeBytes, offset, static_cast<unsigned long long>(hash));
+    const uint32_t dumpBytes = std::min<uint32_t>(sizeBytes, 160u);
+    for (uint32_t i = 0u; i < dumpBytes; ++i)
+        std::fprintf(stderr, "%02x", static_cast<unsigned>(data[i]));
+    std::fprintf(stderr, "\n");
+}
+}
+
 GifArbiter::GifArbiter(ProcessPacketFn processFn)
     : m_processFn(std::move(processFn))
 {
@@ -58,6 +108,8 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
                      static_cast<unsigned long long>(tagLo),
                      static_cast<unsigned long long>(tagHi));
     }
+
+    traceXmenConsoleTexturePacket("submit", pathId, path2DirectHl, data, sizeBytes);
 
     static bool loggedXmenClutPacket = false;
     for (uint32_t offset = 8u;
@@ -127,6 +179,8 @@ void GifArbiter::drain()
         auto &pkt = m_queue[i];
         if (!pkt.data.empty())
         {
+            traceXmenConsoleTexturePacket("process", pkt.pathId, pkt.path2DirectHl,
+                                          pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
             static std::atomic<uint32_t> processTraceCount{0u};
             const uint32_t processTraceIndex = processTraceCount.fetch_add(1u, std::memory_order_relaxed);
             if (processTraceIndex < 128u)

@@ -282,7 +282,11 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
     static const bool enabled = std::getenv("PS2X_XMEN_MEMORY_WATCHES") != nullptr;
     static const bool movieStateEnabled =
         std::getenv("PS2X_XMEN_MOVIE_STATE_WATCH") != nullptr;
-    if (!enabled && !movieStateEnabled)
+    static const bool mediaRecordEnabled =
+        std::getenv("PS2X_XMEN_MEDIA_RECORD_WATCH") != nullptr;
+    static const bool movieStreamEnabled =
+        std::getenv("PS2X_XMEN_MOVIE_STREAM_WATCH") != nullptr;
+    if (!enabled && !movieStateEnabled && !mediaRecordEnabled && !movieStreamEnabled)
     {
         return;
     }
@@ -320,6 +324,110 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                           << " a2=0x" << ps2TraceGuestRegisterLo32(ctx, 6)
                           << " a3=0x" << ps2TraceGuestRegisterLo32(ctx, 7)
                           << std::dec << std::endl;
+            }
+        }
+    }
+    if (mediaRecordEnabled)
+    {
+        constexpr uint32_t owner = 0x0146C600u;
+        constexpr uint32_t recordStart = owner + 0x1278u;
+        constexpr uint32_t recordStride = 116u;
+        constexpr uint32_t recordCount = 8u;
+        const uint32_t writeStart = guestAddr & PS2_RAM_MASK;
+        const uint64_t writeEnd = static_cast<uint64_t>(writeStart) + size;
+        for (uint32_t record = 0u; record < recordCount; ++record)
+        {
+            for (uint32_t field : {8u, 0xCu})
+            {
+                const uint32_t watchAddress = recordStart + record * recordStride + field;
+                if (writeStart > watchAddress || writeEnd <= watchAddress)
+                {
+                    continue;
+                }
+
+                static std::atomic<uint32_t> mediaRecordLogCount{0u};
+                const uint32_t index =
+                    mediaRecordLogCount.fetch_add(1u, std::memory_order_relaxed);
+                if (index < 512u)
+                {
+                    uint32_t previous = 0u;
+                    std::memcpy(&previous, rdram + watchAddress, sizeof(previous));
+                    const uint32_t byteIndex = watchAddress - writeStart;
+                    uint64_t source = byteIndex < 8u ? valueLo : valueHi;
+                    const uint32_t shift = (byteIndex & 7u) * 8u;
+                    std::cerr << "[xmen-media-record-write] index=" << std::dec << index
+                              << " record=" << record
+                              << " field=0x" << std::hex << field
+                              << " op=" << op
+                              << " addr=0x" << writeStart
+                              << " size=0x" << size
+                              << " previous=0x" << previous
+                              << " value=0x" << static_cast<uint32_t>(source >> shift)
+                              << " pc=0x" << (ctx ? ctx->pc : 0u)
+                              << " ra=0x" << ps2TraceGuestRegisterLo32(ctx, 31)
+                              << " a0=0x" << ps2TraceGuestRegisterLo32(ctx, 4)
+                              << " a1=0x" << ps2TraceGuestRegisterLo32(ctx, 5)
+                              << " a2=0x" << ps2TraceGuestRegisterLo32(ctx, 6)
+                              << " s0=0x" << ps2TraceGuestRegisterLo32(ctx, 16)
+                              << " s1=0x" << ps2TraceGuestRegisterLo32(ctx, 17)
+                              << std::dec << std::endl;
+                }
+            }
+        }
+    }
+    if (movieStreamEnabled)
+    {
+        constexpr uint32_t owner = 0x0146C600u;
+        uint32_t streamHolder = 0u;
+        std::memcpy(&streamHolder, rdram + owner + 0x1CACu, sizeof(streamHolder));
+        streamHolder &= PS2_RAM_MASK;
+
+        uint32_t stream = 0u;
+        if (streamHolder != 0u)
+        {
+            std::memcpy(&stream, rdram + streamHolder, sizeof(stream));
+            stream &= PS2_RAM_MASK;
+        }
+
+        if (stream != 0u)
+        {
+            const uint32_t writeStart = guestAddr & PS2_RAM_MASK;
+            const uint64_t writeEnd = static_cast<uint64_t>(writeStart) + size;
+            for (uint32_t field : {1u, 0x60u})
+            {
+                const uint32_t watchAddress = stream + field;
+                if (writeStart > watchAddress || writeEnd <= watchAddress)
+                {
+                    continue;
+                }
+
+                static std::atomic<uint32_t> movieStreamLogCount{0u};
+                const uint32_t index =
+                    movieStreamLogCount.fetch_add(1u, std::memory_order_relaxed);
+                if (index < 256u)
+                {
+                    uint16_t previous = 0u;
+                    std::memcpy(&previous, rdram + watchAddress,
+                                field == 1u ? sizeof(uint8_t) : sizeof(previous));
+                    const uint32_t byteIndex = watchAddress - writeStart;
+                    const uint64_t source = byteIndex < 8u ? valueLo : valueHi;
+                    const uint32_t shift = (byteIndex & 7u) * 8u;
+                    std::cerr << "[xmen-movie-stream-write] index=" << std::dec << index
+                              << " field=0x" << std::hex << field
+                              << " op=" << op
+                              << " addr=0x" << writeStart
+                              << " size=0x" << size
+                              << " previous=0x" << previous
+                              << " value=0x" << static_cast<uint32_t>(source >> shift)
+                              << " pc=0x" << (ctx ? ctx->pc : 0u)
+                              << " ra=0x" << ps2TraceGuestRegisterLo32(ctx, 31)
+                              << " a0=0x" << ps2TraceGuestRegisterLo32(ctx, 4)
+                              << " a1=0x" << ps2TraceGuestRegisterLo32(ctx, 5)
+                              << " a2=0x" << ps2TraceGuestRegisterLo32(ctx, 6)
+                              << " s0=0x" << ps2TraceGuestRegisterLo32(ctx, 16)
+                              << " s1=0x" << ps2TraceGuestRegisterLo32(ctx, 17)
+                              << std::dec << std::endl;
+                }
             }
         }
     }

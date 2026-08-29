@@ -2,6 +2,7 @@
 #include "runtime/ps2_memory.h"
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 enum VIFCmd : uint8_t
@@ -31,6 +32,63 @@ enum VIFCmd : uint8_t
 namespace
 {
     constexpr uint8_t kGifFmtImage = 2u;
+
+    struct XmenTargetVifWriteConfig
+    {
+        bool enabled = false;
+        uint32_t firstQword = 0u;
+        uint32_t lastQword = 0u;
+        uint32_t maxWrites = 512u;
+        uint64_t minTick = 0u;
+    };
+
+    const XmenTargetVifWriteConfig &xmenTargetVifWriteConfig()
+    {
+        static const XmenTargetVifWriteConfig config = []()
+        {
+            XmenTargetVifWriteConfig result{};
+            const char *firstValue = std::getenv("PS2X_TRACE_VIF_DEST_FIRST");
+            const char *lastValue = std::getenv("PS2X_TRACE_VIF_DEST_LAST");
+            if (!firstValue || !lastValue || firstValue[0] == '\0' || lastValue[0] == '\0')
+                return result;
+
+            char *firstEnd = nullptr;
+            char *lastEnd = nullptr;
+            result.firstQword = static_cast<uint32_t>(std::strtoul(firstValue, &firstEnd, 0));
+            result.lastQword = static_cast<uint32_t>(std::strtoul(lastValue, &lastEnd, 0));
+            if (!firstEnd || firstEnd == firstValue || *firstEnd != '\0' ||
+                !lastEnd || lastEnd == lastValue || *lastEnd != '\0' ||
+                result.firstQword > result.lastQword)
+            {
+                return XmenTargetVifWriteConfig{};
+            }
+
+            const char *tickValue = std::getenv("PS2X_TRACE_VIF_MIN_TICK");
+            if (tickValue && tickValue[0] != '\0')
+            {
+                char *tickEnd = nullptr;
+                const uint64_t parsedTick = std::strtoull(tickValue, &tickEnd, 0);
+                if (tickEnd && tickEnd != tickValue && *tickEnd == '\0')
+                    result.minTick = parsedTick;
+            }
+
+            const char *maxWritesValue = std::getenv("PS2X_TRACE_VIF_MAX_WRITES");
+            if (maxWritesValue && maxWritesValue[0] != '\0')
+            {
+                char *maxWritesEnd = nullptr;
+                const unsigned long parsedMaxWrites =
+                    std::strtoul(maxWritesValue, &maxWritesEnd, 0);
+                if (maxWritesEnd && maxWritesEnd != maxWritesValue &&
+                    *maxWritesEnd == '\0' && parsedMaxWrites > 0u)
+                {
+                    result.maxWrites = static_cast<uint32_t>(parsedMaxWrites);
+                }
+            }
+            result.enabled = true;
+            return result;
+        }();
+        return config;
+    }
 
     void traceVuQwords(const char *tag, uint32_t transferIndex, const uint8_t *vuData,
                        uint32_t dataSize, uint32_t baseQword, uint32_t count)
@@ -732,12 +790,15 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
                     uint32_t lanes[4] = {0u, 0u, 0u, 0u};
                     std::memcpy(lanes, m_vu1Data + destOff, sizeof(lanes));
+                    uint32_t previousLanes[4] = {lanes[0], lanes[1], lanes[2], lanes[3]};
                     uint32_t decompressed[4] = {lanes[0], lanes[1], lanes[2], lanes[3]};
                     bool decoded = false;
+                    uint32_t sourceVectorIndex = UINT32_MAX;
 
                     const uint8_t *srcVec = nullptr;
                     if (sourceAvailable && srcIndex < sourceVectorCount)
                     {
+                        sourceVectorIndex = srcIndex;
                         srcVec = srcBase + srcIndex * bytesPerVector;
                         ++srcIndex;
                         decoded = true;
@@ -898,6 +959,52 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     }
 
                     std::memcpy(m_vu1Data + destOff, lanes, sizeof(lanes));
+
+                    const XmenTargetVifWriteConfig &targetConfig =
+                        xmenTargetVifWriteConfig();
+                    const uint64_t targetTick =
+                        gs_regs.vsyncTick.load(std::memory_order_relaxed);
+                    static uint32_t targetWriteTraceCount = 0u;
+                    if (targetConfig.enabled && targetTick >= targetConfig.minTick &&
+                        destVec >= targetConfig.firstQword &&
+                        destVec <= targetConfig.lastQword &&
+                        targetWriteTraceCount++ < targetConfig.maxWrites)
+                    {
+                        std::fprintf(stderr,
+                                     "[xmen-vif1:target-write] tick=%llu transfer=%u unpack=%u "
+                                     "write=%u source=%u dest=0x%x opcode=0x%02x vn=%u vl=%u "
+                                     "mask=%u mode=%u usn=%u cl=%u wl=%u cyclePos=%u decoded=%u "
+                                     "before=%08x,%08x,%08x,%08x after=%08x,%08x,%08x,%08x src=",
+                                     static_cast<unsigned long long>(targetTick),
+                                     transferIndex,
+                                     unpackTraceIndex,
+                                     writeIndex,
+                                     sourceVectorIndex,
+                                     destVec,
+                                     opcode,
+                                     vn,
+                                     vl,
+                                     maskEnable ? 1u : 0u,
+                                     vif1_regs.mode & 3u,
+                                     zeroExtend ? 1u : 0u,
+                                     cl,
+                                     wl,
+                                     cyclePos,
+                                     decoded ? 1u : 0u,
+                                     previousLanes[0], previousLanes[1],
+                                     previousLanes[2], previousLanes[3],
+                                     lanes[0], lanes[1], lanes[2], lanes[3]);
+                        if (srcVec)
+                        {
+                            for (uint32_t sourceByte = 0u;
+                                 sourceByte < std::min<uint32_t>(bytesPerVector, 16u);
+                                 ++sourceByte)
+                            {
+                                std::fprintf(stderr, "%02x", srcVec[sourceByte]);
+                            }
+                        }
+                        std::fprintf(stderr, "\n");
+                    }
                 }
 
                 if (traceUnpack)

@@ -116,6 +116,21 @@ namespace
         return enabled;
     }
 
+    uint64_t tracedRasterTick()
+    {
+        static const uint64_t tick = []()
+        {
+            const char *value = std::getenv("PS2X_TRACE_RASTER_TICK");
+            if (!value || value[0] == '\0')
+                return UINT64_MAX;
+
+            char *end = nullptr;
+            const uint64_t parsed = std::strtoull(value, &end, 0);
+            return end && end != value && *end == '\0' ? parsed : UINT64_MAX;
+        }();
+        return tick;
+    }
+
     bool isXmenVramRegionBlock(uint32_t block)
     {
         return block >= 11000u && block <= 11700u;
@@ -160,6 +175,88 @@ namespace
         const uint8_t minimum = std::min(r, std::min(g, b));
         const uint8_t maximum = std::max(r, std::max(g, b));
         return maximum >= 128u && static_cast<uint32_t>(maximum - minimum) >= 96u;
+    }
+
+    struct XmenTraceBounds
+    {
+        int32_t x0 = 0;
+        int32_t y0 = 96;
+        int32_t x1 = 639;
+        int32_t y1 = 149;
+    };
+
+    const XmenTraceBounds &xmenChromaTraceBounds()
+    {
+        static const XmenTraceBounds bounds = []()
+        {
+            XmenTraceBounds parsed{};
+            const char *value = std::getenv("PS2X_TRACE_CHROMA_BOUNDS");
+            if (!value || value[0] == '\0')
+                return parsed;
+
+            int32_t x0 = 0;
+            int32_t y0 = 0;
+            int32_t x1 = 0;
+            int32_t y1 = 0;
+            if (std::sscanf(value, "%d,%d-%d,%d", &x0, &y0, &x1, &y1) == 4 &&
+                x0 <= x1 && y0 <= y1)
+            {
+                parsed = {x0, y0, x1, y1};
+            }
+            return parsed;
+        }();
+        return bounds;
+    }
+
+    bool isInXmenChromaTraceBounds(int32_t x, int32_t y)
+    {
+        const XmenTraceBounds &bounds = xmenChromaTraceBounds();
+        return x >= bounds.x0 && x <= bounds.x1 && y >= bounds.y0 && y <= bounds.y1;
+    }
+
+    XmenTraceBounds parseXmenTraceBounds(const char *environmentName)
+    {
+        XmenTraceBounds parsed{1, 1, 0, 0};
+        const char *value = std::getenv(environmentName);
+        if (!value || value[0] == '\0')
+            return parsed;
+
+        int32_t x0 = 0;
+        int32_t y0 = 0;
+        int32_t x1 = 0;
+        int32_t y1 = 0;
+        if (std::sscanf(value, "%d,%d-%d,%d", &x0, &y0, &x1, &y1) == 4 &&
+            x0 <= x1 && y0 <= y1)
+        {
+            parsed = {x0, y0, x1, y1};
+        }
+        return parsed;
+    }
+
+    const XmenTraceBounds &xmenRasterTraceBounds()
+    {
+        static const XmenTraceBounds bounds =
+            parseXmenTraceBounds("PS2X_TRACE_RASTER_BOUNDS");
+        return bounds;
+    }
+
+    const XmenTraceBounds &xmenHudTraceBounds()
+    {
+        static const XmenTraceBounds bounds =
+            parseXmenTraceBounds("PS2X_TRACE_HUD_BOUNDS");
+        return bounds;
+    }
+
+    bool overlapsXmenTraceBounds(const XmenRasterProbeStats &stats,
+                                 const XmenTraceBounds &bounds)
+    {
+        if (bounds.x0 > bounds.x1 || bounds.y0 > bounds.y1 || stats.minCoveredX == UINT32_MAX)
+            return false;
+
+        return static_cast<int32_t>(stats.maxCoveredX) >= bounds.x0 &&
+               static_cast<int32_t>(stats.minCoveredX) <= bounds.x1 &&
+               static_cast<int32_t>(stats.maxCoveredY) >= bounds.y0 &&
+               static_cast<int32_t>(stats.minCoveredY) <= bounds.y1;
     }
 
     void accumulateXmenRasterStats(XmenRasterProbeStats &total, const XmenRasterProbeStats &batch)
@@ -880,6 +977,15 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
                                    batch.state.prim.tme &&
                                    xmenContext.tex0.tbp0 == 12800u &&
                                    xmenContext.tex0.psm == GS_PSM_T8;
+    const bool matchesTargetRaster =
+        batch.debugVsyncTick == tracedRasterTick() &&
+        xmenContext.frame.fbp == 0u &&
+        batch.state.prim.type == GS_PRIM_TRISTRIP;
+    static std::atomic<uint32_t> s_targetRasterTraceCount{0u};
+    const uint32_t targetRasterTraceIndex = matchesTargetRaster
+        ? s_targetRasterTraceCount.fetch_add(1u, std::memory_order_relaxed)
+        : UINT32_MAX;
+    const bool traceTargetRaster = targetRasterTraceIndex < 256u;
     const uint32_t xmenTitleRasterGroup = traceXmenUntextured ? 0u : (traceXmenTextured ? 1u : UINT32_MAX);
     static std::array<std::atomic<uint32_t>, 2> s_xmenTitleRasterTraceCounts{};
     static std::array<XmenRasterProbeStats, 2> s_xmenTitleRasterTotals{};
@@ -893,8 +999,18 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
         logXmenGameplayRaster(s_xmenGameplayRaster);
         s_xmenGameplayRaster = {};
     }
-    const bool traceXmenGameplayRaster = batch.debugPresentCount >= 636u &&
-                                         batch.debugPresentCount <= 644u;
+    static const std::pair<uint32_t, uint32_t> xmenGameplayRasterRange = []
+    {
+        uint32_t start = 636u;
+        uint32_t end = 644u;
+        const char *value = std::getenv("PS2X_XMEN_GAMEPLAY_RASTER_RANGE");
+        if (value && std::sscanf(value, "%u-%u", &start, &end) == 2 && start <= end)
+            return std::pair<uint32_t, uint32_t>{start, end};
+        return std::pair<uint32_t, uint32_t>{636u, 644u};
+    }();
+    const bool traceXmenGameplayRaster =
+        batch.debugPresentCount >= xmenGameplayRasterRange.first &&
+        batch.debugPresentCount <= xmenGameplayRasterRange.second;
     static const uint32_t traceTopChromaPresent = []
     {
         const char *value = std::getenv("PS2X_TRACE_TOP_CHROMA_PRESENT");
@@ -908,6 +1024,7 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
             : UINT32_MAX;
     }();
     const bool traceTopChroma = batch.debugPresentCount == traceTopChromaPresent;
+    const bool traceRasterTick = batch.debugVsyncTick == tracedRasterTick();
     if (traceXmenGameplayRaster && s_xmenGameplayRaster.present == UINT32_MAX)
     {
         s_xmenGameplayRaster.present = batch.debugPresentCount;
@@ -958,9 +1075,14 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
         }
     }
     XmenRasterProbeStats xmenRasterStats{};
-    if (xmenTitleRasterTraceIndex != UINT32_MAX || traceXmenGameplayRaster || traceTopChroma)
+    if (xmenTitleRasterTraceIndex != UINT32_MAX || traceXmenGameplayRaster ||
+        traceTopChroma || traceRasterTick || traceTargetRaster)
         s_xmenActiveRasterProbe = &xmenRasterStats;
-    const auto rasterStart = std::chrono::steady_clock::now();
+    static const bool profileCpuRaster =
+        std::getenv("PS2X_GS_CPU_PROFILE") != nullptr;
+    const auto rasterStart = profileCpuRaster
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     static const bool skipCpuRaster = std::getenv("PS2X_SKIP_CPU_RASTER") != nullptr;
     static const uint32_t skipCpuRasterBeforePresent = []
     {
@@ -979,7 +1101,10 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
     s_xmenActiveRasterProbe = nullptr;
     static uint64_t s_xmenCerebroCaptureTick = UINT64_MAX;
     static uint32_t s_xmenCerebroCaptureBatchCount = 0u;
-    if (batch.debugVsyncTick >= 2255u && s_xmenCerebroCaptureTick == UINT64_MAX)
+    static const bool captureXmenCerebro =
+        std::getenv("PS2X_XMEN_CEREBRO_CAPTURE") != nullptr;
+    if (captureXmenCerebro && batch.debugVsyncTick >= 2255u &&
+        s_xmenCerebroCaptureTick == UINT64_MAX)
         s_xmenCerebroCaptureTick = batch.debugVsyncTick;
     if (batch.debugVsyncTick == s_xmenCerebroCaptureTick)
     {
@@ -1057,6 +1182,277 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
         accumulateXmenRasterStats(s_xmenGameplayRaster.raster, xmenRasterStats);
         if (batch.state.prim.tme)
             accumulateXmenRasterStats(s_xmenGameplayRaster.texturedRaster, xmenRasterStats);
+    }
+    const bool darkRasterCandidate =
+        traceRasterTick &&
+        (xmenContext.frame.fbp == 0u || xmenContext.frame.fbp == 140u) &&
+        batch.state.prim.type == GS_PRIM_TRISTRIP &&
+        xmenRasterStats.framebufferWrites >= 64u &&
+        ((batch.state.prim.tme && xmenRasterStats.textureSamples >= 64u &&
+          xmenRasterStats.nonzeroCombinedRgbSamples * 20u < xmenRasterStats.textureSamples) ||
+         xmenRasterStats.nonzeroRgbWrites * 20u < xmenRasterStats.framebufferWrites);
+    if (darkRasterCandidate)
+    {
+        static std::atomic<uint32_t> s_darkRasterCandidateCount{0u};
+        const uint32_t candidateIndex =
+            s_darkRasterCandidateCount.fetch_add(1u, std::memory_order_relaxed);
+        if (candidateIndex < 256u)
+        {
+            std::fprintf(stdout,
+                         "[xmen-dark-raster] index=%u present=%u tick=%llu gifTag=0x%016llx "
+                         "prim=%u/%u/%u/%u/%u frame=%u/%u/%u/0x%x zbuf=%u/%u/%u "
+                         "tex0=%u/%u/%u/%u/%u/%u/%u/%u/%u/%u/%u texclut=%u/%u/%u "
+                         "texa=%u/%u/%u alpha=0x%llx colclamp=0x%llx clamp=0x%llx "
+                         "v0=%d,%d,%.0f/%u,%u,%u,%u "
+                         "v1=%d,%d,%.0f/%u,%u,%u,%u "
+                         "v2=%d,%d,%.0f/%u,%u,%u,%u "
+                         "covered=%llu alphaReject=%llu depthReject=%llu writes=%llu changed=%llu "
+                         "nonzeroSource=%llu texture=%llu nonzeroTexture=%llu combined=%llu "
+                         "bounds=%u,%u-%u,%u\n",
+                         candidateIndex,
+                         batch.debugPresentCount,
+                         static_cast<unsigned long long>(batch.debugVsyncTick),
+                         static_cast<unsigned long long>(batch.debugGifTagLo),
+                         static_cast<unsigned>(batch.state.prim.type),
+                         batch.state.prim.tme ? 1u : 0u,
+                         batch.state.prim.abe ? 1u : 0u,
+                         batch.state.prim.fst ? 1u : 0u,
+                         batch.state.prim.iip ? 1u : 0u,
+                         xmenContext.frame.fbp,
+                         xmenContext.frame.fbw,
+                         static_cast<unsigned>(xmenContext.frame.psm),
+                         xmenContext.frame.fbmsk,
+                         xmenContext.zbuf.zbp,
+                         static_cast<unsigned>(xmenContext.zbuf.psm),
+                         xmenContext.zbuf.zmask ? 1u : 0u,
+                         xmenContext.tex0.tbp0,
+                         static_cast<unsigned>(xmenContext.tex0.tbw),
+                         static_cast<unsigned>(xmenContext.tex0.psm),
+                         static_cast<unsigned>(xmenContext.tex0.tw),
+                         static_cast<unsigned>(xmenContext.tex0.th),
+                         static_cast<unsigned>(xmenContext.tex0.tcc),
+                         static_cast<unsigned>(xmenContext.tex0.tfx),
+                         xmenContext.tex0.cbp,
+                         static_cast<unsigned>(xmenContext.tex0.cpsm),
+                         static_cast<unsigned>(xmenContext.tex0.csm),
+                         static_cast<unsigned>(xmenContext.tex0.csa),
+                         static_cast<unsigned>(batch.state.texclut.cbw),
+                         static_cast<unsigned>(batch.state.texclut.cou),
+                         static_cast<unsigned>(batch.state.texclut.cov),
+                         static_cast<unsigned>(batch.state.texa.ta0),
+                         batch.state.texa.aem ? 1u : 0u,
+                         static_cast<unsigned>(batch.state.texa.ta1),
+                         static_cast<unsigned long long>(xmenContext.alpha),
+                         static_cast<unsigned long long>(batch.state.colclamp),
+                         static_cast<unsigned long long>(xmenContext.clamp),
+                         screenX(0u),
+                         screenY(0u),
+                         batch.vertices[0u].z,
+                         static_cast<unsigned>(batch.vertices[0u].r),
+                         static_cast<unsigned>(batch.vertices[0u].g),
+                         static_cast<unsigned>(batch.vertices[0u].b),
+                         static_cast<unsigned>(batch.vertices[0u].a),
+                         screenX(1u),
+                         screenY(1u),
+                         batch.vertices[std::min<uint32_t>(1u, batch.vertexCount - 1u)].z,
+                         static_cast<unsigned>(batch.vertices[std::min<uint32_t>(1u, batch.vertexCount - 1u)].r),
+                         static_cast<unsigned>(batch.vertices[std::min<uint32_t>(1u, batch.vertexCount - 1u)].g),
+                         static_cast<unsigned>(batch.vertices[std::min<uint32_t>(1u, batch.vertexCount - 1u)].b),
+                         static_cast<unsigned>(batch.vertices[std::min<uint32_t>(1u, batch.vertexCount - 1u)].a),
+                         screenX(2u),
+                         screenY(2u),
+                         batch.vertices[batch.vertexCount - 1u].z,
+                         static_cast<unsigned>(batch.vertices[batch.vertexCount - 1u].r),
+                         static_cast<unsigned>(batch.vertices[batch.vertexCount - 1u].g),
+                         static_cast<unsigned>(batch.vertices[batch.vertexCount - 1u].b),
+                         static_cast<unsigned>(batch.vertices[batch.vertexCount - 1u].a),
+                         static_cast<unsigned long long>(xmenRasterStats.covered),
+                         static_cast<unsigned long long>(xmenRasterStats.alphaRejected),
+                         static_cast<unsigned long long>(xmenRasterStats.depthRejected),
+                         static_cast<unsigned long long>(xmenRasterStats.framebufferWrites),
+                         static_cast<unsigned long long>(xmenRasterStats.framebufferChangedWrites),
+                         static_cast<unsigned long long>(xmenRasterStats.nonzeroRgbWrites),
+                         static_cast<unsigned long long>(xmenRasterStats.textureSamples),
+                         static_cast<unsigned long long>(xmenRasterStats.nonzeroTextureRgbSamples),
+                         static_cast<unsigned long long>(xmenRasterStats.nonzeroCombinedRgbSamples),
+                         xmenRasterStats.minCoveredX,
+                         xmenRasterStats.minCoveredY,
+                         xmenRasterStats.maxCoveredX,
+                         xmenRasterStats.maxCoveredY);
+            std::fflush(stdout);
+        }
+    }
+    const bool traceWorldRegion = overlapsXmenTraceBounds(
+        xmenRasterStats, xmenRasterTraceBounds());
+    const bool traceHudRegion = overlapsXmenTraceBounds(
+        xmenRasterStats, xmenHudTraceBounds());
+    const bool regionRasterCandidate =
+        traceRasterTick &&
+        (traceWorldRegion || traceHudRegion);
+    if (regionRasterCandidate)
+    {
+        static std::atomic<uint32_t> s_regionRasterCandidateCount{0u};
+        const uint32_t candidateIndex =
+            s_regionRasterCandidateCount.fetch_add(1u, std::memory_order_relaxed);
+        if (candidateIndex < 2048u)
+        {
+            const GSVertex &v0 = batch.vertices[0u];
+            const GSVertex &v1 = batch.vertices[std::min<uint32_t>(1u, batch.vertexCount - 1u)];
+            const GSVertex &v2 = batch.vertices[batch.vertexCount - 1u];
+            std::fprintf(stdout,
+                         "[xmen-region-raster] index=%u region=%u/%u present=%u tick=%llu "
+                         "gifTag=0x%016llx "
+                         "prim=%u/%u/%u/%u/%u/%u frame=%u/%u/%u/0x%x zbuf=%u/%u/%u "
+                         "tex0=%u/%u/%u/%u/%u/%u/%u/%u/%u/%u/%u texclut=%u/%u/%u "
+                         "texa=%u/%u/%u alpha=0x%llx test=0x%llx colclamp=0x%llx clamp=0x%llx "
+                         "v0=%d,%d,%.0f/%u,%u,%u,%u "
+                         "v1=%d,%d,%.0f/%u,%u,%u,%u "
+                         "v2=%d,%d,%.0f/%u,%u,%u,%u "
+                         "covered=%llu alphaReject=%llu destAlphaReject=%llu depthReject=%llu "
+                         "writes=%llu changed=%llu nonzeroSource=%llu texture=%llu "
+                         "nonzeroTexture=%llu combined=%llu bounds=%u,%u-%u,%u\n",
+                         candidateIndex,
+                         traceWorldRegion ? 1u : 0u,
+                         traceHudRegion ? 1u : 0u,
+                         batch.debugPresentCount,
+                         static_cast<unsigned long long>(batch.debugVsyncTick),
+                         static_cast<unsigned long long>(batch.debugGifTagLo),
+                         static_cast<unsigned>(batch.state.prim.type),
+                         batch.state.prim.tme ? 1u : 0u,
+                         batch.state.prim.abe ? 1u : 0u,
+                         batch.state.prim.fst ? 1u : 0u,
+                         batch.state.prim.iip ? 1u : 0u,
+                         batch.state.prim.fge ? 1u : 0u,
+                         xmenContext.frame.fbp,
+                         xmenContext.frame.fbw,
+                         static_cast<unsigned>(xmenContext.frame.psm),
+                         xmenContext.frame.fbmsk,
+                         xmenContext.zbuf.zbp,
+                         static_cast<unsigned>(xmenContext.zbuf.psm),
+                         xmenContext.zbuf.zmask ? 1u : 0u,
+                         xmenContext.tex0.tbp0,
+                         static_cast<unsigned>(xmenContext.tex0.tbw),
+                         static_cast<unsigned>(xmenContext.tex0.psm),
+                         static_cast<unsigned>(xmenContext.tex0.tw),
+                         static_cast<unsigned>(xmenContext.tex0.th),
+                         static_cast<unsigned>(xmenContext.tex0.tcc),
+                         static_cast<unsigned>(xmenContext.tex0.tfx),
+                         xmenContext.tex0.cbp,
+                         static_cast<unsigned>(xmenContext.tex0.cpsm),
+                         static_cast<unsigned>(xmenContext.tex0.csm),
+                         static_cast<unsigned>(xmenContext.tex0.csa),
+                         static_cast<unsigned>(batch.state.texclut.cbw),
+                         static_cast<unsigned>(batch.state.texclut.cou),
+                         static_cast<unsigned>(batch.state.texclut.cov),
+                         static_cast<unsigned>(batch.state.texa.ta0),
+                         batch.state.texa.aem ? 1u : 0u,
+                         static_cast<unsigned>(batch.state.texa.ta1),
+                         static_cast<unsigned long long>(xmenContext.alpha),
+                         static_cast<unsigned long long>(xmenContext.test),
+                         static_cast<unsigned long long>(batch.state.colclamp),
+                         static_cast<unsigned long long>(xmenContext.clamp),
+                         screenX(0u), screenY(0u), v0.z,
+                         static_cast<unsigned>(v0.r), static_cast<unsigned>(v0.g),
+                         static_cast<unsigned>(v0.b), static_cast<unsigned>(v0.a),
+                         screenX(1u), screenY(1u), v1.z,
+                         static_cast<unsigned>(v1.r), static_cast<unsigned>(v1.g),
+                         static_cast<unsigned>(v1.b), static_cast<unsigned>(v1.a),
+                         screenX(2u), screenY(2u), v2.z,
+                         static_cast<unsigned>(v2.r), static_cast<unsigned>(v2.g),
+                         static_cast<unsigned>(v2.b), static_cast<unsigned>(v2.a),
+                         static_cast<unsigned long long>(xmenRasterStats.covered),
+                         static_cast<unsigned long long>(xmenRasterStats.alphaRejected),
+                         static_cast<unsigned long long>(xmenRasterStats.destinationAlphaRejected),
+                         static_cast<unsigned long long>(xmenRasterStats.depthRejected),
+                         static_cast<unsigned long long>(xmenRasterStats.framebufferWrites),
+                         static_cast<unsigned long long>(xmenRasterStats.framebufferChangedWrites),
+                         static_cast<unsigned long long>(xmenRasterStats.nonzeroRgbWrites),
+                         static_cast<unsigned long long>(xmenRasterStats.textureSamples),
+                         static_cast<unsigned long long>(xmenRasterStats.nonzeroTextureRgbSamples),
+                         static_cast<unsigned long long>(xmenRasterStats.nonzeroCombinedRgbSamples),
+                         xmenRasterStats.minCoveredX,
+                         xmenRasterStats.minCoveredY,
+                         xmenRasterStats.maxCoveredX,
+                         xmenRasterStats.maxCoveredY);
+            std::fflush(stdout);
+        }
+    }
+    if (traceTargetRaster)
+    {
+        const uint32_t minIncomingZ = xmenRasterStats.minIncomingZ == UINT32_MAX
+            ? 0u
+            : xmenRasterStats.minIncomingZ;
+        const uint32_t minStoredZ = xmenRasterStats.minStoredZ == UINT32_MAX
+            ? 0u
+            : xmenRasterStats.minStoredZ;
+        std::fprintf(stdout,
+                     "[gs-raster-target] index=%u present=%u tick=%llu "
+                     "prim=%u/%u/%u/%u/%u frame=%u/%u/%u/0x%x zbuf=%u/%u/%u "
+                     "test=0x%016llx tex0=%u/%u/%u/%u/%u/%u/%u/%u/%u/%u "
+                     "offset=%d,%d v0=%d,%d,%.0f v1=%d,%d,%.0f v2=%d,%d,%.0f "
+                     "covered=%llu alphaReject=%llu destAlphaReject=%llu depthReject=%llu "
+                     "fbWrites=%llu changed=%llu nonzeroSource=%llu sourceSum=%llu sourceMax=%u "
+                     "depthWrites=%llu textureSamples=%llu nonzeroTexture=%llu nonzeroCombined=%llu "
+                     "bounds=%u,%u-%u,%u incomingZ=%u-%u storedZ=%u-%u\n",
+                     targetRasterTraceIndex,
+                     batch.debugPresentCount,
+                     static_cast<unsigned long long>(batch.debugVsyncTick),
+                     static_cast<unsigned>(batch.state.prim.type),
+                     batch.state.prim.tme ? 1u : 0u,
+                     batch.state.prim.abe ? 1u : 0u,
+                     batch.state.prim.fst ? 1u : 0u,
+                     batch.state.prim.iip ? 1u : 0u,
+                     xmenContext.frame.fbp,
+                     xmenContext.frame.fbw,
+                     static_cast<unsigned>(xmenContext.frame.psm),
+                     xmenContext.frame.fbmsk,
+                     xmenContext.zbuf.zbp,
+                     static_cast<unsigned>(xmenContext.zbuf.psm),
+                     xmenContext.zbuf.zmask ? 1u : 0u,
+                     static_cast<unsigned long long>(xmenContext.test),
+                     xmenContext.tex0.tbp0,
+                     static_cast<unsigned>(xmenContext.tex0.tbw),
+                     static_cast<unsigned>(xmenContext.tex0.psm),
+                     static_cast<unsigned>(xmenContext.tex0.tw),
+                     static_cast<unsigned>(xmenContext.tex0.th),
+                     static_cast<unsigned>(xmenContext.tex0.tcc),
+                     static_cast<unsigned>(xmenContext.tex0.tfx),
+                     xmenContext.tex0.cbp,
+                     static_cast<unsigned>(xmenContext.tex0.cpsm),
+                     static_cast<unsigned>(xmenContext.tex0.csa),
+                     submitOfx,
+                     submitOfy,
+                     screenX(0u),
+                     screenY(0u),
+                     batch.vertices[0u].z,
+                     screenX(1u),
+                     screenY(1u),
+                     batch.vertices[std::min<uint32_t>(1u, batch.vertexCount - 1u)].z,
+                     screenX(2u),
+                     screenY(2u),
+                     batch.vertices[batch.vertexCount - 1u].z,
+                     static_cast<unsigned long long>(xmenRasterStats.covered),
+                     static_cast<unsigned long long>(xmenRasterStats.alphaRejected),
+                     static_cast<unsigned long long>(xmenRasterStats.destinationAlphaRejected),
+                     static_cast<unsigned long long>(xmenRasterStats.depthRejected),
+                     static_cast<unsigned long long>(xmenRasterStats.framebufferWrites),
+                     static_cast<unsigned long long>(xmenRasterStats.framebufferChangedWrites),
+                     static_cast<unsigned long long>(xmenRasterStats.nonzeroRgbWrites),
+                     static_cast<unsigned long long>(xmenRasterStats.sourceChannelSum),
+                     xmenRasterStats.maxSourceChannel,
+                     static_cast<unsigned long long>(xmenRasterStats.depthWrites),
+                     static_cast<unsigned long long>(xmenRasterStats.textureSamples),
+                     static_cast<unsigned long long>(xmenRasterStats.nonzeroTextureRgbSamples),
+                     static_cast<unsigned long long>(xmenRasterStats.nonzeroCombinedRgbSamples),
+                     xmenRasterStats.minCoveredX == UINT32_MAX ? 0u : xmenRasterStats.minCoveredX,
+                     xmenRasterStats.minCoveredY == UINT32_MAX ? 0u : xmenRasterStats.minCoveredY,
+                     xmenRasterStats.maxCoveredX,
+                     xmenRasterStats.maxCoveredY,
+                     minIncomingZ,
+                     xmenRasterStats.maxIncomingZ,
+                     minStoredZ,
+                     xmenRasterStats.maxStoredZ);
+        std::fflush(stdout);
     }
     if (traceTopChroma && xmenRasterStats.topChromaFramebufferWrites != 0u)
     {
@@ -1151,8 +1547,12 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
     }
     static bool dumpedTopChromaTexture = false;
     if (traceTopChroma && !dumpedTopChromaTexture &&
-        xmenContext.tex0.tbp0 == 11584u && xmenContext.tex0.psm == GS_PSM_T8 &&
-        xmenContext.tex0.cbp == 11616u)
+        batch.state.prim.tme && xmenRasterStats.topChromaSourceWrites != 0u &&
+        (xmenContext.tex0.psm == GS_PSM_T8 ||
+         xmenContext.tex0.psm == GS_PSM_T8H ||
+         xmenContext.tex0.psm == GS_PSM_T4 ||
+         xmenContext.tex0.psm == GS_PSM_T4HL ||
+         xmenContext.tex0.psm == GS_PSM_T4HH))
     {
         dumpedTopChromaTexture = true;
         const uint32_t width = 1u << std::min<uint32_t>(xmenContext.tex0.tw, 10u);
@@ -1217,8 +1617,17 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
         if (paletteFile)
             std::fclose(paletteFile);
         std::fprintf(stdout,
-                     "[xmen-top-chroma-dump] size=%ux%u highPalette=%u highTexels=%llu "
-                     "wrote=%u/%u/%u\n",
+                     "[xmen-top-chroma-dump] tex0=%u/%u/%u/%u/%u cbp=%u/%u/%u/%u "
+                     "size=%ux%u highPalette=%u highTexels=%llu wrote=%u/%u/%u\n",
+                     xmenContext.tex0.tbp0,
+                     static_cast<unsigned>(xmenContext.tex0.tbw),
+                     static_cast<unsigned>(xmenContext.tex0.psm),
+                     static_cast<unsigned>(xmenContext.tex0.tw),
+                     static_cast<unsigned>(xmenContext.tex0.th),
+                     xmenContext.tex0.cbp,
+                     static_cast<unsigned>(xmenContext.tex0.cpsm),
+                     static_cast<unsigned>(xmenContext.tex0.csm),
+                     static_cast<unsigned>(xmenContext.tex0.csa),
                      width, height, highChromaPaletteEntries,
                      static_cast<unsigned long long>(highChromaTexels),
                      imageFile ? 1u : 0u, indexFile ? 1u : 0u, paletteFile ? 1u : 0u);
@@ -1311,12 +1720,6 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
                      frameFile ? 1u : 0u);
         std::fflush(stdout);
     }
-    const uint64_t rasterNanoseconds = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - rasterStart).count());
-    const uint64_t submitCount = s_profileSubmitCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
-    const uint64_t totalRasterNanoseconds =
-        s_profileRasterNanoseconds.fetch_add(rasterNanoseconds, std::memory_order_relaxed) + rasterNanoseconds;
     if (xmenTitleRasterTraceIndex < 32u)
     {
         const uint32_t minIncomingZ = xmenRasterStats.minIncomingZ == UINT32_MAX ? 0u : xmenRasterStats.minIncomingZ;
@@ -1365,14 +1768,25 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
                      xmenRasterStats.maxStoredZ);
         std::fflush(stdout);
     }
-    if ((submitCount & 511u) == 0u)
+    if (profileCpuRaster)
     {
-        std::fprintf(stderr,
-                     "[gs:cpu-profile] submits=%llu raster-ms=%.3f average-us=%.3f\n",
-                     static_cast<unsigned long long>(submitCount),
-                     static_cast<double>(totalRasterNanoseconds) / 1000000.0,
-                     static_cast<double>(totalRasterNanoseconds) /
-                         static_cast<double>(submitCount) / 1000.0);
+        const uint64_t rasterNanoseconds = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - rasterStart).count());
+        const uint64_t submitCount =
+            s_profileSubmitCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        const uint64_t totalRasterNanoseconds =
+            s_profileRasterNanoseconds.fetch_add(rasterNanoseconds, std::memory_order_relaxed) +
+            rasterNanoseconds;
+        if ((submitCount & 511u) == 0u)
+        {
+            std::fprintf(stderr,
+                         "[gs:cpu-profile] submits=%llu raster-ms=%.3f average-us=%.3f\n",
+                         static_cast<unsigned long long>(submitCount),
+                         static_cast<double>(totalRasterNanoseconds) / 1000000.0,
+                         static_cast<double>(totalRasterNanoseconds) /
+                             static_cast<double>(submitCount) / 1000.0);
+        }
     }
     if (traceSubmitProbe)
     {
@@ -1930,7 +2344,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
             s_xmenActiveRasterProbe->maxSourceChannel = std::max<uint32_t>(
                 s_xmenActiveRasterProbe->maxSourceChannel,
                 std::max<uint32_t>(srcR, std::max<uint32_t>(srcG, srcB)));
-            if (y >= 96 && y < 150 && isHighChroma(srcR, srcG, srcB))
+            if (isInXmenChromaTraceBounds(x, y) && isHighChroma(srcR, srcG, srcB))
                 ++s_xmenActiveRasterProbe->topChromaSourceWrites;
         }
 
@@ -1961,10 +2375,16 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
                 };
                 int cAlpha = (csel == 0) ? a : (csel == 1) ? da
                                                            : fix;
+                auto finalizeBlendChannel = [&](int value) -> uint8_t
+                {
+                    return (state.colclamp & 0x1u) != 0u
+                        ? clampU8(value)
+                        : static_cast<uint8_t>(value);
+                };
 
-                r = clampU8(((pickRGB(asel, r, dr) - pickRGB(bsel, r, dr)) * cAlpha >> 7) + pickRGB(dsel, r, dr));
-                g = clampU8(((pickRGB(asel, g, dg) - pickRGB(bsel, g, dg)) * cAlpha >> 7) + pickRGB(dsel, g, dg));
-                b = clampU8(((pickRGB(asel, b, db) - pickRGB(bsel, b, db)) * cAlpha >> 7) + pickRGB(dsel, b, db));
+                r = finalizeBlendChannel(((pickRGB(asel, r, dr) - pickRGB(bsel, r, dr)) * cAlpha >> 7) + pickRGB(dsel, r, dr));
+                g = finalizeBlendChannel(((pickRGB(asel, g, dg) - pickRGB(bsel, g, dg)) * cAlpha >> 7) + pickRGB(dsel, g, dg));
+                b = finalizeBlendChannel(((pickRGB(asel, b, db) - pickRGB(bsel, b, db)) * cAlpha >> 7) + pickRGB(dsel, b, db));
             }
             else
             {
@@ -2016,7 +2436,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
             const uint8_t storedR = static_cast<uint8_t>(storedRgba);
             const uint8_t storedG = static_cast<uint8_t>(storedRgba >> 8u);
             const uint8_t storedB = static_cast<uint8_t>(storedRgba >> 16u);
-            if (y >= 96 && y < 150 && isHighChroma(storedR, storedG, storedB))
+            if (isInXmenChromaTraceBounds(x, y) && isHighChroma(storedR, storedG, storedB))
             {
                 ++s_xmenActiveRasterProbe->topChromaFramebufferWrites;
                 const uint32_t chromaX = static_cast<uint32_t>(x);
@@ -2046,9 +2466,14 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
                                   uint8_t sourcePsm)
 {
     const uint32_t clutIndex = resolveClutIndex(index, cpsm, csm, csa, sourcePsm);
-    const uint32_t clutWidth = (state.texclut.cbw != 0u) ? static_cast<uint32_t>(state.texclut.cbw) : 1u;
-    const uint32_t clutX = static_cast<uint32_t>(state.texclut.cou) + (clutIndex & 0x0Fu);
-    const uint32_t clutY = static_cast<uint32_t>(state.texclut.cov) + (clutIndex >> 4);
+    const bool csm2 = csm != 0u;
+    const uint32_t clutWidth = csm2 && state.texclut.cbw != 0u
+        ? static_cast<uint32_t>(state.texclut.cbw)
+        : 1u;
+    const uint32_t clutX = (csm2 ? static_cast<uint32_t>(state.texclut.cou) << 4u : 0u) +
+                           (clutIndex & 0x0Fu);
+    const uint32_t clutY = (csm2 ? static_cast<uint32_t>(state.texclut.cov) : 0u) +
+                           (clutIndex >> 4);
 
     switch (cpsm)
     {
