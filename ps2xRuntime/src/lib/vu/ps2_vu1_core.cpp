@@ -1183,10 +1183,62 @@ void VU1Interpreter::finishXgkick()
         std::memcpy(&tagHi,
                     m_xgkick.packet.data() + sizeof(tagLo),
                     sizeof(tagHi));
+
+        uint32_t rgbaCount = 0u;
+        uint32_t zeroRgbCount = 0u;
+        uint8_t rgbaMin[4] = {0xFFu, 0xFFu, 0xFFu, 0xFFu};
+        uint8_t rgbaMax[4] = {0u, 0u, 0u, 0u};
+        const uint32_t packetBytes = std::min<uint32_t>(
+            m_xgkick.totalBytes,
+            static_cast<uint32_t>(m_xgkick.packet.size()));
+        const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+        const uint32_t format = static_cast<uint32_t>((tagLo >> 58u) & 0x3u);
+        uint32_t nreg = static_cast<uint32_t>((tagLo >> 60u) & 0xFu);
+        if (nreg == 0u)
+            nreg = 16u;
+        if (format == 0u)
+        {
+            uint32_t payloadOffset = 16u;
+            for (uint32_t loop = 0u; loop < nloop; ++loop)
+            {
+                for (uint32_t reg = 0u; reg < nreg; ++reg)
+                {
+                    if (payloadOffset + 16u > packetBytes)
+                        break;
+                    const uint32_t descriptor =
+                        static_cast<uint32_t>((tagHi >> (reg * 4u)) & 0xFu);
+                    if (descriptor == 0x1u)
+                    {
+                        uint32_t lanes[4]{};
+                        std::memcpy(lanes,
+                                    m_xgkick.packet.data() + payloadOffset,
+                                    sizeof(lanes));
+                        uint8_t channels[4]{};
+                        for (uint32_t channel = 0u; channel < 4u; ++channel)
+                        {
+                            channels[channel] =
+                                static_cast<uint8_t>(lanes[channel] & 0xFFu);
+                            rgbaMin[channel] =
+                                std::min(rgbaMin[channel], channels[channel]);
+                            rgbaMax[channel] =
+                                std::max(rgbaMax[channel], channels[channel]);
+                        }
+                        if (channels[0] == 0u && channels[1] == 0u &&
+                            channels[2] == 0u)
+                        {
+                            ++zeroRgbCount;
+                        }
+                        ++rgbaCount;
+                    }
+                    payloadOffset += 16u;
+                }
+            }
+        }
         std::fprintf(stderr,
                      "[xmen-vu1:xgkick-census] tick=%llu program=0x%x issuePc=0x%x "
                      "source=0x%x bytes=%u copied=%u issueCycle=%llu finishCycle=%llu "
-                     "tagLo=0x%016llx tagHi=0x%016llx\n",
+                     "tagLo=0x%016llx tagHi=0x%016llx rgba=%u zeroRgb=%u "
+                     "rgbaMin=%u,%u,%u,%u rgbaMax=%u,%u,%u,%u\n",
                      static_cast<unsigned long long>(xmenXgkickIssueTick),
                      xmenXgkickProgramStart,
                      xmenXgkickIssuePc,
@@ -1196,7 +1248,14 @@ void VU1Interpreter::finishXgkick()
                      static_cast<unsigned long long>(m_xgkick.issueCycle),
                      static_cast<unsigned long long>(m_cycle),
                      static_cast<unsigned long long>(tagLo),
-                     static_cast<unsigned long long>(tagHi));
+                     static_cast<unsigned long long>(tagHi),
+                     rgbaCount,
+                     zeroRgbCount,
+                     rgbaCount != 0u ? rgbaMin[0] : 0u,
+                     rgbaCount != 0u ? rgbaMin[1] : 0u,
+                     rgbaCount != 0u ? rgbaMin[2] : 0u,
+                     rgbaCount != 0u ? rgbaMin[3] : 0u,
+                     rgbaMax[0], rgbaMax[1], rgbaMax[2], rgbaMax[3]);
         std::fflush(stderr);
     }
 
