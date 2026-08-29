@@ -65,6 +65,9 @@ namespace
     constexpr uint32_t kDelayedDmacWaitPc = 0x00160600u;
     constexpr uint32_t kDelayedDmacResumePc = 0x00160610u;
     constexpr uint32_t kDelayedDmacHandlerPc = 0x00160620u;
+    constexpr uint32_t kCoalescedDmacWaitPc = 0x00160700u;
+    constexpr uint32_t kCoalescedDmacResumePc = 0x00160710u;
+    constexpr uint32_t kCoalescedDmacHandlerPc = 0x00160720u;
 
     constexpr uint32_t kTimer2Count = 0x10001000u;
     constexpr uint32_t kTimer2Mode = 0x10001010u;
@@ -88,6 +91,10 @@ namespace
     std::atomic<bool> g_timer2Resumed{false};
     uint64_t g_delayedDmacStartCycle = 0u;
     uint64_t g_delayedDmacHandlerCycle = 0u;
+    uint32_t g_coalescedDmacCalls = 0u;
+    uint32_t g_independentDmacCalls = 0u;
+    uint64_t g_coalescedDmacStartCycle = 0u;
+    uint64_t g_coalescedDmacHandlerCycle = 0u;
 
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
@@ -326,6 +333,44 @@ namespace
         ctx->pc = 0u;
         runtime->requestStop();
     }
+    void schedulerCoalescedDmacHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t cause = getRegU32(ctx, 4);
+        if (cause == 8u)
+        {
+            ++g_coalescedDmacCalls;
+            if (g_coalescedDmacHandlerCycle == 0u)
+            {
+                g_coalescedDmacHandlerCycle = runtime->eeScheduler().currentEeCycle();
+            }
+        }
+        else if (cause == 9u)
+        {
+            ++g_independentDmacCalls;
+            runtime->eeScheduler().signalSemaphore(g_testSemaphoreId, true);
+        }
+        ctx->pc = 0u;
+    }
+
+    void schedulerCoalescedDmacWait(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        g_testSemaphoreId = scheduler.createSemaphore(0, 1, 0u, 0u);
+        scheduler.addIrqHandler(true, 8u, kCoalescedDmacHandlerPc, true, 0u, 0u, 0u);
+        scheduler.addIrqHandler(true, 9u, kCoalescedDmacHandlerPc, true, 0u, 0u, 0u);
+        g_coalescedDmacStartCycle = scheduler.currentEeCycle();
+        scheduler.scheduleDmacIrq(8u, 1024u);
+        scheduler.scheduleDmacIrq(8u, 2048u);
+        scheduler.scheduleDmacIrq(9u, 3072u);
+        ctx->pc = kCoalescedDmacResumePc;
+        scheduler.waitSemaphore(g_testSemaphoreId);
+    }
+
+    void schedulerCoalescedDmacResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
 }
 
 void register_ps2_runtime_interrupt_tests()
@@ -519,6 +564,31 @@ void register_ps2_runtime_interrupt_tests()
                      "scheduled DMAC IRQ should run its handler before resuming the waiter");
             t.IsTrue(g_delayedDmacHandlerCycle >= g_delayedDmacStartCycle + 1024u,
                      "DMAC handler must not run before its requested EE cycle deadline");
+        });
+
+        tc.Run("pending DMAC causes coalesce independently", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kCoalescedDmacWaitPc, schedulerCoalescedDmacWait);
+            env.runtime.registerFunction(kCoalescedDmacResumePc, schedulerCoalescedDmacResume);
+            env.runtime.registerFunction(kCoalescedDmacHandlerPc, schedulerCoalescedDmacHandler);
+
+            g_coalescedDmacCalls = 0u;
+            g_independentDmacCalls = 0u;
+            g_coalescedDmacStartCycle = 0u;
+            g_coalescedDmacHandlerCycle = 0u;
+            R5900Context mainContext{};
+            mainContext.pc = kCoalescedDmacWaitPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            t.Equals(g_coalescedDmacCalls, 1u,
+                     "multiple pending completions for one DMAC cause should dispatch once");
+            t.Equals(g_independentDmacCalls, 1u,
+                     "a pending completion for another DMAC cause should remain independent");
+            t.IsTrue(g_coalescedDmacHandlerCycle >= g_coalescedDmacStartCycle + 1024u &&
+                         g_coalescedDmacHandlerCycle < g_coalescedDmacStartCycle + 2048u,
+                     "coalescing should preserve the earliest completion deadline");
         });
 
         tc.Run("iSignalSema defers selection until IRQ return", [](TestCase &t)
