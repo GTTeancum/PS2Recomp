@@ -89,6 +89,48 @@ namespace
         return config;
     }
 
+    struct XmenXgkickCensusConfig
+    {
+        bool enabled = false;
+        uint64_t minTick = 0u;
+        uint32_t maxEntries = 256u;
+    };
+
+    const XmenXgkickCensusConfig &xmenXgkickCensusConfig()
+    {
+        static const XmenXgkickCensusConfig config = []()
+        {
+            XmenXgkickCensusConfig result{};
+            const char *tickValue =
+                std::getenv("PS2X_TRACE_XGKICK_CENSUS_MIN_TICK");
+            if (!tickValue || tickValue[0] == '\0')
+                return result;
+
+            char *tickEnd = nullptr;
+            result.minTick = std::strtoull(tickValue, &tickEnd, 0);
+            if (!tickEnd || tickEnd == tickValue || *tickEnd != '\0')
+                return XmenXgkickCensusConfig{};
+
+            const char *maxValue =
+                std::getenv("PS2X_TRACE_XGKICK_CENSUS_MAX");
+            if (maxValue && maxValue[0] != '\0')
+            {
+                char *maxEnd = nullptr;
+                const unsigned long parsedMax =
+                    std::strtoul(maxValue, &maxEnd, 0);
+                if (maxEnd && maxEnd != maxValue && *maxEnd == '\0' &&
+                    parsedMax > 0u)
+                {
+                    result.maxEntries = static_cast<uint32_t>(
+                        std::min<unsigned long>(parsedMax, 65536u));
+                }
+            }
+            result.enabled = true;
+            return result;
+        }();
+        return config;
+    }
+
     struct XmenTitleVuTrace
     {
         bool active = false;
@@ -1127,6 +1169,35 @@ void VU1Interpreter::finishXgkick()
                          static_cast<unsigned long long>(targetTagHi));
             std::fflush(stderr);
         }
+    }
+
+    const XmenXgkickCensusConfig &censusConfig = xmenXgkickCensusConfig();
+    static uint32_t censusTraceCount = 0u;
+    if (censusConfig.enabled && m_xgkick.totalBytes >= 16u &&
+        xmenXgkickIssueTick >= censusConfig.minTick &&
+        censusTraceCount++ < censusConfig.maxEntries)
+    {
+        uint64_t tagLo = 0u;
+        uint64_t tagHi = 0u;
+        std::memcpy(&tagLo, m_xgkick.packet.data(), sizeof(tagLo));
+        std::memcpy(&tagHi,
+                    m_xgkick.packet.data() + sizeof(tagLo),
+                    sizeof(tagHi));
+        std::fprintf(stderr,
+                     "[xmen-vu1:xgkick-census] tick=%llu program=0x%x issuePc=0x%x "
+                     "source=0x%x bytes=%u copied=%u issueCycle=%llu finishCycle=%llu "
+                     "tagLo=0x%016llx tagHi=0x%016llx\n",
+                     static_cast<unsigned long long>(xmenXgkickIssueTick),
+                     xmenXgkickProgramStart,
+                     xmenXgkickIssuePc,
+                     m_xgkick.sourceAddress,
+                     m_xgkick.totalBytes,
+                     m_xgkick.copiedBytes,
+                     static_cast<unsigned long long>(m_xgkick.issueCycle),
+                     static_cast<unsigned long long>(m_cycle),
+                     static_cast<unsigned long long>(tagLo),
+                     static_cast<unsigned long long>(tagHi));
+        std::fflush(stderr);
     }
 
     static uint32_t finishTraceCount = 0u;
