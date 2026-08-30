@@ -223,6 +223,7 @@ void GS::reset()
     m_vtxCount = 0;
     m_vtxIndex = 0;
     m_currentGifTagLo = 0;
+    m_currentGifPacketTagLo = 0;
     m_traceCurrentGifPacket = false;
     m_preferredDisplaySourceFrame = {};
     m_preferredDisplayDestFbp = 0;
@@ -889,8 +890,10 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     }
 
     const uint64_t previousGifTagLo = m_currentGifTagLo;
+    const uint64_t previousGifPacketTagLo = m_currentGifPacketTagLo;
     const bool previousTracePacket = m_traceCurrentGifPacket;
     m_currentGifTagLo = firstTagLo;
+    m_currentGifPacketTagLo = firstTagLo;
     m_traceCurrentGifPacket = traceTargetPacket;
 
     PS2_IF_AGRESSIVE_LOGS({
@@ -920,6 +923,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         uint64_t tagLo = loadLE64(data + offset);
         uint64_t tagHi = loadLE64(data + offset + 8);
         offset += 16;
+        m_currentGifTagLo = tagLo;
 
         m_curQ = 1.0f;
 
@@ -976,6 +980,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                                          nreg);
                         }
                         m_currentGifTagLo = previousGifTagLo;
+                        m_currentGifPacketTagLo = previousGifPacketTagLo;
                         m_traceCurrentGifPacket = previousTracePacket;
                         return;
                     }
@@ -1019,6 +1024,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                                          nreg);
                         }
                         m_currentGifTagLo = previousGifTagLo;
+                        m_currentGifPacketTagLo = previousGifPacketTagLo;
                         m_traceCurrentGifPacket = previousTracePacket;
                         return;
                     }
@@ -1051,6 +1057,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         }
     }
     m_currentGifTagLo = previousGifTagLo;
+    m_currentGifPacketTagLo = previousGifPacketTagLo;
     m_traceCurrentGifPacket = previousTracePacket;
 }
 
@@ -1064,6 +1071,8 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         return false;
 
     const uint64_t previousGifTagLo = m_currentGifTagLo;
+    const uint64_t previousGifPacketTagLo = m_currentGifPacketTagLo;
+    m_currentGifPacketTagLo = loadLE64(data);
     const bool processed = visitPackedGifPacket(data, sizeBytes, [&](const PackedGifPacketTag &tag)
                                                 {
         m_currentGifTagLo = tag.lo;
@@ -1089,6 +1098,7 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
         return true; });
     m_currentGifTagLo = previousGifTagLo;
+    m_currentGifPacketTagLo = previousGifPacketTagLo;
 
     if (!processed)
         return false;
@@ -1444,8 +1454,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
                                   ? static_cast<uint32_t>(value & 0x3FFFu)
                                   : m_ctx[contextIndex].tex0.tbp0;
         const uint32_t cbp = static_cast<uint32_t>((value >> 37u) & 0x3FFFu);
-        const bool targetBinding =
-            tbp0 == 11584u || tbp0 == 16320u || cbp == 11616u || cbp == 16352u;
+        const bool targetBinding = tbp0 == 15168u || cbp == 16256u;
         if (targetBinding)
         {
             static std::atomic<uint32_t> traceCount{0u};
@@ -1456,13 +1465,15 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
                                                ? m_privRegs->vsyncTick.load(std::memory_order_relaxed)
                                                : 0u;
                 std::fprintf(stderr,
-                             "[gs:texture-binding] index=%u present=%u tick=%llu reg=0x%x context=%u raw=0x%016llx tbp=%u tbw=%u psm=0x%x tw=%u th=%u cbp=%u cpsm=0x%x csm=%u csa=%u cld=%u\n",
+                             "[gs:texture-binding] index=%u present=%u tick=%llu reg=0x%x context=%u raw=0x%016llx gifTag=0x%016llx packetTag=0x%016llx tbp=%u tbw=%u psm=0x%x tw=%u th=%u cbp=%u cpsm=0x%x csm=%u csa=%u cld=%u\n",
                              index,
                              s_xmenPresentTraceCount.load(std::memory_order_relaxed),
                              static_cast<unsigned long long>(vsyncTick),
                              static_cast<unsigned>(regAddr),
                              contextIndex,
                              static_cast<unsigned long long>(value),
+                             static_cast<unsigned long long>(m_currentGifTagLo),
+                             static_cast<unsigned long long>(m_currentGifPacketTagLo),
                              tbp0,
                              tex0Write ? static_cast<unsigned>((value >> 14u) & 0x3Fu)
                                        : static_cast<unsigned>(m_ctx[contextIndex].tex0.tbw),
@@ -1607,6 +1618,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
+        if (m_backend)
+            m_backend->LoadClut(t, m_texclut);
         break;
     }
     case GS_REG_CLAMP_1:
@@ -1637,6 +1650,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
+        if (m_backend)
+            m_backend->LoadClut(t, m_texclut);
         break;
     }
     case GS_REG_XYOFFSET_1:

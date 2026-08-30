@@ -1,9 +1,12 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include "ps2_vif_trace.h"
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
+#include <utility>
 
 enum VIFCmd : uint8_t
 {
@@ -32,6 +35,9 @@ enum VIFCmd : uint8_t
 namespace
 {
     constexpr uint8_t kGifFmtImage = 2u;
+    thread_local std::unordered_map<
+        const uint8_t *, std::vector<Vif1TraceProvenance>> vif1TraceProvenance;
+    thread_local const std::vector<Vif1TraceProvenance> *currentVif1TraceProvenance = nullptr;
 
     struct XmenTargetVifWriteConfig
     {
@@ -40,6 +46,9 @@ namespace
         uint32_t lastQword = 0u;
         uint32_t maxWrites = 512u;
         uint64_t minTick = 0u;
+        bool matchAfterWord0 = false;
+        uint32_t afterWordIndex = 0u;
+        uint32_t afterWord0 = 0u;
     };
 
     const XmenTargetVifWriteConfig &xmenTargetVifWriteConfig()
@@ -84,6 +93,36 @@ namespace
                     result.maxWrites = static_cast<uint32_t>(parsedMaxWrites);
                 }
             }
+
+            const char *afterWord0Value =
+                std::getenv("PS2X_TRACE_VIF_AFTER_WORD0");
+            if (afterWord0Value && afterWord0Value[0] != '\0')
+            {
+                char *afterWord0End = nullptr;
+                const unsigned long parsedAfterWord0 =
+                    std::strtoul(afterWord0Value, &afterWord0End, 0);
+                if (afterWord0End && afterWord0End != afterWord0Value &&
+                    *afterWord0End == '\0')
+                {
+                    result.matchAfterWord0 = true;
+                    result.afterWord0 = static_cast<uint32_t>(parsedAfterWord0);
+                }
+            }
+            const char *afterWordIndexValue =
+                std::getenv("PS2X_TRACE_VIF_AFTER_WORD_INDEX");
+            if (afterWordIndexValue && afterWordIndexValue[0] != '\0')
+            {
+                char *afterWordIndexEnd = nullptr;
+                const unsigned long parsedAfterWordIndex =
+                    std::strtoul(afterWordIndexValue, &afterWordIndexEnd, 0);
+                if (afterWordIndexEnd &&
+                    afterWordIndexEnd != afterWordIndexValue &&
+                    *afterWordIndexEnd == '\0' && parsedAfterWordIndex < 4u)
+                {
+                    result.afterWordIndex =
+                        static_cast<uint32_t>(parsedAfterWordIndex);
+                }
+            }
             result.enabled = true;
             return result;
         }();
@@ -122,6 +161,49 @@ namespace
 
         return static_cast<uint32_t>(tagLo & 0x7FFFu);
     }
+}
+
+void registerVif1TraceProvenance(
+    const uint8_t *data,
+    std::vector<Vif1TraceProvenance> &&ranges)
+{
+    if (data && !ranges.empty())
+        vif1TraceProvenance[data] = std::move(ranges);
+}
+
+void beginVif1TraceProvenance(const uint8_t *data)
+{
+    currentVif1TraceProvenance = nullptr;
+    const auto entry = vif1TraceProvenance.find(data);
+    if (entry != vif1TraceProvenance.end())
+        currentVif1TraceProvenance = &entry->second;
+}
+
+void endVif1TraceProvenance(const uint8_t *data)
+{
+    currentVif1TraceProvenance = nullptr;
+    vif1TraceProvenance.erase(data);
+}
+
+bool resolveVif1TraceProvenance(
+    size_t streamOffset,
+    uint32_t &sourceAddr,
+    uint32_t &tagAddr)
+{
+    if (!currentVif1TraceProvenance)
+        return false;
+
+    for (const Vif1TraceProvenance &range : *currentVif1TraceProvenance)
+    {
+        if (streamOffset >= range.flatStart && streamOffset < range.flatEnd)
+        {
+            sourceAddr = range.sourceAddr +
+                static_cast<uint32_t>(streamOffset - range.flatStart);
+            tagAddr = range.tagAddr;
+            return true;
+        }
+    }
+    return false;
 }
 
 void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
@@ -902,6 +984,42 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                         handledFormat = false;
                     }
 
+                    // The VIF expands V2 to XYXY. V3's otherwise-indeterminate W lane
+                    // overlaps the next packed source component; games rely on both
+                    // behaviors, so preserve them when the overlapping bytes are present.
+                    if (handledFormat && components == 2)
+                    {
+                        decompressed[2] = decompressed[0];
+                        decompressed[3] = decompressed[1];
+                    }
+                    else if (handledFormat && components == 3)
+                    {
+                        const size_t fourthComponentOffset =
+                            static_cast<size_t>(srcVec - data) +
+                            3u * static_cast<size_t>(bitsPerComponent / 8);
+                        const size_t fourthComponentBytes =
+                            static_cast<size_t>(bitsPerComponent / 8);
+                        if (fourthComponentOffset + fourthComponentBytes <= sizeBytes)
+                        {
+                            if (vl == 0u)
+                            {
+                                std::memcpy(&decompressed[3],
+                                            data + fourthComponentOffset,
+                                            sizeof(decompressed[3]));
+                            }
+                            else if (vl == 1u)
+                            {
+                                uint16_t raw = 0u;
+                                std::memcpy(&raw, data + fourthComponentOffset, sizeof(raw));
+                                decompressed[3] = extend16(raw);
+                            }
+                            else if (vl == 2u)
+                            {
+                                decompressed[3] = extend8(data[fourthComponentOffset]);
+                            }
+                        }
+                    }
+
                     // Unknown compressed format fallback: preserve legacy raw-copy behavior.
                     if (!handledFormat && decoded && !maskEnable && (vif1_regs.mode == 0u || vif1_regs.mode == 3u))
                     {
@@ -968,13 +1086,25 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     if (targetConfig.enabled && targetTick >= targetConfig.minTick &&
                         destVec >= targetConfig.firstQword &&
                         destVec <= targetConfig.lastQword &&
+                        (!targetConfig.matchAfterWord0 ||
+                         lanes[targetConfig.afterWordIndex] ==
+                             targetConfig.afterWord0) &&
                         targetWriteTraceCount++ < targetConfig.maxWrites)
                     {
+                        const size_t sourceStreamOffset = srcVec
+                            ? static_cast<size_t>(srcVec - data)
+                            : static_cast<size_t>(-1);
+                        uint32_t sourceGuestAddress = UINT32_MAX;
+                        uint32_t sourceTagAddress = UINT32_MAX;
+                        if (srcVec)
+                            resolveVif1TraceProvenance(
+                                sourceStreamOffset, sourceGuestAddress, sourceTagAddress);
                         std::fprintf(stderr,
                                      "[xmen-vif1:target-write] tick=%llu transfer=%u unpack=%u "
                                      "write=%u source=%u dest=0x%x opcode=0x%02x vn=%u vl=%u "
                                      "mask=%u mode=%u usn=%u cl=%u wl=%u cyclePos=%u decoded=%u "
-                                     "before=%08x,%08x,%08x,%08x after=%08x,%08x,%08x,%08x src=",
+                                     "before=%08x,%08x,%08x,%08x after=%08x,%08x,%08x,%08x "
+                                     "stream=0x%zx guest=%08x tag=%08x src=",
                                      static_cast<unsigned long long>(targetTick),
                                      transferIndex,
                                      unpackTraceIndex,
@@ -993,7 +1123,9 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                                      decoded ? 1u : 0u,
                                      previousLanes[0], previousLanes[1],
                                      previousLanes[2], previousLanes[3],
-                                     lanes[0], lanes[1], lanes[2], lanes[3]);
+                                     lanes[0], lanes[1], lanes[2], lanes[3],
+                                     sourceStreamOffset, sourceGuestAddress,
+                                     sourceTagAddress);
                         if (srcVec)
                         {
                             for (uint32_t sourceByte = 0u;

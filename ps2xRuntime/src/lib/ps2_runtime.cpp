@@ -1967,6 +1967,103 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     static thread_local bool s_xmenSlotGrowActive = false;
     static thread_local uint32_t s_xmenSlotGrowOldAddress = 0u;
     static thread_local uint32_t s_xmenSlotGrowBytes = 0u;
+    if (rdram && targetPc == 0x002F7250u &&
+        (std::getenv("PS2X_TRACE_XMEN_TEXTURE_LINK") != nullptr ||
+         std::getenv("PS2X_TRACE_XMEN_TEXTURE_LINK_ALL") != nullptr))
+    {
+        const uint64_t tick = m_eeScheduler->currentVSyncTick();
+        const bool traceAll =
+            std::getenv("PS2X_TRACE_XMEN_TEXTURE_LINK_ALL") != nullptr &&
+            tick >= 750u && tick <= 766u;
+        const uint32_t texture = GPR_U32(ctx, 4);
+        const uint32_t textureBase = readRdramProbeU32(rdram, texture + 0x38u) & 0x3FFFu;
+        const uint32_t palette = readRdramProbeU32(rdram, texture + 0x2Cu);
+        const uint32_t paletteImage = readRdramProbeU32(rdram, palette + 0x0Cu);
+        const uint32_t paletteBase =
+            readRdramProbeU32(rdram, paletteImage + 0x38u) & 0x3FFFu;
+        if (traceAll || textureBase == 0x3F20u || paletteBase == 0x3F80u)
+        {
+            static std::atomic<uint32_t> s_xmenTextureLinkTraceCount{0u};
+            const uint32_t index =
+                s_xmenTextureLinkTraceCount.fetch_add(1u, std::memory_order_relaxed);
+            if (index < 512u)
+            {
+                std::cerr << "[xmen-texture-link] index=" << std::dec << index
+                          << " tick=" << tick
+                          << " source=0x" << std::hex << sourcePc
+                          << " texture=0x" << texture
+                          << " texture0=0x" << readRdramProbeU32(rdram, texture)
+                          << " texture4=0x" << readRdramProbeU32(rdram, texture + 0x04u)
+                          << " texture8=0x" << readRdramProbeU32(rdram, texture + 0x08u)
+                          << " textureC=0x" << readRdramProbeU32(rdram, texture + 0x0Cu)
+                          << " texture10=0x" << readRdramProbeU32(rdram, texture + 0x10u)
+                          << " texture14=0x" << readRdramProbeU32(rdram, texture + 0x14u)
+                          << " texture18=0x" << readRdramProbeU32(rdram, texture + 0x18u)
+                          << " texture1C=0x" << readRdramProbeU32(rdram, texture + 0x1Cu)
+                          << " texture20=0x" << readRdramProbeU32(rdram, texture + 0x20u)
+                          << " texture24=0x" << readRdramProbeU32(rdram, texture + 0x24u)
+                          << " texture28=0x" << readRdramProbeU32(rdram, texture + 0x28u)
+                          << " texture2C=0x" << palette
+                          << " texture30=0x" << readRdramProbeU32(rdram, texture + 0x30u)
+                          << " texture34=0x" << readRdramProbeU32(rdram, texture + 0x34u)
+                          << " texture38=0x" << readRdramProbeU32(rdram, texture + 0x38u)
+                          << " texture3C=0x" << readRdramProbeU32(rdram, texture + 0x3Cu)
+                          << " texture40=0x" << readRdramProbeU32(rdram, texture + 0x40u)
+                          << " texture44=0x" << readRdramProbeU32(rdram, texture + 0x44u)
+                          << " texture48=0x" << readRdramProbeU32(rdram, texture + 0x48u)
+                          << " palette=0x" << palette
+                          << " palette0=0x" << readRdramProbeU32(rdram, palette)
+                          << " paletteC=0x" << paletteImage
+                          << " paletteImage=0x" << paletteImage
+                          << " paletteImage0=0x" << readRdramProbeU32(rdram, paletteImage)
+                          << " paletteImage2C=0x"
+                          << readRdramProbeU32(rdram, paletteImage + 0x2Cu)
+                          << " paletteImage34=0x"
+                          << readRdramProbeU32(rdram, paletteImage + 0x34u)
+                          << " paletteImage38=0x"
+                          << readRdramProbeU32(rdram, paletteImage + 0x38u)
+                          << std::dec << std::endl;
+            }
+        }
+    }
+    if (rdram && targetPc == 0x002D9490u && sourcePc == 0x002FAD08u &&
+        std::getenv("PS2X_TRACE_XMEN_TEXTURE_LINK_ALL") != nullptr)
+    {
+        const uint64_t tick = m_eeScheduler->currentVSyncTick();
+        if (tick >= 750u && tick <= 766u)
+        {
+            static std::atomic<uint32_t> s_xmenPaletteLinkTraceCount{0u};
+            const uint32_t index =
+                s_xmenPaletteLinkTraceCount.fetch_add(1u, std::memory_order_relaxed);
+            if (index < 512u)
+            {
+                const uint32_t textureSlot = GPR_U32(ctx, 19);
+                const uint32_t texture = readRdramProbeU32(rdram, textureSlot);
+                const uint32_t linkedTexture = readRdramProbeU32(rdram, texture + 0x24u);
+                const uint32_t palette = GPR_U32(ctx, 4);
+                const uint32_t paletteImage = readRdramProbeU32(rdram, palette + 0x0Cu);
+                std::cerr << "[xmen-palette-link] index=" << std::dec << index
+                          << " tick=" << tick
+                          << " textureSlot=0x" << std::hex << textureSlot
+                          << " texture=0x" << texture
+                          << " textureBase=0x"
+                          << (readRdramProbeU32(rdram, texture + 0x38u) & 0x3FFFu)
+                          << " linkedTexture=0x" << linkedTexture
+                          << " linkedPalette=0x"
+                          << readRdramProbeU32(rdram, linkedTexture + 0x2Cu)
+                          << " palette=0x" << palette
+                          << " palette0=0x" << readRdramProbeU32(rdram, palette)
+                          << " paletteC=0x" << paletteImage
+                          << " palette10=0x" << readRdramProbeU32(rdram, palette + 0x10u)
+                          << " paletteImage=0x" << paletteImage
+                          << " paletteImage10=0x"
+                          << readRdramProbeU32(rdram, paletteImage + 0x10u)
+                          << " paletteImage38=0x"
+                          << readRdramProbeU32(rdram, paletteImage + 0x38u)
+                          << std::dec << std::endl;
+            }
+        }
+    }
     if (sourcePc == 0x0024B2ACu && targetPc == 0u)
     {
         static std::atomic<uint32_t> s_xmenNullListenerTraceCount{0u};

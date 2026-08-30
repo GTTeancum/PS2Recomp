@@ -220,6 +220,7 @@ private:
     int m_vtxCount = 0;
     int m_vtxIndex = 0;
     uint64_t m_currentGifTagLo = 0;
+    uint64_t m_currentGifPacketTagLo = 0;
     bool m_traceCurrentGifPacket = false;
 
     std::vector<uint8_t> m_displaySnapshot;

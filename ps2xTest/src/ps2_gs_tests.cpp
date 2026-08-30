@@ -2751,7 +2751,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
             gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
             gs.writeRegister(GS_REG_ALPHA_1, 0ull);
-            gs.writeRegister(GS_REG_TEX0_1, kTex0);
+            gs.writeRegister(GS_REG_TEX0_1, kTex0 | (1ull << 61));
             gs.writeRegister(GS_REG_PRIM, kPrim);
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
             gs.writeRegister(GS_REG_UV, 0ull);
@@ -2833,7 +2833,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
             gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
             gs.writeRegister(GS_REG_ALPHA_1, 0ull);
-            gs.writeRegister(GS_REG_TEX0_1, kTex0);
+            gs.writeRegister(GS_REG_TEX0_1, kTex0 | (1ull << 61));
             gs.writeRegister(GS_REG_PRIM, kPrim);
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
             gs.writeRegister(GS_REG_UV, 0ull);
@@ -2845,6 +2845,55 @@ void register_ps2_gs_tests()
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
             t.Equals(pixel, kExpectedColor,
                      "T8 CSM1 CLUT sampling should read CT32-uploaded palette entries through GS swizzled addressing");
+        });
+
+        tc.Run("GS CLUT cache survives backing VRAM overwrite", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            constexpr uint32_t kTexTbp = 64u;
+            constexpr uint32_t kClutCbp = 128u;
+            constexpr uint64_t kFrameReg =
+                (1ull << 16) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint64_t kTex0 =
+                (static_cast<uint64_t>(kTexTbp) << 0) |
+                (1ull << 14) |
+                (static_cast<uint64_t>(GS_PSM_T8) << 20) |
+                (1ull << 34) |
+                (1ull << 35) |
+                (static_cast<uint64_t>(kClutCbp) << 37) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
+                (1ull << 61);
+            constexpr uint64_t kPrim =
+                static_cast<uint64_t>(GS_PRIM_SPRITE) |
+                (1ull << 4) |
+                (1ull << 8);
+            constexpr uint32_t kExpectedColor = 0xFF204080u;
+            constexpr uint32_t kOverwrittenColor = 0xFF00FF00u;
+
+            gs.WriteVram(GS_PSM_T8, kTexTbp, 1u, 0u, 0u, 8u);
+            gs.WriteVram(GS_PSM_CT32, kClutCbp, 1u, 0u, 1u, kExpectedColor);
+            gs.writeRegister(GS_REG_FRAME_1, kFrameReg);
+            gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+            gs.writeRegister(GS_REG_SCISSOR_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_TEX0_1, kTex0 | (1ull << 61));
+
+            gs.WriteVram(GS_PSM_CT32, kClutCbp, 1u, 0u, 1u, kOverwrittenColor);
+            gs.writeRegister(GS_REG_PRIM, kPrim);
+            gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+            gs.writeRegister(GS_REG_UV, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 0ull);
+
+            uint32_t pixel = 0u;
+            std::memcpy(&pixel, vram.data(), sizeof(pixel));
+            t.Equals(pixel, kExpectedColor,
+                     "indexed texture sampling should use the GS-internal CLUT copy until another CLUT load");
         });
 
         tc.Run("GS T8 CSM1 applies CSA and masks CSA bit 4 for CT32 CLUTs", [](TestCase &t)
@@ -2894,7 +2943,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
             gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
             gs.writeRegister(GS_REG_ALPHA_1, 0ull);
-            gs.writeRegister(GS_REG_TEX0_1, kTex0);
+            gs.writeRegister(GS_REG_TEX0_1, kTex0 | (1ull << 61));
             gs.writeRegister(GS_REG_PRIM, kPrim);
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
             gs.writeRegister(GS_REG_UV, 0ull);
@@ -2943,10 +2992,10 @@ void register_ps2_gs_tests()
 
             writePSMT4Texel(vram, kTexTbp, 1u, 0u, 0u, 1u);
 
-            // CSA=16 selects the upper half of a CT16 CLUT. CSM1 swaps bits
-            // 3 and 4 but must preserve address bit 8.
-            gs.WriteVram(GS_PSM_CT16, kClutCbp, 1u, 1u, 0u, kWrongGreen);
-            gs.WriteVram(GS_PSM_CT16, kClutCbp, 1u, 1u, 16u, kExpectedRed);
+            // CSA=16 selects the destination cache bank. The T4 source still
+            // begins at the CLUT base, so entry 1 comes from source entry 1.
+            gs.WriteVram(GS_PSM_CT16, kClutCbp, 1u, 1u, 0u, kExpectedRed);
+            gs.WriteVram(GS_PSM_CT16, kClutCbp, 1u, 1u, 16u, kWrongGreen);
 
             gs.writeRegister(GS_REG_FRAME_1, kFrameReg);
             gs.writeRegister(GS_REG_ZBUF_1, kZbuf);
@@ -2954,7 +3003,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
             gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
             gs.writeRegister(GS_REG_ALPHA_1, 0ull);
-            gs.writeRegister(GS_REG_TEX0_1, kTex0);
+            gs.writeRegister(GS_REG_TEX0_1, kTex0 | (1ull << 61));
             gs.writeRegister(GS_REG_TEXA, kTexa);
             gs.writeRegister(GS_REG_PRIM, kPrim);
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
@@ -3092,8 +3141,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
             gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
             gs.writeRegister(GS_REG_ALPHA_1, 0ull);
-            gs.writeRegister(GS_REG_TEX0_1, kTex0);
-            gs.writeRegister(GS_REG_TEX2_1, kTex2);
+            gs.writeRegister(GS_REG_TEX0_1, kTex0 | (1ull << 61));
+            gs.writeRegister(GS_REG_TEX2_1, kTex2 | (1ull << 61));
             gs.writeRegister(GS_REG_PRIM, kPrim);
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
             gs.writeRegister(GS_REG_UV, 0ull);
@@ -3156,8 +3205,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
             gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
             gs.writeRegister(GS_REG_ALPHA_1, 0ull);
-            gs.writeRegister(GS_REG_TEX0_1, kTex0);
             gs.writeRegister(GS_REG_TEXCLUT, kTexClut);
+            gs.writeRegister(GS_REG_TEX0_1, kTex0 | (1ull << 61));
             gs.writeRegister(GS_REG_PRIM, kPrim);
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
             gs.writeRegister(GS_REG_UV, 0ull);
@@ -3189,7 +3238,8 @@ void register_ps2_gs_tests()
                 (1ull << 34) |
                 (1ull << 35) |
                 (static_cast<uint64_t>(kClutCbp) << 37) |
-                (static_cast<uint64_t>(GS_PSM_CT32) << 51);
+                (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
+                (1ull << 61);
             constexpr uint64_t kTexClut =
                 (1ull << 0) |
                 (3ull << 6) |
@@ -3213,8 +3263,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
             gs.writeRegister(GS_REG_SCISSOR_1, 0ull);
             gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
-            gs.writeRegister(GS_REG_TEX0_1, kTex0);
             gs.writeRegister(GS_REG_TEXCLUT, kTexClut);
+            gs.writeRegister(GS_REG_TEX0_1, kTex0 | (1ull << 61));
             gs.writeRegister(GS_REG_PRIM, kPrim);
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
             gs.writeRegister(GS_REG_UV, 0ull);
@@ -4564,7 +4614,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
             gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
             gs.writeRegister(GS_REG_ALPHA_1, 0ull);
-            gs.writeRegister(GS_REG_TEX0_1, kTex0HL);
+            gs.writeRegister(GS_REG_TEX0_1, kTex0HL | (1ull << 61));
             gs.writeRegister(GS_REG_PRIM, kPrim);
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
             gs.writeRegister(GS_REG_UV, 0ull);
@@ -4588,7 +4638,7 @@ void register_ps2_gs_tests()
                 (static_cast<uint64_t>(kClutCbpB) << 37) |
                 (static_cast<uint64_t>(GS_PSM_CT32) << 51);
 
-            gs.writeRegister(GS_REG_TEX0_1, kTex0HH);
+            gs.writeRegister(GS_REG_TEX0_1, kTex0HH | (1ull << 61));
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
             gs.writeRegister(GS_REG_UV, 0ull);

@@ -17,6 +17,7 @@ public:
 
     virtual void BeginTransfer(const GSTransferCommand &command) = 0;
     virtual void UploadImage(const uint8_t *data, uint32_t sizeBytes) = 0;
+    virtual void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) = 0;
 
     virtual void Flush() = 0;
     virtual void TextureFlush() = 0;

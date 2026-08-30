@@ -109,10 +109,17 @@ namespace
     std::atomic<uint32_t> s_xmenLastDrawPresent{UINT32_MAX};
     std::atomic<uint64_t> s_xmenLastDrawTick{0u};
     std::atomic<uint32_t> s_xmenVramDrawTraceCount{0u};
+    std::atomic<uint32_t> s_xmenLocalTransferTraceCount{0u};
 
     bool traceXmenVramRegion()
     {
         static const bool enabled = std::getenv("PS2X_TRACE_VRAM_REGION") != nullptr;
+        return enabled;
+    }
+
+    bool traceXmenLocalTransfers()
+    {
+        static const bool enabled = std::getenv("PS2X_TRACE_LOCAL_TRANSFER") != nullptr;
         return enabled;
     }
 
@@ -131,10 +138,55 @@ namespace
         return tick;
     }
 
+    struct XmenTracePixel
+    {
+        bool enabled = false;
+        int32_t x = 0;
+        int32_t y = 0;
+    };
+
+    const XmenTracePixel &xmenTracePixel()
+    {
+        static const XmenTracePixel pixel = []()
+        {
+            XmenTracePixel parsed{};
+            const char *value = std::getenv("PS2X_TRACE_RASTER_PIXEL");
+            if (!value || value[0] == '\0')
+                return parsed;
+
+            int32_t x = 0;
+            int32_t y = 0;
+            if (std::sscanf(value, "%d,%d", &x, &y) == 2 && x >= 0 && y >= 0)
+                parsed = {true, x, y};
+            return parsed;
+        }();
+        return pixel;
+    }
+
+    bool isXmenTracePixel(int32_t x, int32_t y)
+    {
+        const XmenTracePixel &pixel = xmenTracePixel();
+        return pixel.enabled && x == pixel.x && y == pixel.y;
+    }
+
     bool isXmenVramRegionBlock(uint32_t block)
     {
         return block >= 11000u && block <= 11700u;
     }
+
+    struct XmenTextureSampleTrace
+    {
+        int32_t u = 0;
+        int32_t v = 0;
+        uint32_t raw = 0u;
+        uint32_t index = 0u;
+        uint32_t clutIndex = 0u;
+        uint32_t clutX = 0u;
+        uint32_t clutY = 0u;
+        uint32_t clutRaw = 0u;
+        uint32_t texel = 0u;
+        bool hasClut = false;
+    };
 
     struct XmenRasterProbeStats
     {
@@ -166,9 +218,42 @@ namespace
         uint32_t maxTopChromaX = 0u;
         uint32_t minTopChromaY = UINT32_MAX;
         uint32_t maxTopChromaY = 0u;
+        uint32_t targetCovered = 0u;
+        uint32_t targetAlphaRejected = 0u;
+        uint32_t targetDestinationAlphaRejected = 0u;
+        uint32_t targetDepthRejected = 0u;
+        uint32_t targetFramebufferWrites = 0u;
+        uint32_t targetSourceRgba = 0u;
+        uint32_t targetFramebufferBefore = 0u;
+        uint32_t targetFramebufferAfter = 0u;
+        uint32_t targetIncomingZ = 0u;
+        uint32_t targetStoredZ = 0u;
+        float targetTextureS = 0.0f;
+        float targetTextureT = 0.0f;
+        float targetTextureQ = 0.0f;
+        float targetTextureU = 0.0f;
+        float targetTextureV = 0.0f;
+        uint16_t targetTextureFixedU = 0u;
+        uint16_t targetTextureFixedV = 0u;
+        uint32_t targetTextureSampleCount = 0u;
+        bool targetTextureLinearFilter = false;
+        std::array<XmenTextureSampleTrace, 4> targetTextureSamples{};
+    };
+
+    struct XmenClutLookupTrace
+    {
+        bool valid = false;
+        uint32_t index = 0u;
+        uint32_t clutIndex = 0u;
+        uint32_t x = 0u;
+        uint32_t y = 0u;
+        uint32_t raw = 0u;
+        uint32_t texel = 0u;
     };
 
     thread_local XmenRasterProbeStats *s_xmenActiveRasterProbe = nullptr;
+    thread_local bool s_xmenTraceTextureSample = false;
+    thread_local XmenClutLookupTrace s_xmenLastClutLookup{};
 
     bool isHighChroma(uint8_t r, uint8_t g, uint8_t b)
     {
@@ -565,41 +650,47 @@ namespace
         return (index & ~0x18u) | ((index & 0x08u) << 1u) | ((index & 0x10u) >> 1u);
     }
 
-    // TODO: clut cache
-    uint32_t resolveClutIndex(uint8_t index, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm)
+    bool isFourBitIndexedPsm(uint8_t psm)
     {
-        uint32_t clutIndex = static_cast<uint32_t>(index);
+        return psm == GS_PSM_T4 || psm == GS_PSM_T4HH || psm == GS_PSM_T4HL;
+    }
 
-        // CSM2 addresses the source directly through TEXCLUT. CSA is required
-        // to be zero there, so it must not offset the source coordinates.
-        if (csm != 0u)
-            return (sourcePsm == GS_PSM_T4 ||
-                    sourcePsm == GS_PSM_T4HH ||
-                    sourcePsm == GS_PSM_T4HL)
-                       ? (clutIndex & 0x0Fu)
-                       : clutIndex;
+    bool isIndexedPsm(uint8_t psm)
+    {
+        return psm == GS_PSM_T8 || psm == GS_PSM_T8H || isFourBitIndexedPsm(psm);
+    }
 
-        const bool is16BitClut = cpsm == GS_PSM_CT16 || cpsm == GS_PSM_CT16S;
-        const uint32_t csaMask = is16BitClut ? 0x1Fu : 0x0Fu;
-        const uint32_t clutIndexMask = is16BitClut ? 0x1FFu : 0x0FFu;
-        const uint32_t clutBase = (static_cast<uint32_t>(csa) & csaMask) << 4u;
+    bool is16BitClutPsm(uint8_t psm)
+    {
+        return psm == GS_PSM_CT16 || psm == GS_PSM_CT16S;
+    }
 
-        switch (sourcePsm)
+    uint32_t clutBaseIndex(uint8_t cpsm, uint8_t csa)
+    {
+        const uint32_t csaMask = is16BitClutPsm(cpsm) ? 0x1Fu : 0x0Fu;
+        return (static_cast<uint32_t>(csa) & csaMask) << 4u;
+    }
+
+    uint32_t resolveClutCacheIndex(uint8_t index, uint8_t cpsm, uint8_t csa, uint8_t sourcePsm)
+    {
+        const uint32_t base = clutBaseIndex(cpsm, csa);
+        if (isFourBitIndexedPsm(sourcePsm))
+            return base + (static_cast<uint32_t>(index) & 0x0Fu);
+
+        if (!is16BitClutPsm(cpsm))
         {
-        case GS_PSM_T4:
-        case GS_PSM_T4HH:
-        case GS_PSM_T4HL:
-            clutIndex = clutBase + (clutIndex & 0x0Fu);
-            break;
-        case GS_PSM_T8:
-        case GS_PSM_T8H:
-            clutIndex = clutBase + clutIndex;
-            break;
-        default:
-            return clutIndex;
+            const uint32_t group = std::min((static_cast<uint32_t>(index) & 0xF0u) + base, 0xF0u);
+            return group + (static_cast<uint32_t>(index) & 0x0Fu);
         }
 
-        return swizzleClutIndexCSM1(clutIndex & clutIndexMask);
+        return base + static_cast<uint32_t>(index);
+    }
+
+    uint32_t resolveCsm1VramIndex(uint32_t index, uint8_t cpsm)
+    {
+        const bool is16BitClut = cpsm == GS_PSM_CT16 || cpsm == GS_PSM_CT16S;
+        const uint32_t clutIndexMask = is16BitClut ? 0x1FFu : 0x0FFu;
+        return swizzleClutIndexCSM1(index & clutIndexMask);
     }
 
     uint8_t lerpChannel(uint8_t c00, uint8_t c10, uint8_t c01, uint8_t c11, float fx, float fy)
@@ -895,12 +986,216 @@ void GSCpuBackend::Reset()
 
 void GSCpuBackend::ResetUnlocked()
 {
+    m_clutCache.fill(0u);
+    m_clutCbp.fill(0u);
     m_transfer = {};
     m_transfer.direction = 3u;
     m_transferState = {};
     m_transferState.direction = 3u;
     m_localToHostBuffer.clear();
     m_localToHostReadPos = 0u;
+}
+
+void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    LoadClutUnlocked(tex0, texclut);
+}
+
+void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+{
+    if (!m_vram || !isIndexedPsm(tex0.psm))
+        return;
+
+    const bool fourBit = isFourBitIndexedPsm(tex0.psm);
+    const bool sixteenBit = is16BitClutPsm(tex0.cpsm);
+    const uint32_t base = clutBaseIndex(tex0.cpsm, tex0.csa);
+    uint32_t count = fourBit ? 16u : 256u;
+    if (!sixteenBit && !fourBit)
+        count = std::min(count, 256u - std::min(base, 256u));
+
+    bool shouldLoad = false;
+    const char *decision = "invalid";
+    switch (tex0.cld)
+    {
+    case 0u:
+        decision = "skip-cld0";
+        break;
+    case 6u:
+        decision = "skip-cld6";
+        break;
+    case 7u:
+        decision = "skip-cld7";
+        break;
+    case 1u:
+        shouldLoad = true;
+        decision = "load-unconditional";
+        break;
+    case 2u:
+        m_clutCbp[0] = tex0.cbp;
+        shouldLoad = true;
+        decision = "load-set-cbp0";
+        break;
+    case 3u:
+        m_clutCbp[1] = tex0.cbp;
+        shouldLoad = true;
+        decision = "load-set-cbp1";
+        break;
+    case 4u:
+        if (m_clutCbp[0] == tex0.cbp)
+            decision = "skip-cbp0-match";
+        else
+        {
+            m_clutCbp[0] = tex0.cbp;
+            shouldLoad = true;
+            decision = "load-cbp0-miss";
+        }
+        break;
+    case 5u:
+        if (m_clutCbp[1] == tex0.cbp)
+            decision = "skip-cbp1-match";
+        else
+        {
+            m_clutCbp[1] = tex0.cbp;
+            shouldLoad = true;
+            decision = "load-cbp1-miss";
+        }
+        break;
+    default:
+        break;
+    }
+
+    const bool traceTarget = std::getenv("PS2X_TRACE_CLUT_LOAD") != nullptr &&
+                             (tex0.tbp0 == 15168u || tex0.cbp == 16256u);
+    uint32_t traceIndex = UINT32_MAX;
+    if (traceTarget)
+    {
+        static std::atomic<uint32_t> traceCount{0u};
+        traceIndex = traceCount.fetch_add(1u, std::memory_order_relaxed);
+    }
+
+    constexpr std::array<uint8_t, 4> sampleIndices = {43u, 49u, 58u, 63u};
+    const auto readClutSource = [&](uint32_t cacheIndex, bool &available)
+    {
+        available = cacheIndex >= base && cacheIndex - base < count;
+        if (!available)
+            return 0u;
+
+        const uint32_t i = cacheIndex - base;
+        uint32_t clutX = 0u;
+        uint32_t clutY = 0u;
+        uint32_t clutWidth = 1u;
+        if (tex0.csm == 0u)
+        {
+            const uint32_t sourceIndex = !sixteenBit && !fourBit ? cacheIndex : i;
+            const uint32_t vramIndex = resolveCsm1VramIndex(sourceIndex, tex0.cpsm);
+            clutX = vramIndex & 0x0Fu;
+            clutY = vramIndex >> 4u;
+        }
+        else
+        {
+            clutWidth = std::max<uint32_t>(texclut.cbw, 1u);
+            clutX = (static_cast<uint32_t>(texclut.cou) << 4u) + i;
+            clutY = static_cast<uint32_t>(texclut.cov);
+        }
+
+        switch (tex0.cpsm)
+        {
+        case GS_PSM_CT32:
+            return GSMem::ReadCT32(m_vram, tex0.cbp, clutWidth, clutX, clutY);
+        case GS_PSM_CT24:
+            return GSMem::ReadCT24(m_vram, tex0.cbp, clutWidth, clutX, clutY);
+        case GS_PSM_CT16:
+            return GSMem::ReadCT16(m_vram, tex0.cbp, clutWidth, clutX, clutY);
+        case GS_PSM_CT16S:
+            return GSMem::ReadCT16S(m_vram, tex0.cbp, clutWidth, clutX, clutY);
+        default:
+            available = false;
+            return 0u;
+        }
+    };
+
+    if (traceIndex < 256u)
+    {
+        std::fprintf(stderr,
+                     "[xmen-clut-load] seq=%u tbp=%u psm=%u cbp=%u cpsm=%u csm=%u csa=%u cld=%u "
+                     "cbw=%u cou=%u cov=%u decision=%s cbp0=%u cbp1=%u",
+                     traceIndex, tex0.tbp0, tex0.psm, tex0.cbp, tex0.cpsm, tex0.csm,
+                     tex0.csa, tex0.cld, texclut.cbw, texclut.cou, texclut.cov, decision,
+                     m_clutCbp[0], m_clutCbp[1]);
+        for (const uint8_t sampleIndex : sampleIndices)
+        {
+            const uint32_t cacheIndex = resolveClutCacheIndex(sampleIndex, tex0.cpsm,
+                                                               tex0.csa, tex0.psm);
+            bool sourceAvailable = false;
+            const uint32_t source = readClutSource(cacheIndex, sourceAvailable);
+            const uint32_t before = cacheIndex < m_clutCache.size() ? m_clutCache[cacheIndex] : 0u;
+            if (sourceAvailable)
+                std::fprintf(stderr, " i%u=c%u/src%08x/before%08x", sampleIndex, cacheIndex,
+                             source, before);
+            else
+                std::fprintf(stderr, " i%u=c%u/srcNA/before%08x", sampleIndex, cacheIndex, before);
+        }
+        std::fputc('\n', stderr);
+    }
+
+    if (!shouldLoad)
+        return;
+
+    for (uint32_t i = 0u; i < count; ++i)
+    {
+        const uint32_t cacheIndex = base + i;
+        if (cacheIndex >= m_clutCache.size())
+            break;
+
+        uint32_t clutX = 0u;
+        uint32_t clutY = 0u;
+        uint32_t clutWidth = 1u;
+        if (tex0.csm == 0u)
+        {
+            const uint32_t sourceIndex = !sixteenBit && !fourBit ? cacheIndex : i;
+            const uint32_t vramIndex = resolveCsm1VramIndex(sourceIndex, tex0.cpsm);
+            clutX = vramIndex & 0x0Fu;
+            clutY = vramIndex >> 4u;
+        }
+        else
+        {
+            clutWidth = std::max<uint32_t>(texclut.cbw, 1u);
+            clutX = (static_cast<uint32_t>(texclut.cou) << 4u) + i;
+            clutY = static_cast<uint32_t>(texclut.cov);
+        }
+
+        switch (tex0.cpsm)
+        {
+        case GS_PSM_CT32:
+            m_clutCache[cacheIndex] = GSMem::ReadCT32(m_vram, tex0.cbp, clutWidth, clutX, clutY);
+            break;
+        case GS_PSM_CT24:
+            m_clutCache[cacheIndex] = GSMem::ReadCT24(m_vram, tex0.cbp, clutWidth, clutX, clutY);
+            break;
+        case GS_PSM_CT16:
+            m_clutCache[cacheIndex] = GSMem::ReadCT16(m_vram, tex0.cbp, clutWidth, clutX, clutY);
+            break;
+        case GS_PSM_CT16S:
+            m_clutCache[cacheIndex] = GSMem::ReadCT16S(m_vram, tex0.cbp, clutWidth, clutX, clutY);
+            break;
+        default:
+            return;
+        }
+    }
+
+    if (traceIndex < 256u)
+    {
+        std::fprintf(stderr, "[xmen-clut-loaded] seq=%u", traceIndex);
+        for (const uint8_t sampleIndex : sampleIndices)
+        {
+            const uint32_t cacheIndex = resolveClutCacheIndex(sampleIndex, tex0.cpsm,
+                                                               tex0.csa, tex0.psm);
+            const uint32_t after = cacheIndex < m_clutCache.size() ? m_clutCache[cacheIndex] : 0u;
+            std::fprintf(stderr, " i%u=c%u/after%08x", sampleIndex, cacheIndex, after);
+        }
+        std::fputc('\n', stderr);
+    }
 }
 
 void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
@@ -1098,6 +1393,109 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
     }();
     if (!skipCpuRaster && batch.debugPresentCount >= skipCpuRasterBeforePresent)
         DrawPrimitive(batch);
+    const uint32_t targetPixelEvents =
+        xmenRasterStats.targetCovered +
+        xmenRasterStats.targetAlphaRejected +
+        xmenRasterStats.targetDestinationAlphaRejected +
+        xmenRasterStats.targetDepthRejected +
+        xmenRasterStats.targetFramebufferWrites;
+    if (traceRasterTick && targetPixelEvents != 0u)
+    {
+        static std::atomic<uint32_t> s_targetPixelTraceCount{0u};
+        const uint32_t traceIndex =
+            s_targetPixelTraceCount.fetch_add(1u, std::memory_order_relaxed);
+        if (traceIndex < 512u)
+        {
+            const XmenTracePixel &pixel = xmenTracePixel();
+            std::fprintf(stdout,
+                         "[xmen-pixel-raster] index=%u present=%u tick=%llu pixel=%d,%d "
+                         "gifTag=0x%016llx prim=%u/%u/%u/%u/%u/%u "
+                         "frame=%u/%u/%u/0x%x zbuf=%u/%u/%u "
+                         "tex0=%u/%u/%u/%u/%u/%u/%u/%u/%u/%u/%u "
+                         "alpha=0x%llx test=0x%llx pabe=%u colclamp=0x%llx "
+                         "events=%u/%u/%u/%u/%u source=%08x before=%08x after=%08x "
+                         "incomingZ=%u storedZ=%u\n",
+                         traceIndex,
+                         batch.debugPresentCount,
+                         static_cast<unsigned long long>(batch.debugVsyncTick),
+                         pixel.x,
+                         pixel.y,
+                         static_cast<unsigned long long>(batch.debugGifTagLo),
+                         static_cast<unsigned>(batch.state.prim.type),
+                         batch.state.prim.tme ? 1u : 0u,
+                         batch.state.prim.abe ? 1u : 0u,
+                         batch.state.prim.fst ? 1u : 0u,
+                         batch.state.prim.iip ? 1u : 0u,
+                         batch.state.prim.fge ? 1u : 0u,
+                         xmenContext.frame.fbp,
+                         xmenContext.frame.fbw,
+                         static_cast<unsigned>(xmenContext.frame.psm),
+                         xmenContext.frame.fbmsk,
+                         xmenContext.zbuf.zbp,
+                         static_cast<unsigned>(xmenContext.zbuf.psm),
+                         xmenContext.zbuf.zmask ? 1u : 0u,
+                         xmenContext.tex0.tbp0,
+                         static_cast<unsigned>(xmenContext.tex0.tbw),
+                         static_cast<unsigned>(xmenContext.tex0.psm),
+                         static_cast<unsigned>(xmenContext.tex0.tw),
+                         static_cast<unsigned>(xmenContext.tex0.th),
+                         static_cast<unsigned>(xmenContext.tex0.tcc),
+                         static_cast<unsigned>(xmenContext.tex0.tfx),
+                         xmenContext.tex0.cbp,
+                         static_cast<unsigned>(xmenContext.tex0.cpsm),
+                         static_cast<unsigned>(xmenContext.tex0.csm),
+                         static_cast<unsigned>(xmenContext.tex0.csa),
+                         static_cast<unsigned long long>(xmenContext.alpha),
+                         static_cast<unsigned long long>(xmenContext.test),
+                         batch.state.pabe ? 1u : 0u,
+                         static_cast<unsigned long long>(batch.state.colclamp),
+                         xmenRasterStats.targetCovered,
+                         xmenRasterStats.targetAlphaRejected,
+                         xmenRasterStats.targetDestinationAlphaRejected,
+                         xmenRasterStats.targetDepthRejected,
+                         xmenRasterStats.targetFramebufferWrites,
+                         xmenRasterStats.targetSourceRgba,
+                         xmenRasterStats.targetFramebufferBefore,
+                         xmenRasterStats.targetFramebufferAfter,
+                         xmenRasterStats.targetIncomingZ,
+                         xmenRasterStats.targetStoredZ);
+            const uint32_t textureSampleCount = std::min<uint32_t>(
+                xmenRasterStats.targetTextureSampleCount,
+                static_cast<uint32_t>(xmenRasterStats.targetTextureSamples.size()));
+            for (uint32_t sampleIndex = 0u; sampleIndex < textureSampleCount; ++sampleIndex)
+            {
+                const XmenTextureSampleTrace &sample =
+                    xmenRasterStats.targetTextureSamples[sampleIndex];
+                std::fprintf(stdout,
+                             "[xmen-pixel-texture] raster=%u sample=%u/%u "
+                             "stq=%.9g,%.9g,%.9g fixedUv=%u,%u texUv=%.9g,%.9g linear=%u "
+                             "sampleUv=%d,%d raw=%08x index=%u hasClut=%u "
+                             "clutIndex=%u clutXy=%u,%u clutRaw=%08x texel=%08x\n",
+                             traceIndex,
+                             sampleIndex,
+                             xmenRasterStats.targetTextureSampleCount,
+                             xmenRasterStats.targetTextureS,
+                             xmenRasterStats.targetTextureT,
+                             xmenRasterStats.targetTextureQ,
+                             static_cast<unsigned>(xmenRasterStats.targetTextureFixedU),
+                             static_cast<unsigned>(xmenRasterStats.targetTextureFixedV),
+                             xmenRasterStats.targetTextureU,
+                             xmenRasterStats.targetTextureV,
+                             xmenRasterStats.targetTextureLinearFilter ? 1u : 0u,
+                             sample.u,
+                             sample.v,
+                             sample.raw,
+                             sample.index,
+                             sample.hasClut ? 1u : 0u,
+                             sample.clutIndex,
+                             sample.clutX,
+                             sample.clutY,
+                             sample.clutRaw,
+                             sample.texel);
+            }
+            std::fflush(stdout);
+        }
+    }
     s_xmenActiveRasterProbe = nullptr;
     static uint64_t s_xmenCerebroCaptureTick = UINT64_MAX;
     static uint32_t s_xmenCerebroCaptureBatchCount = 0u;
@@ -1187,10 +1585,13 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
         traceRasterTick &&
         (xmenContext.frame.fbp == 0u || xmenContext.frame.fbp == 140u) &&
         batch.state.prim.type == GS_PRIM_TRISTRIP &&
+        batch.state.prim.tme &&
         xmenRasterStats.framebufferWrites >= 64u &&
-        ((batch.state.prim.tme && xmenRasterStats.textureSamples >= 64u &&
-          xmenRasterStats.nonzeroCombinedRgbSamples * 20u < xmenRasterStats.textureSamples) ||
-         xmenRasterStats.nonzeroRgbWrites * 20u < xmenRasterStats.framebufferWrites);
+        xmenRasterStats.textureSamples >= 64u &&
+        xmenRasterStats.nonzeroTextureRgbSamples >= 64u &&
+        (xmenRasterStats.nonzeroCombinedRgbSamples * 20u <
+             xmenRasterStats.nonzeroTextureRgbSamples ||
+         xmenRasterStats.sourceChannelSum < xmenRasterStats.framebufferWrites * 24u);
     if (darkRasterCandidate)
     {
         static std::atomic<uint32_t> s_darkRasterCandidateCount{0u};
@@ -1200,14 +1601,15 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
         {
             std::fprintf(stdout,
                          "[xmen-dark-raster] index=%u present=%u tick=%llu gifTag=0x%016llx "
-                         "prim=%u/%u/%u/%u/%u frame=%u/%u/%u/0x%x zbuf=%u/%u/%u "
+                         "prim=%u/%u/%u/%u/%u/%u frame=%u/%u/%u/0x%x zbuf=%u/%u/%u "
                          "tex0=%u/%u/%u/%u/%u/%u/%u/%u/%u/%u/%u texclut=%u/%u/%u "
                          "texa=%u/%u/%u alpha=0x%llx colclamp=0x%llx clamp=0x%llx "
-                         "v0=%d,%d,%.0f/%u,%u,%u,%u "
-                         "v1=%d,%d,%.0f/%u,%u,%u,%u "
-                         "v2=%d,%d,%.0f/%u,%u,%u,%u "
+                         "v0=%d,%d,%.0f/%u,%u,%u,%u/%u "
+                         "v1=%d,%d,%.0f/%u,%u,%u,%u/%u "
+                         "v2=%d,%d,%.0f/%u,%u,%u,%u/%u "
                          "covered=%llu alphaReject=%llu depthReject=%llu writes=%llu changed=%llu "
-                         "nonzeroSource=%llu texture=%llu nonzeroTexture=%llu combined=%llu "
+                         "nonzeroSource=%llu sourceSum=%llu sourceMax=%u "
+                         "texture=%llu nonzeroTexture=%llu combined=%llu "
                          "bounds=%u,%u-%u,%u\n",
                          candidateIndex,
                          batch.debugPresentCount,
@@ -1218,6 +1620,7 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
                          batch.state.prim.abe ? 1u : 0u,
                          batch.state.prim.fst ? 1u : 0u,
                          batch.state.prim.iip ? 1u : 0u,
+                         batch.state.prim.fge ? 1u : 0u,
                          xmenContext.frame.fbp,
                          xmenContext.frame.fbw,
                          static_cast<unsigned>(xmenContext.frame.psm),
@@ -1252,6 +1655,7 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
                          static_cast<unsigned>(batch.vertices[0u].g),
                          static_cast<unsigned>(batch.vertices[0u].b),
                          static_cast<unsigned>(batch.vertices[0u].a),
+                         static_cast<unsigned>(batch.vertices[0u].fog),
                          screenX(1u),
                          screenY(1u),
                          batch.vertices[std::min<uint32_t>(1u, batch.vertexCount - 1u)].z,
@@ -1259,6 +1663,7 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
                          static_cast<unsigned>(batch.vertices[std::min<uint32_t>(1u, batch.vertexCount - 1u)].g),
                          static_cast<unsigned>(batch.vertices[std::min<uint32_t>(1u, batch.vertexCount - 1u)].b),
                          static_cast<unsigned>(batch.vertices[std::min<uint32_t>(1u, batch.vertexCount - 1u)].a),
+                         static_cast<unsigned>(batch.vertices[std::min<uint32_t>(1u, batch.vertexCount - 1u)].fog),
                          screenX(2u),
                          screenY(2u),
                          batch.vertices[batch.vertexCount - 1u].z,
@@ -1266,12 +1671,15 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
                          static_cast<unsigned>(batch.vertices[batch.vertexCount - 1u].g),
                          static_cast<unsigned>(batch.vertices[batch.vertexCount - 1u].b),
                          static_cast<unsigned>(batch.vertices[batch.vertexCount - 1u].a),
+                         static_cast<unsigned>(batch.vertices[batch.vertexCount - 1u].fog),
                          static_cast<unsigned long long>(xmenRasterStats.covered),
                          static_cast<unsigned long long>(xmenRasterStats.alphaRejected),
                          static_cast<unsigned long long>(xmenRasterStats.depthRejected),
                          static_cast<unsigned long long>(xmenRasterStats.framebufferWrites),
                          static_cast<unsigned long long>(xmenRasterStats.framebufferChangedWrites),
                          static_cast<unsigned long long>(xmenRasterStats.nonzeroRgbWrites),
+                         static_cast<unsigned long long>(xmenRasterStats.sourceChannelSum),
+                         xmenRasterStats.maxSourceChannel,
                          static_cast<unsigned long long>(xmenRasterStats.textureSamples),
                          static_cast<unsigned long long>(xmenRasterStats.nonzeroTextureRgbSamples),
                          static_cast<unsigned long long>(xmenRasterStats.nonzeroCombinedRgbSamples),
@@ -1571,8 +1979,7 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
         for (uint32_t index = 0u; index < 256u; ++index)
         {
             const uint32_t color = LookupCLUT(batch.state, static_cast<uint8_t>(index),
-                                              xmenContext.tex0.cbp, xmenContext.tex0.cpsm,
-                                              xmenContext.tex0.csm, xmenContext.tex0.csa,
+                                              xmenContext.tex0.cpsm, xmenContext.tex0.csa,
                                               xmenContext.tex0.psm);
             const uint8_t rgb[3] = {
                 static_cast<uint8_t>(color),
@@ -1594,8 +2001,7 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
                     ReadVramUnlocked(xmenContext.tex0.psm, xmenContext.tex0.tbp0,
                                      xmenContext.tex0.tbw, x, y));
                 const uint32_t color = LookupCLUT(batch.state, index,
-                                                  xmenContext.tex0.cbp, xmenContext.tex0.cpsm,
-                                                  xmenContext.tex0.csm, xmenContext.tex0.csa,
+                                                  xmenContext.tex0.cpsm, xmenContext.tex0.csa,
                                                   xmenContext.tex0.psm);
                 const uint8_t rgb[3] = {
                     static_cast<uint8_t>(color),
@@ -1854,8 +2260,8 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
             const auto dumpTexel = [&](uint32_t x, uint32_t y)
             {
                 const uint32_t index = ReadVramUnlocked(ctx.tex0.psm, ctx.tex0.tbp0, ctx.tex0.tbw, x, y);
-                const uint32_t color = LookupCLUT(state, static_cast<uint8_t>(index), ctx.tex0.cbp,
-                                                  ctx.tex0.cpsm, ctx.tex0.csm, ctx.tex0.csa, ctx.tex0.psm);
+                const uint32_t color = LookupCLUT(state, static_cast<uint8_t>(index),
+                                                  ctx.tex0.cpsm, ctx.tex0.csa, ctx.tex0.psm);
                 std::fprintf(stderr, "[xmen-gs-legal-sample] xy=%u,%u index=%u color=%08x\n",
                              x, y, index, color);
             };
@@ -1892,8 +2298,7 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
                 {
                     const uint8_t index = static_cast<uint8_t>(
                         ReadVramUnlocked(ctx.tex0.psm, ctx.tex0.tbp0, ctx.tex0.tbw, x, y));
-                    const uint32_t color = LookupCLUT(state, index, ctx.tex0.cbp,
-                                                      ctx.tex0.cpsm, ctx.tex0.csm,
+                    const uint32_t color = LookupCLUT(state, index, ctx.tex0.cpsm,
                                                       ctx.tex0.csa, ctx.tex0.psm);
                     const uint8_t rgb[3] = {
                         static_cast<uint8_t>(color),
@@ -1933,18 +2338,16 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
             {
                 const uint32_t index = ReadVramUnlocked(ctx.tex0.psm, ctx.tex0.tbp0, ctx.tex0.tbw,
                                                         coord[0], coord[1]);
-                const uint32_t color = LookupCLUT(state, static_cast<uint8_t>(index), ctx.tex0.cbp,
-                                                  ctx.tex0.cpsm, ctx.tex0.csm, ctx.tex0.csa,
-                                                  ctx.tex0.psm);
+                const uint32_t color = LookupCLUT(state, static_cast<uint8_t>(index),
+                                                  ctx.tex0.cpsm, ctx.tex0.csa, ctx.tex0.psm);
                 std::fprintf(stderr,
                              "[xmen-gs-legal-missing-palette-sample] xy=%u,%u index=%u color=%08x\n",
                              coord[0], coord[1], index, color);
             }
             for (uint32_t index = 0u; index < 256u; index += 16u)
             {
-                const uint32_t color = LookupCLUT(state, static_cast<uint8_t>(index), ctx.tex0.cbp,
-                                                  ctx.tex0.cpsm, ctx.tex0.csm, ctx.tex0.csa,
-                                                  ctx.tex0.psm);
+                const uint32_t color = LookupCLUT(state, static_cast<uint8_t>(index),
+                                                  ctx.tex0.cpsm, ctx.tex0.csa, ctx.tex0.psm);
                 std::fprintf(stderr, "[xmen-gs-legal-missing-palette-entry] index=%u color=%08x\n",
                              index, color);
             }
@@ -2217,6 +2620,8 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
     const auto &ctx = state.context;
     if (x < ctx.scissor.x0 || x > ctx.scissor.x1 || y < ctx.scissor.y0 || y > ctx.scissor.y1)
         return;
+    const bool traceTargetPixel =
+        s_xmenActiveRasterProbe && isXmenTracePixel(x, y);
 
     if (state.prim.fge)
     {
@@ -2242,6 +2647,8 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
     {
         if (s_xmenActiveRasterProbe)
             ++s_xmenActiveRasterProbe->alphaRejected;
+        if (traceTargetPixel)
+            ++s_xmenActiveRasterProbe->targetAlphaRejected;
         return;
     }
 
@@ -2256,6 +2663,11 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
         s_xmenActiveRasterProbe->maxCoveredY = std::max(s_xmenActiveRasterProbe->maxCoveredY, coveredY);
         s_xmenActiveRasterProbe->minIncomingZ = std::min(s_xmenActiveRasterProbe->minIncomingZ, static_cast<uint32_t>(z));
         s_xmenActiveRasterProbe->maxIncomingZ = std::max(s_xmenActiveRasterProbe->maxIncomingZ, static_cast<uint32_t>(z));
+        if (traceTargetPixel)
+        {
+            ++s_xmenActiveRasterProbe->targetCovered;
+            s_xmenActiveRasterProbe->targetIncomingZ = static_cast<uint32_t>(z);
+        }
     }
 
     const bool ztestEnabled = ((ctx.test >> 16) & 1u) != 0u;
@@ -2290,6 +2702,8 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
     {
         if (s_xmenActiveRasterProbe)
             ++s_xmenActiveRasterProbe->destinationAlphaRejected;
+        if (traceTargetPixel)
+            ++s_xmenActiveRasterProbe->targetDestinationAlphaRejected;
         return;
     }
 
@@ -2318,6 +2732,8 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
         {
             s_xmenActiveRasterProbe->minStoredZ = std::min(s_xmenActiveRasterProbe->minStoredZ, storedZ);
             s_xmenActiveRasterProbe->maxStoredZ = std::max(s_xmenActiveRasterProbe->maxStoredZ, storedZ);
+            if (traceTargetPixel)
+                s_xmenActiveRasterProbe->targetStoredZ = storedZ;
         }
     }
 
@@ -2325,6 +2741,8 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
     {
         if (s_xmenActiveRasterProbe)
             ++s_xmenActiveRasterProbe->depthRejected;
+        if (traceTargetPixel)
+            ++s_xmenActiveRasterProbe->targetDepthRejected;
         return;
     }
 
@@ -2346,6 +2764,12 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
                 std::max<uint32_t>(srcR, std::max<uint32_t>(srcG, srcB)));
             if (isInXmenChromaTraceBounds(x, y) && isHighChroma(srcR, srcG, srcB))
                 ++s_xmenActiveRasterProbe->topChromaSourceWrites;
+            if (traceTargetPixel)
+            {
+                s_xmenActiveRasterProbe->targetSourceRgba =
+                    pack32(srcR, srcG, srcB, a);
+                s_xmenActiveRasterProbe->targetFramebufferBefore = framebufferBefore;
+            }
         }
 
         if (state.prim.abe)
@@ -2425,6 +2849,11 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
                 ++s_xmenActiveRasterProbe->nonzeroRgbWrites;
 
             const u32 framebufferAfter = ReadVramUnlocked(fpsm, fbp, fbw, x, y);
+            if (traceTargetPixel)
+            {
+                ++s_xmenActiveRasterProbe->targetFramebufferWrites;
+                s_xmenActiveRasterProbe->targetFramebufferAfter = framebufferAfter;
+            }
             if (framebufferAfter != framebufferBefore)
                 ++s_xmenActiveRasterProbe->framebufferChangedWrites;
 
@@ -2459,37 +2888,38 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
 
 uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
                                   uint8_t index,
-                                  uint32_t cbp,
                                   uint8_t cpsm,
-                                  uint8_t csm,
                                   uint8_t csa,
                                   uint8_t sourcePsm)
 {
-    const uint32_t clutIndex = resolveClutIndex(index, cpsm, csm, csa, sourcePsm);
-    const bool csm2 = csm != 0u;
-    const uint32_t clutWidth = csm2 && state.texclut.cbw != 0u
-        ? static_cast<uint32_t>(state.texclut.cbw)
-        : 1u;
-    const uint32_t clutX = (csm2 ? static_cast<uint32_t>(state.texclut.cou) << 4u : 0u) +
-                           (clutIndex & 0x0Fu);
-    const uint32_t clutY = (csm2 ? static_cast<uint32_t>(state.texclut.cov) : 0u) +
-                           (clutIndex >> 4);
+    const uint32_t clutIndex = resolveClutCacheIndex(index, cpsm, csa, sourcePsm);
+    const uint32_t clutX = clutIndex & 0x0Fu;
+    const uint32_t clutY = clutIndex >> 4u;
 
+    const uint32_t raw = clutIndex < m_clutCache.size() ? m_clutCache[clutIndex] : 0u;
+    uint32_t expanded = 0u;
     switch (cpsm)
     {
     case GS_PSM_CT32:
-        return applyTexa(state.texa, cpsm, GSMem::ReadCT32(m_vram, cbp, clutWidth, clutX, clutY));
-    case GS_PSM_CT24:
-        return applyTexa(state.texa, cpsm, GSMem::ReadCT24(m_vram, cbp, clutWidth, clutX, clutY));
-    case GS_PSM_CT16:
-        return applyTexa(state.texa, cpsm, Rgba5551ToRgba8888(GSMem::ReadCT16(m_vram, cbp, clutWidth, clutX, clutY)));
-    case GS_PSM_CT16S:
-        return applyTexa(state.texa, cpsm, Rgba5551ToRgba8888(GSMem::ReadCT16S(m_vram, cbp, clutWidth, clutX, clutY)));
-    default:
+        expanded = raw;
         break;
+    case GS_PSM_CT24:
+        expanded = raw & 0x00FFFFFFu;
+        break;
+    case GS_PSM_CT16:
+        expanded = Rgba5551ToRgba8888(raw);
+        break;
+    case GS_PSM_CT16S:
+        expanded = Rgba5551ToRgba8888(raw);
+        break;
+    default:
+        return 0xFFFF00FFu;
     }
 
-    return 0xFFFF00FFu;
+    const uint32_t texel = applyTexa(state.texa, cpsm, expanded);
+    if (s_xmenTraceTextureSample)
+        s_xmenLastClutLookup = {true, index, clutIndex, clutX, clutY, raw, texel};
+    return texel;
 }
 
 uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v)
@@ -2520,12 +2950,27 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
         texVf = t * invQ * static_cast<float>(texH);
     }
 
+    const bool traceTargetSample = s_xmenTraceTextureSample && s_xmenActiveRasterProbe;
+    if (traceTargetSample)
+    {
+        s_xmenActiveRasterProbe->targetTextureS = s;
+        s_xmenActiveRasterProbe->targetTextureT = t;
+        s_xmenActiveRasterProbe->targetTextureQ = q;
+        s_xmenActiveRasterProbe->targetTextureU = texUf;
+        s_xmenActiveRasterProbe->targetTextureV = texVf;
+        s_xmenActiveRasterProbe->targetTextureFixedU = u;
+        s_xmenActiveRasterProbe->targetTextureFixedV = v;
+        s_xmenActiveRasterProbe->targetTextureLinearFilter = state.linearFilter;
+    }
+
     auto samplePoint = [&](int sampleU, int sampleV) -> uint32_t
     {
         sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
         sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
 
-        u32 out = ReadVramUnlocked(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
+        const u32 out = ReadVramUnlocked(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
+        uint32_t texel = 0xFFFF00FFu;
+        s_xmenLastClutLookup = {};
 
         switch (tex.psm)
         {
@@ -2533,21 +2978,48 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
         case GS_PSM_Z32:
         case GS_PSM_CT24:
         case GS_PSM_Z24:
-            return applyTexa(state.texa, tex.psm, out);
+            texel = applyTexa(state.texa, tex.psm, out);
+            break;
         case GS_PSM_CT16:
         case GS_PSM_CT16S:
         case GS_PSM_Z16:
         case GS_PSM_Z16S:
-            return applyTexa(state.texa, tex.psm, Rgba5551ToRgba8888(out));
+            texel = applyTexa(state.texa, tex.psm, Rgba5551ToRgba8888(out));
+            break;
         case GS_PSM_T8:
         case GS_PSM_T8H:
         case GS_PSM_T4:
         case GS_PSM_T4HL:
         case GS_PSM_T4HH:
-            return LookupCLUT(state, static_cast<u8>(out), tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
+            texel = LookupCLUT(state, static_cast<u8>(out), tex.cpsm, tex.csa, tex.psm);
+            break;
         }
 
-        return 0xFFFF00FFu;
+        if (traceTargetSample)
+        {
+            const uint32_t traceSampleIndex =
+                s_xmenActiveRasterProbe->targetTextureSampleCount++;
+            if (traceSampleIndex < s_xmenActiveRasterProbe->targetTextureSamples.size())
+            {
+                XmenTextureSampleTrace &sample =
+                    s_xmenActiveRasterProbe->targetTextureSamples[traceSampleIndex];
+                sample.u = sampleU;
+                sample.v = sampleV;
+                sample.raw = out;
+                sample.index = static_cast<uint8_t>(out);
+                sample.texel = texel;
+                if (s_xmenLastClutLookup.valid)
+                {
+                    sample.hasClut = true;
+                    sample.index = s_xmenLastClutLookup.index;
+                    sample.clutIndex = s_xmenLastClutLookup.clutIndex;
+                    sample.clutX = s_xmenLastClutLookup.x;
+                    sample.clutY = s_xmenLastClutLookup.y;
+                    sample.clutRaw = s_xmenLastClutLookup.raw;
+                }
+            }
+        }
+        return texel;
     };
 
     if (!state.linearFilter)
@@ -2681,6 +3153,7 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
                 float tx = (static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
                 float texUf = u0f + (u1f - u0f) * tx;
                 uint32_t texel = 0xFFFF00FFu;
+                s_xmenTraceTextureSample = s_xmenActiveRasterProbe && isXmenTracePixel(x, y);
                 if (state.prim.fst)
                 {
                     const int fixedU = static_cast<int>((texUf * 16.0f) + 0.5f);
@@ -2693,6 +3166,7 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
                 {
                     texel = SampleTexture(state, texUf / static_cast<float>(texW), texVf / static_cast<float>(texH), 1.0f, 0u, 0u);
                 }
+                s_xmenTraceTextureSample = false;
 
                 uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                 uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
@@ -2804,7 +3278,9 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                     iv = 0;
                 }
 
+                s_xmenTraceTextureSample = s_xmenActiveRasterProbe && isXmenTracePixel(x, y);
                 uint32_t texel = SampleTexture(state, is, it, iq, iu, iv);
+                s_xmenTraceTextureSample = false;
 
                 uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                 uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
@@ -3108,6 +3584,55 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
         return;
     }
 
+    const uint32_t traceIndex = s_xmenLocalTransferTraceCount.fetch_add(1u, std::memory_order_relaxed);
+    const bool traceTransfer = traceXmenLocalTransfers() && traceIndex < 256u;
+    const uint32_t sampleCount = std::min<uint32_t>(rrw, 4u);
+    std::array<uint32_t, 4> sourceSamples{};
+    std::array<uint32_t, 4> destinationBefore{};
+    if (traceTransfer)
+    {
+        for (uint32_t sample = 0u; sample < sampleCount; ++sample)
+        {
+            sourceSamples[sample] = ReadVramUnlocked(
+                m_transfer.bitbltbuf.spsm,
+                m_transfer.bitbltbuf.sbp,
+                std::max<uint32_t>(m_transfer.bitbltbuf.sbw, 1u),
+                m_transfer.trxpos.ssax + sample,
+                m_transfer.trxpos.ssay);
+            destinationBefore[sample] = ReadVramUnlocked(
+                m_transfer.bitbltbuf.dpsm,
+                m_transfer.bitbltbuf.dbp,
+                std::max<uint32_t>(m_transfer.bitbltbuf.dbw, 1u),
+                m_transfer.trxpos.dsax + sample,
+                m_transfer.trxpos.dsay);
+        }
+
+        std::fprintf(stderr,
+                     "[xmen-local-transfer] phase=begin index=%u present=%u tick=%llu "
+                     "src=%u/%u/0x%x dst=%u/%u/0x%x pos=%u,%u-%u,%u dir=%u size=%u,%u "
+                     "samples=%u srcHead=%08x,%08x,%08x,%08x dstBefore=%08x,%08x,%08x,%08x\n",
+                     traceIndex,
+                     s_xmenLastDrawPresent.load(std::memory_order_relaxed),
+                     static_cast<unsigned long long>(s_xmenLastDrawTick.load(std::memory_order_relaxed)),
+                     m_transfer.bitbltbuf.sbp,
+                     static_cast<unsigned>(m_transfer.bitbltbuf.sbw),
+                     static_cast<unsigned>(m_transfer.bitbltbuf.spsm),
+                     m_transfer.bitbltbuf.dbp,
+                     static_cast<unsigned>(m_transfer.bitbltbuf.dbw),
+                     static_cast<unsigned>(m_transfer.bitbltbuf.dpsm),
+                     m_transfer.trxpos.ssax,
+                     m_transfer.trxpos.ssay,
+                     m_transfer.trxpos.dsax,
+                     m_transfer.trxpos.dsay,
+                     static_cast<unsigned>(m_transfer.trxpos.dir),
+                     rrw,
+                     rrh,
+                     sampleCount,
+                     sourceSamples[0], sourceSamples[1], sourceSamples[2], sourceSamples[3],
+                     destinationBefore[0], destinationBefore[1],
+                     destinationBefore[2], destinationBefore[3]);
+    }
+
     for (uint32_t pixel = 0; pixel < total; ++pixel)
     {
         uint32_t x = pixel % rrw;
@@ -3128,6 +3653,26 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
                           x + m_transfer.trxpos.dsax,
                           y + m_transfer.trxpos.dsay,
                           value);
+    }
+
+    if (traceTransfer)
+    {
+        std::array<uint32_t, 4> destinationAfter{};
+        for (uint32_t sample = 0u; sample < sampleCount; ++sample)
+        {
+            destinationAfter[sample] = ReadVramUnlocked(
+                m_transfer.bitbltbuf.dpsm,
+                m_transfer.bitbltbuf.dbp,
+                std::max<uint32_t>(m_transfer.bitbltbuf.dbw, 1u),
+                m_transfer.trxpos.dsax + sample,
+                m_transfer.trxpos.dsay);
+        }
+        std::fprintf(stderr,
+                     "[xmen-local-transfer] phase=end index=%u dstAfter=%08x,%08x,%08x,%08x\n",
+                     traceIndex,
+                     destinationAfter[0], destinationAfter[1],
+                     destinationAfter[2], destinationAfter[3]);
+        std::fflush(stderr);
     }
 
     m_transferState.copiedPixels = total;

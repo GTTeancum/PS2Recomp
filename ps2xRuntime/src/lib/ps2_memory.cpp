@@ -2,6 +2,8 @@
 #include "runtime/ps2_address.h"
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
+#include "ps2_vif_trace.h"
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <cstdio>
@@ -11,6 +13,13 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#endif
 
 namespace
 {
@@ -37,6 +46,288 @@ namespace
         static const bool enabled = std::getenv("PS2X_TRACE_GIF_DMA") != nullptr;
         return enabled;
     }
+
+    bool traceVifDmaProvenance()
+    {
+        static const bool enabled = std::getenv("PS2X_TRACE_VIF_PROVENANCE") != nullptr;
+        return enabled;
+    }
+
+#if defined(_WIN32)
+    struct RdramPageWatch
+    {
+        std::atomic<bool> enabled{false};
+        std::atomic<bool> ready{false};
+        uint8_t *rdram = nullptr;
+        uint32_t guestAddress = 0u;
+        uint32_t size = 0u;
+        bool match32Enabled = false;
+        bool match32Any = false;
+        uint32_t match32 = 0u;
+        uint64_t armTick = 0u;
+        uint8_t *page = nullptr;
+        size_t pageSize = 0u;
+        DWORD originalProtection = PAGE_READWRITE;
+        PVOID handler = nullptr;
+        uintptr_t instruction = 0u;
+        uintptr_t moduleBase = 0u;
+        DWORD threadId = 0u;
+        USHORT frameCount = 0u;
+        std::array<void *, 24> frames{};
+        std::array<uint8_t, 256> before{};
+        std::array<uint8_t, 256> after{};
+    };
+
+    RdramPageWatch rdramPageWatch;
+    thread_local bool rdramPageWatchSingleStep = false;
+    thread_local uintptr_t rdramPageWatchInstruction = 0u;
+    thread_local DWORD rdramPageWatchThreadId = 0u;
+    thread_local USHORT rdramPageWatchFrameCount = 0u;
+    thread_local std::array<void *, 24> rdramPageWatchFrames{};
+    thread_local std::array<uint8_t, 256> rdramPageWatchBefore{};
+
+    LONG CALLBACK handleRdramPageWatch(PEXCEPTION_POINTERS exception)
+    {
+        if (!exception || !exception->ExceptionRecord || !exception->ContextRecord)
+            return EXCEPTION_CONTINUE_SEARCH;
+
+        const DWORD code = exception->ExceptionRecord->ExceptionCode;
+        if (code == EXCEPTION_ACCESS_VIOLATION && rdramPageWatch.enabled.load())
+        {
+            if (exception->ExceptionRecord->NumberParameters < 2u ||
+                exception->ExceptionRecord->ExceptionInformation[0] != 1u)
+            {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+
+            const uintptr_t accessAddress =
+                static_cast<uintptr_t>(exception->ExceptionRecord->ExceptionInformation[1]);
+            const uintptr_t pageStart = reinterpret_cast<uintptr_t>(rdramPageWatch.page);
+            if (accessAddress < pageStart ||
+                accessAddress >= pageStart + rdramPageWatch.pageSize)
+            {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+
+            std::memcpy(rdramPageWatchBefore.data(),
+                        rdramPageWatch.rdram + rdramPageWatch.guestAddress,
+                        rdramPageWatch.size);
+#if defined(_M_X64)
+            rdramPageWatchInstruction =
+                static_cast<uintptr_t>(exception->ContextRecord->Rip);
+#else
+            rdramPageWatchInstruction =
+                static_cast<uintptr_t>(exception->ContextRecord->Eip);
+#endif
+            rdramPageWatchThreadId = GetCurrentThreadId();
+            rdramPageWatchFrameCount = RtlCaptureStackBackTrace(
+                0u, static_cast<DWORD>(rdramPageWatchFrames.size()),
+                rdramPageWatchFrames.data(), nullptr);
+
+            DWORD ignored = 0u;
+            if (!VirtualProtect(rdramPageWatch.page, rdramPageWatch.pageSize,
+                                PAGE_READWRITE, &ignored))
+            {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            rdramPageWatchSingleStep = true;
+            exception->ContextRecord->EFlags |= 0x100u;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        if (code == EXCEPTION_SINGLE_STEP && rdramPageWatchSingleStep)
+        {
+            rdramPageWatchSingleStep = false;
+            exception->ContextRecord->EFlags &= ~0x100u;
+
+            std::array<uint8_t, 256> after{};
+            std::memcpy(after.data(),
+                        rdramPageWatch.rdram + rdramPageWatch.guestAddress,
+                        rdramPageWatch.size);
+            const bool changed =
+                std::memcmp(rdramPageWatchBefore.data(), after.data(),
+                            rdramPageWatch.size) != 0;
+            bool matched = !rdramPageWatch.match32Enabled;
+            if (rdramPageWatch.match32Enabled)
+            {
+                const uint32_t matchLimit = rdramPageWatch.match32Any
+                    ? rdramPageWatch.size
+                    : std::min<uint32_t>(rdramPageWatch.size, sizeof(uint32_t));
+                for (uint32_t offset = 0u;
+                     offset + sizeof(uint32_t) <= matchLimit;
+                     ++offset)
+                {
+                    uint32_t candidate = 0u;
+                    std::memcpy(&candidate, after.data() + offset, sizeof(candidate));
+                    if (candidate == rdramPageWatch.match32)
+                    {
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+            if (changed && matched)
+            {
+                rdramPageWatch.instruction = rdramPageWatchInstruction;
+                rdramPageWatch.threadId = rdramPageWatchThreadId;
+                rdramPageWatch.frameCount = rdramPageWatchFrameCount;
+                rdramPageWatch.frames = rdramPageWatchFrames;
+                rdramPageWatch.before = rdramPageWatchBefore;
+                rdramPageWatch.after = after;
+                rdramPageWatch.enabled.store(false);
+                rdramPageWatch.ready.store(true);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+
+            DWORD ignored = 0u;
+            if (!VirtualProtect(rdramPageWatch.page, rdramPageWatch.pageSize,
+                                PAGE_READONLY, &ignored))
+            {
+                rdramPageWatch.enabled.store(false);
+            }
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    void disableRdramPageWatch()
+    {
+        rdramPageWatch.enabled.store(false);
+        if (rdramPageWatch.page)
+        {
+            DWORD ignored = 0u;
+            VirtualProtect(rdramPageWatch.page, rdramPageWatch.pageSize,
+                           rdramPageWatch.originalProtection, &ignored);
+        }
+        if (rdramPageWatch.handler)
+        {
+            RemoveVectoredExceptionHandler(rdramPageWatch.handler);
+            rdramPageWatch.handler = nullptr;
+        }
+        rdramPageWatch.page = nullptr;
+        rdramPageWatch.ready.store(false);
+    }
+
+    void armRdramPageWatch(uint64_t tick)
+    {
+        if (!rdramPageWatch.page || !rdramPageWatch.handler ||
+            rdramPageWatch.enabled.load() || rdramPageWatch.ready.load() ||
+            tick < rdramPageWatch.armTick)
+        {
+            return;
+        }
+
+        if (!VirtualProtect(rdramPageWatch.page, rdramPageWatch.pageSize,
+                            PAGE_READONLY, &rdramPageWatch.originalProtection))
+        {
+            disableRdramPageWatch();
+            return;
+        }
+        rdramPageWatch.enabled.store(true);
+        std::fprintf(stderr,
+                     "[xmen-rdram-page-watch:armed] tick=%llu guest=0x%08x size=0x%x "
+                     "host=%p page=%p module=0x%llx match32=%s0x%08x any=%u\n",
+                     static_cast<unsigned long long>(tick),
+                     rdramPageWatch.guestAddress, rdramPageWatch.size,
+                     rdramPageWatch.rdram + rdramPageWatch.guestAddress,
+                     rdramPageWatch.page,
+                     static_cast<unsigned long long>(rdramPageWatch.moduleBase),
+                     rdramPageWatch.match32Enabled ? "" : "disabled:",
+                     rdramPageWatch.match32,
+                     rdramPageWatch.match32Any ? 1u : 0u);
+    }
+
+    void initializeRdramPageWatch(uint8_t *rdram, size_t ramSize)
+    {
+        disableRdramPageWatch();
+        const char *addressValue = std::getenv("PS2X_WATCH_RDRAM_PAGE_GUEST");
+        if (!rdram || !addressValue || addressValue[0] == '\0')
+            return;
+
+        const uint32_t guestAddress =
+            static_cast<uint32_t>(std::strtoul(addressValue, nullptr, 0)) & PS2_RAM_MASK;
+        const char *sizeValue = std::getenv("PS2X_WATCH_RDRAM_PAGE_SIZE");
+        const uint32_t size = sizeValue
+            ? static_cast<uint32_t>(std::strtoul(sizeValue, nullptr, 0))
+            : 16u;
+        if (size == 0u || size > rdramPageWatch.before.size() ||
+            static_cast<uint64_t>(guestAddress) + size > ramSize)
+        {
+            return;
+        }
+
+        SYSTEM_INFO systemInfo{};
+        GetSystemInfo(&systemInfo);
+        const size_t pageSize = systemInfo.dwPageSize;
+        const uintptr_t target = reinterpret_cast<uintptr_t>(rdram + guestAddress);
+        const uintptr_t pageStart = target & ~(static_cast<uintptr_t>(pageSize) - 1u);
+        if (target + size > pageStart + pageSize)
+            return;
+
+        rdramPageWatch.rdram = rdram;
+        rdramPageWatch.guestAddress = guestAddress;
+        rdramPageWatch.size = size;
+        const char *match32Value = std::getenv("PS2X_WATCH_RDRAM_PAGE_MATCH32");
+        rdramPageWatch.match32Enabled = match32Value && match32Value[0] != '\0';
+        rdramPageWatch.match32 = rdramPageWatch.match32Enabled
+            ? static_cast<uint32_t>(std::strtoul(match32Value, nullptr, 0))
+            : 0u;
+        rdramPageWatch.match32Any =
+            std::getenv("PS2X_WATCH_RDRAM_PAGE_MATCH32_ANY") != nullptr;
+        const char *armTickValue = std::getenv("PS2X_WATCH_RDRAM_PAGE_ARM_TICK");
+        rdramPageWatch.armTick = armTickValue
+            ? std::strtoull(armTickValue, nullptr, 0)
+            : 0u;
+        rdramPageWatch.page = reinterpret_cast<uint8_t *>(pageStart);
+        rdramPageWatch.pageSize = pageSize;
+        rdramPageWatch.moduleBase =
+            reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        std::memcpy(rdramPageWatch.before.data(), rdram + guestAddress, size);
+        rdramPageWatch.handler = AddVectoredExceptionHandler(1u, handleRdramPageWatch);
+        if (!rdramPageWatch.handler)
+        {
+            disableRdramPageWatch();
+            return;
+        }
+        armRdramPageWatch(0u);
+    }
+
+    void reportRdramPageWatch(uint64_t tick)
+    {
+        armRdramPageWatch(tick);
+        if (!rdramPageWatch.ready.exchange(false))
+            return;
+
+        std::fprintf(stderr,
+                     "[xmen-rdram-page-watch:changed] guest=0x%08x size=0x%x "
+                     "thread=%lu rip=0x%llx module=0x%llx offset=0x%llx before=",
+                     rdramPageWatch.guestAddress, rdramPageWatch.size,
+                     static_cast<unsigned long>(rdramPageWatch.threadId),
+                     static_cast<unsigned long long>(rdramPageWatch.instruction),
+                     static_cast<unsigned long long>(rdramPageWatch.moduleBase),
+                     static_cast<unsigned long long>(
+                         rdramPageWatch.instruction - rdramPageWatch.moduleBase));
+        for (uint32_t index = 0u; index < rdramPageWatch.size; ++index)
+            std::fprintf(stderr, "%02x", rdramPageWatch.before[index]);
+        std::fprintf(stderr, " after=");
+        for (uint32_t index = 0u; index < rdramPageWatch.size; ++index)
+            std::fprintf(stderr, "%02x", rdramPageWatch.after[index]);
+        std::fprintf(stderr, " stack=");
+        for (USHORT index = 0u; index < rdramPageWatch.frameCount; ++index)
+        {
+            std::fprintf(stderr, "%s0x%llx", index == 0u ? "" : ",",
+                         static_cast<unsigned long long>(
+                             reinterpret_cast<uintptr_t>(rdramPageWatch.frames[index])));
+        }
+        std::fprintf(stderr, "\n");
+        disableRdramPageWatch();
+    }
+#else
+    void disableRdramPageWatch() {}
+    void initializeRdramPageWatch(uint8_t *, size_t) {}
+    void reportRdramPageWatch(uint64_t) {}
+#endif
 
     bool gifDmaPayloadInTraceRange(uint32_t address, uint32_t bytes)
     {
@@ -323,6 +614,7 @@ PS2Memory::PS2Memory()
 
 PS2Memory::~PS2Memory()
 {
+    disableRdramPageWatch();
     if (m_rdram)
     {
         delete[] m_rdram;
@@ -374,6 +666,7 @@ bool PS2Memory::initialize(size_t ramSize)
 {
     auto cleanup = [this]()
     {
+        disableRdramPageWatch();
         delete[] m_rdram;
         delete[] m_scratchpad;
         delete[] iop_ram;
@@ -415,6 +708,7 @@ bool PS2Memory::initialize(size_t ramSize)
         // Allocate main RAM
         m_rdram = new uint8_t[ramSize];
         std::memset(m_rdram, 0, ramSize);
+        initializeRdramPageWatch(m_rdram, ramSize);
 
         // Allocate scratchpad
         m_scratchpad = new uint8_t[PS2_SCRATCHPAD_SIZE];
@@ -1554,6 +1848,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
                     const int kMaxChainTags = 65536;
                     std::vector<uint8_t> chainBuf;
+                    std::vector<Vif1TraceProvenance> chainProvenance;
                     bool chainEnded = false;
                     const uint32_t chainStartTagAddr = tagAddr;
                     const bool traceXmenCorruptChain =
@@ -1572,7 +1867,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         }
                     }
 
-                    auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+                    auto appendData = [&](uint32_t srcAddr, uint32_t qwCount,
+                                          uint32_t sourceTagAddr)
                     {
                         const uint64_t bytes64 = static_cast<uint64_t>(qwCount) * 16ull;
                         uint32_t bytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
@@ -1602,9 +1898,19 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                 chunk = maxSz2 - src;
                             if (chunk == 0)
                                 break;
+                            const uint32_t flatStart = static_cast<uint32_t>(chainBuf.size());
                             chainBuf.insert(chainBuf.end(), base2 + src, base2 + src + chunk);
+                            if (traceVifDmaProvenance() && channelBase == 0x10009000u)
+                            {
+                                chainProvenance.push_back({
+                                    flatStart,
+                                    static_cast<uint32_t>(chainBuf.size()),
+                                    canonicalDmacAddress(srcAddr),
+                                    canonicalDmacAddress(sourceTagAddr)});
+                            }
                             bytes -= chunk;
                             src += chunk;
+                            srcAddr += chunk;
                         }
                     };
 
@@ -1785,10 +2091,22 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             (channelBase == 0x10009000u || channelBase == 0x10008000u);
                         const size_t flattenedStart = chainBuf.size();
                         if (vifChannel && tagTransferEnabled)
+                        {
+                            const uint32_t tagFlatStart = static_cast<uint32_t>(chainBuf.size());
                             appendVifChainTagData(currentTagAddr);
+                            if (traceVifDmaProvenance() && channelBase == 0x10009000u &&
+                                chainBuf.size() > tagFlatStart)
+                            {
+                                chainProvenance.push_back({
+                                    tagFlatStart,
+                                    static_cast<uint32_t>(chainBuf.size()),
+                                    canonicalDmacAddress(currentTagAddr) + 8u,
+                                    canonicalDmacAddress(currentTagAddr)});
+                            }
+                        }
 
                         if (hasPayload)
-                            appendData(dataAddr, tagQwc);
+                            appendData(dataAddr, tagQwc, currentTagAddr);
                         if (xmenVifChainMap)
                         {
                             std::fprintf(xmenVifChainMap,
@@ -1912,6 +2230,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         pt.qwc = 0;
                         pt.dmaTagCount = static_cast<uint32_t>(tagsProcessed);
                         pt.chainData = std::move(chainBuf);
+                        if (!chainProvenance.empty())
+                        {
+                            registerVif1TraceProvenance(
+                                pt.chainData.data(), std::move(chainProvenance));
+                        }
                         if (channelBase == 0x1000A000)
                         {
                             m_pendingGifTransfers.push_back(std::move(pt));
@@ -2036,6 +2359,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
 void PS2Memory::processPendingTransfers()
 {
+    reportRdramPageWatch(gs().vsyncTick.load(std::memory_order_relaxed));
     const bool hadGif = !m_pendingGifTransfers.empty();
     uint64_t gifTransferQwc = 0u;
     uint64_t gifDmaTagCount = 0u;
@@ -2169,7 +2493,9 @@ void PS2Memory::processPendingTransfers()
     {
         if (!p.chainData.empty())
         {
+            beginVif1TraceProvenance(p.chainData.data());
             processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
+            endVif1TraceProvenance(p.chainData.data());
         }
         else if (p.qwc > 0)
         {
