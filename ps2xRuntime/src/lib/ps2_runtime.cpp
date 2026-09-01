@@ -10544,7 +10544,11 @@ void PS2Runtime::run()
 
     uint64_t tick = 0;
     bool xmenZeroPcLogged = false;
-    std::ofstream xmenProgressTrace("xmen_runtime_progress.log", std::ios::out | std::ios::trunc);
+    std::ofstream xmenProgressTrace;
+    if (std::getenv("PS2X_XMEN_PROGRESS_TRACE") != nullptr)
+    {
+        xmenProgressTrace.open("xmen_runtime_progress.log", std::ios::out | std::ios::trunc);
+    }
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
         tick++;
