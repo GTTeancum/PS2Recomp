@@ -2060,31 +2060,33 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
         return mask;
     }();
-    const auto findXmenCompatibilityAddress = [&](uint32_t address)
+    static_assert((kXmenCompatibilityPageMask[
+                       (((0x00325900u >> 12u) - kXmenCompatibilityFirstPage) / 64u)] &
+                   (uint64_t{1} <<
+                    (((0x00325900u >> 12u) - kXmenCompatibilityFirstPage) % 64u))) != 0u);
+    static_assert((kXmenCompatibilityPageMask[
+                       (((0x00130C00u >> 12u) - kXmenCompatibilityFirstPage) / 64u)] &
+                   (uint64_t{1} <<
+                    (((0x00130C00u >> 12u) - kXmenCompatibilityFirstPage) % 64u))) != 0u);
+    static_assert((kXmenCompatibilityPageMask[
+                       (((0x003AF850u >> 12u) - kXmenCompatibilityFirstPage) / 64u)] &
+                   (uint64_t{1} <<
+                    (((0x003AF850u >> 12u) - kXmenCompatibilityFirstPage) % 64u))) != 0u);
+    const auto isXmenCompatibilityPage = [&](uint32_t address)
     {
         const uint32_t page = address >> 12u;
         if (page < kXmenCompatibilityFirstPage || page > kXmenCompatibilityLastPage)
         {
-            return kXmenCompatibilityBranchAddresses.end();
+            return false;
         }
         const size_t pageOffset = page - kXmenCompatibilityFirstPage;
-        if ((kXmenCompatibilityPageMask[pageOffset / 64u] &
-             (uint64_t{1} << (pageOffset % 64u))) == 0u)
-        {
-            return kXmenCompatibilityBranchAddresses.end();
-        }
-        return std::lower_bound(kXmenCompatibilityBranchAddresses.begin(),
-                                kXmenCompatibilityBranchAddresses.end(),
-                                address);
+        return (kXmenCompatibilityPageMask[pageOffset / 64u] &
+                (uint64_t{1} << (pageOffset % 64u))) != 0u;
     };
-    const auto sourceCompatibilityIt = findXmenCompatibilityAddress(sourcePc);
-    const auto targetCompatibilityIt = findXmenCompatibilityAddress(targetPc);
     const bool sourceRequiresXmenCompatibility =
-        sourceCompatibilityIt != kXmenCompatibilityBranchAddresses.end() &&
-        *sourceCompatibilityIt == sourcePc;
+        isXmenCompatibilityPage(sourcePc);
     const bool targetRequiresXmenCompatibility =
-        targetCompatibilityIt != kXmenCompatibilityBranchAddresses.end() &&
-        *targetCompatibilityIt == targetPc;
+        isXmenCompatibilityPage(targetPc);
     const bool requiresXmenCompatibility =
         targetPc == 0u || sourceRequiresXmenCompatibility ||
         targetRequiresXmenCompatibility;
@@ -2092,6 +2094,18 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         std::getenv("PS2X_PROFILE_XMEN_BRANCH_SELECTOR") != nullptr;
     if (profileXmenBranchSelector)
     {
+        const auto sourceCompatibilityIt = std::lower_bound(
+            kXmenCompatibilityBranchAddresses.begin(),
+            kXmenCompatibilityBranchAddresses.end(), sourcePc);
+        const auto targetCompatibilityIt = std::lower_bound(
+            kXmenCompatibilityBranchAddresses.begin(),
+            kXmenCompatibilityBranchAddresses.end(), targetPc);
+        const bool sourceMatchesExactCompatibilityAddress =
+            sourceCompatibilityIt != kXmenCompatibilityBranchAddresses.end() &&
+            *sourceCompatibilityIt == sourcePc;
+        const bool targetMatchesExactCompatibilityAddress =
+            targetCompatibilityIt != kXmenCompatibilityBranchAddresses.end() &&
+            *targetCompatibilityIt == targetPc;
         static thread_local uint64_t calls = 0u;
         static thread_local uint64_t compatibilityCalls = 0u;
         static thread_local uint64_t nullTargetCalls = 0u;
@@ -2107,12 +2121,12 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         {
             ++nullTargetCalls;
         }
-        if (sourceRequiresXmenCompatibility)
+        if (sourceMatchesExactCompatibilityAddress)
         {
             ++addressHits[static_cast<size_t>(
                 sourceCompatibilityIt - kXmenCompatibilityBranchAddresses.begin())];
         }
-        if (targetRequiresXmenCompatibility)
+        if (targetMatchesExactCompatibilityAddress)
         {
             ++addressHits[static_cast<size_t>(
                 targetCompatibilityIt - kXmenCompatibilityBranchAddresses.begin())];
