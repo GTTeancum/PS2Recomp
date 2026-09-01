@@ -11674,6 +11674,7 @@ void PS2Runtime::run()
         {
             const GSRegisters &gs = m_memory.gs();
             const auto eeSnapshot = m_eeScheduler->snapshot();
+            const auto dmaChannelCounts = m_memory.dmaChannelStartCounts();
             xmenProgressTrace << "[run:tick] tick=" << tick
                               << " pc=0x" << std::hex << m_debugPc.load(std::memory_order_relaxed)
                               << " ra=0x" << m_debugRa.load(std::memory_order_relaxed)
@@ -11690,6 +11691,10 @@ void PS2Runtime::run()
                               << " gif=" << m_memory.gifCopyCount()
                               << " gsw=" << m_memory.gsWriteCount()
                               << " vif=" << m_memory.vifWriteCount()
+                              << " dmac=[";
+            for (const uint64_t count : dmaChannelCounts)
+                xmenProgressTrace << count << ',';
+            xmenProgressTrace << "]"
                               << " threads=[";
             for (const auto &thread : eeSnapshot.threads)
             {

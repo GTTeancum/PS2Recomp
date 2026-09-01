@@ -719,6 +719,8 @@ bool PS2Memory::initialize(size_t ramSize)
     cleanup();
     m_seenGifCopy = false;
     m_dmaStartCount.store(0, std::memory_order_relaxed);
+    for (auto &count : m_dmaChannelStartCounts)
+        count.store(0, std::memory_order_relaxed);
     m_gifCopyCount.store(0, std::memory_order_relaxed);
     m_gsWriteCount.store(0, std::memory_order_relaxed);
     m_vifWriteCount.store(0, std::memory_order_relaxed);
@@ -1775,6 +1777,19 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+            static constexpr std::array<uint32_t, 10> dmaChannelBases = {
+                0x10008000u, 0x10009000u, 0x1000A000u, 0x1000B000u, 0x1000B400u,
+                0x1000C000u, 0x1000C400u, 0x1000C800u, 0x1000D000u, 0x1000D400u,
+            };
+            const auto dmaChannelIt = std::find(dmaChannelBases.begin(),
+                                                dmaChannelBases.end(),
+                                                channelBase);
+            if (dmaChannelIt != dmaChannelBases.end())
+            {
+                m_dmaChannelStartCounts[static_cast<size_t>(
+                    dmaChannelIt - dmaChannelBases.begin())].fetch_add(
+                        1u, std::memory_order_relaxed);
+            }
             const uint32_t channelIndex = (channelBase - 0x10008000u) >> 12u;
             uint32_t dmaStartIndex = 0u;
             static std::atomic<uint32_t> dmaChannelTraceCounts[7]{};

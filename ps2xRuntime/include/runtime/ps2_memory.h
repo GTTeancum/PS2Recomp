@@ -293,6 +293,13 @@ public:
     uint64_t gifCopyCount() const { return m_gifCopyCount.load(std::memory_order_relaxed); }
     uint64_t gsWriteCount() const { return m_gsWriteCount.load(std::memory_order_relaxed); }
     uint64_t vifWriteCount() const { return m_vifWriteCount.load(std::memory_order_relaxed); }
+    std::array<uint64_t, 10> dmaChannelStartCounts() const
+    {
+        std::array<uint64_t, 10> counts{};
+        for (size_t i = 0; i < counts.size(); ++i)
+            counts[i] = m_dmaChannelStartCounts[i].load(std::memory_order_relaxed);
+        return counts;
+    }
     uint64_t getVU0CodeGeneration() const { return m_vu0CodeGeneration.load(std::memory_order_relaxed); }
     uint64_t getVU1CodeGeneration() const { return m_vu1CodeGeneration.load(std::memory_order_relaxed); }
 
@@ -391,6 +398,7 @@ public:
 
     bool m_seenGifCopy;
     std::atomic<uint64_t> m_dmaStartCount{0};
+    std::array<std::atomic<uint64_t>, 10> m_dmaChannelStartCounts{};
     std::atomic<uint64_t> m_gifCopyCount{0};
     std::atomic<uint64_t> m_gsWriteCount{0};
     std::atomic<uint64_t> m_vifWriteCount{0};
