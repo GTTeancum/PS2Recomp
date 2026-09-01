@@ -5,6 +5,15 @@
 #include <cstdint>
 #include <vector>
 
+struct GSRasterDebugCounters
+{
+    uint64_t submits = 0u;
+    uint64_t frame0Submits = 0u;
+    uint64_t frame140Submits = 0u;
+    uint64_t otherFrameSubmits = 0u;
+    uint64_t viewportVertices = 0u;
+};
+
 class GSRasterBackend
 {
 public:
@@ -31,4 +40,5 @@ public:
     virtual void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) = 0;
     virtual void SnapshotVram(std::vector<uint8_t> &out) const = 0;
     virtual GSTransferSnapshot GetTransferSnapshot() const = 0;
+    virtual GSRasterDebugCounters GetDebugCounters() const { return {}; }
 };

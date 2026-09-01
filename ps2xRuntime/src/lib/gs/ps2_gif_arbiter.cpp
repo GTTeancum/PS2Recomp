@@ -110,6 +110,8 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     }
 
     traceXmenConsoleTexturePacket("submit", pathId, path2DirectHl, data, sizeBytes);
+    m_debugSubmitted[static_cast<size_t>(pathId) - 1u].fetch_add(
+        1u, std::memory_order_relaxed);
 
     static bool loggedXmenClutPacket = false;
     for (uint32_t offset = 8u;
@@ -179,6 +181,8 @@ void GifArbiter::drain()
         auto &pkt = m_queue[i];
         if (!pkt.data.empty())
         {
+            m_debugProcessed[static_cast<size_t>(pkt.pathId) - 1u].fetch_add(
+                1u, std::memory_order_relaxed);
             traceXmenConsoleTexturePacket("process", pkt.pathId, pkt.path2DirectHl,
                                           pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
             static std::atomic<uint32_t> processTraceCount{0u};
@@ -201,6 +205,17 @@ void GifArbiter::drain()
         }
     }
     m_queue.clear();
+}
+
+GifArbiter::DebugCounters GifArbiter::debugCounters() const
+{
+    DebugCounters counters{};
+    for (size_t i = 0; i < counters.submitted.size(); ++i)
+    {
+        counters.submitted[i] = m_debugSubmitted[i].load(std::memory_order_relaxed);
+        counters.processed[i] = m_debugProcessed[i].load(std::memory_order_relaxed);
+    }
+    return counters;
 }
 
 uint8_t GifArbiter::pathPriority(GifPathId id)

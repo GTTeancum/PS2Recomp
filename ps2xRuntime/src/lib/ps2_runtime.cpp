@@ -11676,6 +11676,8 @@ void PS2Runtime::run()
             const auto eeSnapshot = m_eeScheduler->snapshot();
             const auto dmaChannelCounts = m_memory.dmaChannelStartCounts();
             const auto vu1Counters = m_vu1.debugCounters();
+            const auto gifArbiterCounters = m_gifArbiter.debugCounters();
+            const auto rasterCounters = m_gs.rasterDebugCounters();
             xmenProgressTrace << "[run:tick] tick=" << tick
                               << " pc=0x" << std::hex << m_debugPc.load(std::memory_order_relaxed)
                               << " ra=0x" << m_debugRa.load(std::memory_order_relaxed)
@@ -11702,6 +11704,19 @@ void PS2Runtime::run()
                               << ',' << vu1Counters.resumes
                               << ',' << vu1Counters.xgkickStarts
                               << ',' << vu1Counters.xgkickFinishes << "]"
+                              << " gifarb=[";
+            for (const uint64_t count : gifArbiterCounters.submitted)
+                xmenProgressTrace << count << ',';
+            for (const uint64_t count : gifArbiterCounters.processed)
+                xmenProgressTrace << count << ',';
+            xmenProgressTrace << "]"
+                              << " gs=[" << m_gs.processedGifPacketCount()
+                              << ',' << m_gs.submittedDrawBatchCount() << "]"
+                              << " raster=[" << rasterCounters.submits
+                              << ',' << rasterCounters.frame0Submits
+                              << ',' << rasterCounters.frame140Submits
+                              << ',' << rasterCounters.otherFrameSubmits
+                              << ',' << rasterCounters.viewportVertices << "]"
                               << " threads=[";
             for (const auto &thread : eeSnapshot.threads)
             {

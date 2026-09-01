@@ -2,6 +2,7 @@
 #define PS2_GS_FRONTEND_H
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -143,6 +144,9 @@ public:
     bool clearActiveFramebuffer(uint32_t rgba);
     uint64_t nativeImageUploadCount() const { return m_nativeImageUploadCount; }
     uint64_t nativePackedGIFPacketCount() const { return m_nativePackedGIFPacketCount; }
+    uint64_t processedGifPacketCount() const { return m_debugProcessedGifPacketCount.load(std::memory_order_relaxed); }
+    uint64_t submittedDrawBatchCount() const { return m_debugSubmittedDrawBatchCount.load(std::memory_order_relaxed); }
+    GSRasterDebugCounters rasterDebugCounters() const;
 
     uint32_t consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes);
 
@@ -238,6 +242,8 @@ private:
     bool m_hasHostPresentationFrame = false;
     uint64_t m_nativeImageUploadCount = 0;
     uint64_t m_nativePackedGIFPacketCount = 0;
+    std::atomic<uint64_t> m_debugProcessedGifPacketCount{0u};
+    std::atomic<uint64_t> m_debugSubmittedDrawBatchCount{0u};
 
     static constexpr size_t kDebugHistoryCapacity = 512;
     std::array<GSDebugHistoryEntry, kDebugHistoryCapacity> m_debugHistory{};

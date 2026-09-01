@@ -1,6 +1,8 @@
 #ifndef PS2_GIF_ARBITER_H
 #define PS2_GIF_ARBITER_H
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -35,9 +37,19 @@ public:
     void drain();
     bool empty() const { return m_queue.empty(); }
 
+    struct DebugCounters
+    {
+        std::array<uint64_t, 3> submitted{};
+        std::array<uint64_t, 3> processed{};
+    };
+
+    DebugCounters debugCounters() const;
+
 private:
     ProcessPacketFn m_processFn;
     std::vector<GifArbiterPacket> m_queue;
+    std::array<std::atomic<uint64_t>, 3> m_debugSubmitted{};
+    std::array<std::atomic<uint64_t>, 3> m_debugProcessed{};
 
     static bool isImagePacket(const uint8_t *data, uint32_t sizeBytes);
     static uint8_t pathPriority(GifPathId id);

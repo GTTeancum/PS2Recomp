@@ -924,6 +924,8 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         return;
     }
 
+    m_debugProcessedGifPacketCount.fetch_add(1u, std::memory_order_relaxed);
+
     const uint64_t firstTagLo = loadLE64(data);
     const uint64_t firstTagHi = loadLE64(data + 8u);
     uint32_t firstNloop = static_cast<uint32_t>(firstTagLo & 0x7FFFu);
@@ -2453,6 +2455,7 @@ void GS::vertexKick(bool drawing)
                          coloredDrawCount.load(std::memory_order_relaxed));
         }
         updatePreferredDisplaySourceForDraw(batch);
+        m_debugSubmittedDrawBatchCount.fetch_add(1u, std::memory_order_relaxed);
         m_backend->Submit(batch);
         recordDrawDebugEventUnlocked(needed);
     }
@@ -2581,6 +2584,12 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
     batch.debugGifTagLo = m_currentGifTagLo;
     batch.debugPresentCount = s_xmenPresentTraceCount.load(std::memory_order_relaxed);
     return batch;
+}
+
+GSRasterDebugCounters GS::rasterDebugCounters() const
+{
+    std::lock_guard<std::mutex> lock(m_backendLifetimeMutex);
+    return m_backend ? m_backend->GetDebugCounters() : GSRasterDebugCounters{};
 }
 
 void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)

@@ -1284,6 +1284,19 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
         }
         return;
     }
+    m_debugSubmitCount.fetch_add(1u, std::memory_order_relaxed);
+    switch (batch.state.context.frame.fbp)
+    {
+    case 0u:
+        m_debugFrame0SubmitCount.fetch_add(1u, std::memory_order_relaxed);
+        break;
+    case 140u:
+        m_debugFrame140SubmitCount.fetch_add(1u, std::memory_order_relaxed);
+        break;
+    default:
+        m_debugOtherFrameSubmitCount.fetch_add(1u, std::memory_order_relaxed);
+        break;
+    }
     const bool traceXmenLegal = batch.state.context.frame.fbp == 140u &&
                                 batch.state.prim.type != GS_PRIM_SPRITE;
     const uint32_t submitProbeIndex = s_submitProbeCount.fetch_add(1u, std::memory_order_relaxed);
@@ -1302,6 +1315,15 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
     const auto screenY = [&](uint32_t i) -> int {
         return static_cast<int>(std::lround(batch.vertices[std::min<uint32_t>(i, batch.vertexCount - 1u)].y)) - submitOfy;
     };
+    uint64_t viewportVertices = 0u;
+    for (uint32_t i = 0u; i < batch.vertexCount; ++i)
+    {
+        const int x = screenX(i);
+        const int y = screenY(i);
+        if (x >= 0 && x < 640 && y >= 0 && y < 448)
+            ++viewportVertices;
+    }
+    m_debugViewportVertexCount.fetch_add(viewportVertices, std::memory_order_relaxed);
     sampleX[0] = 0; sampleY[0] = 0;
     sampleX[1] = 100; sampleY[1] = 100;
     sampleX[2] = 320; sampleY[2] = 224;
@@ -2567,6 +2589,17 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
                          readFrame(320u, 224u), readFrame(639u, 447u));
         }
     }
+}
+
+GSRasterDebugCounters GSCpuBackend::GetDebugCounters() const
+{
+    return {
+        m_debugSubmitCount.load(std::memory_order_relaxed),
+        m_debugFrame0SubmitCount.load(std::memory_order_relaxed),
+        m_debugFrame140SubmitCount.load(std::memory_order_relaxed),
+        m_debugOtherFrameSubmitCount.load(std::memory_order_relaxed),
+        m_debugViewportVertexCount.load(std::memory_order_relaxed),
+    };
 }
 
 void GSCpuBackend::Flush()

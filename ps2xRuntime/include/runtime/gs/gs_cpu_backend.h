@@ -3,6 +3,7 @@
 #include "runtime/gs/gs_backend.h"
 
 #include <array>
+#include <atomic>
 #include <functional>
 #include <mutex>
 #include <vector>
@@ -32,6 +33,7 @@ public:
     void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override;
     void SnapshotVram(std::vector<uint8_t> &out) const override;
     GSTransferSnapshot GetTransferSnapshot() const override;
+    GSRasterDebugCounters GetDebugCounters() const override;
 
 private:
     void ResetUnlocked();
@@ -76,4 +78,9 @@ private:
     GSTransferSnapshot m_transferState{};
     std::vector<uint8_t> m_localToHostBuffer;
     size_t m_localToHostReadPos = 0;
+    std::atomic<uint64_t> m_debugSubmitCount{0u};
+    std::atomic<uint64_t> m_debugFrame0SubmitCount{0u};
+    std::atomic<uint64_t> m_debugFrame140SubmitCount{0u};
+    std::atomic<uint64_t> m_debugOtherFrameSubmitCount{0u};
+    std::atomic<uint64_t> m_debugViewportVertexCount{0u};
 };
