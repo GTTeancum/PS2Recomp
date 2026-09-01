@@ -215,6 +215,28 @@ void register_ps2_memory_tests()
                      "KSEG0 dword writes should be visible through KSEG1");
         });
 
+        tc.Run("quadword stores update one GS privileged register slot", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kDispfb1 = PS2_GS_PRIV_REG_BASE + 0x70u;
+            constexpr uint32_t kDisplay1 = PS2_GS_PRIV_REG_BASE + 0x80u;
+            constexpr uint64_t kDispfbValue = 0x0123456789ABCDEFull;
+            constexpr uint64_t kUnusedUpperLane = 0xFEDCBA9876543210ull;
+            const __m128i value = _mm_set_epi64x(
+                static_cast<int64_t>(kUnusedUpperLane),
+                static_cast<int64_t>(kDispfbValue));
+            const uint64_t display1Before = mem.read64(kDisplay1);
+
+            mem.write128(kDispfb1, value);
+
+            t.Equals(mem.read64(kDispfb1), kDispfbValue,
+                     "SQ should write the low lane to the GS register");
+            t.Equals(mem.read64(kDisplay1), display1Before,
+                     "SQ upper lane should not spill into the next GS register slot");
+        });
+
         tc.Run("EE timer0 count advances from scheduler cycles and can be reset", [](TestCase &t)
         {
             PS2Memory mem;
