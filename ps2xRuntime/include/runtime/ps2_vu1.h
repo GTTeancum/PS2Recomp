@@ -2,6 +2,7 @@
 #define PS2_VU1_H
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 
 class GS;
@@ -62,6 +63,24 @@ public:
     VU1State &state() { return m_state; }
     const VU1State &state() const { return m_state; }
     [[nodiscard]] bool isRunning() const { return m_running; }
+
+    struct DebugCounters
+    {
+        uint64_t executions = 0u;
+        uint64_t resumes = 0u;
+        uint64_t xgkickStarts = 0u;
+        uint64_t xgkickFinishes = 0u;
+    };
+
+    [[nodiscard]] DebugCounters debugCounters() const
+    {
+        return {
+            m_debugExecutionCount.load(std::memory_order_relaxed),
+            m_debugResumeCount.load(std::memory_order_relaxed),
+            m_debugXgkickStartCount.load(std::memory_order_relaxed),
+            m_debugXgkickFinishCount.load(std::memory_order_relaxed),
+        };
+    }
 
 private:
     enum Pipeline : uint8_t
@@ -241,6 +260,10 @@ private:
     bool m_running = false;
     bool m_pendingHaltD = false;
     bool m_pendingHaltT = false;
+    std::atomic<uint64_t> m_debugExecutionCount{0u};
+    std::atomic<uint64_t> m_debugResumeCount{0u};
+    std::atomic<uint64_t> m_debugXgkickStartCount{0u};
+    std::atomic<uint64_t> m_debugXgkickFinishCount{0u};
 
     void run(uint8_t *vuCode, uint32_t codeSize,
              uint8_t *vuData, uint32_t dataSize,

@@ -293,6 +293,8 @@ public:
     uint64_t gifCopyCount() const { return m_gifCopyCount.load(std::memory_order_relaxed); }
     uint64_t gsWriteCount() const { return m_gsWriteCount.load(std::memory_order_relaxed); }
     uint64_t vifWriteCount() const { return m_vifWriteCount.load(std::memory_order_relaxed); }
+    uint64_t vif1TransferCount() const { return m_vif1TransferCount.load(std::memory_order_relaxed); }
+    uint64_t vif1MscalDispatchCount() const { return m_vif1MscalDispatchCount.load(std::memory_order_relaxed); }
     std::array<uint64_t, 10> dmaChannelStartCounts() const
     {
         std::array<uint64_t, 10> counts{};
@@ -402,6 +404,8 @@ public:
     std::atomic<uint64_t> m_gifCopyCount{0};
     std::atomic<uint64_t> m_gsWriteCount{0};
     std::atomic<uint64_t> m_vifWriteCount{0};
+    std::atomic<uint64_t> m_vif1TransferCount{0};
+    std::atomic<uint64_t> m_vif1MscalDispatchCount{0};
     std::atomic<uint64_t> m_vu0CodeGeneration{0};
     std::atomic<uint64_t> m_vu1CodeGeneration{0};
     // I/O registers

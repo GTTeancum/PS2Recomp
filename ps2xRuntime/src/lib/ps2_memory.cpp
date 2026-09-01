@@ -724,6 +724,8 @@ bool PS2Memory::initialize(size_t ramSize)
     m_gifCopyCount.store(0, std::memory_order_relaxed);
     m_gsWriteCount.store(0, std::memory_order_relaxed);
     m_vifWriteCount.store(0, std::memory_order_relaxed);
+    m_vif1TransferCount.store(0, std::memory_order_relaxed);
+    m_vif1MscalDispatchCount.store(0, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(m_completedDmacMutex);
         m_completedDmacCauses.clear();

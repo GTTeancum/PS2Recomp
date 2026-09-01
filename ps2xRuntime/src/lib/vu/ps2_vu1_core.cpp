@@ -383,6 +383,10 @@ void VU1Interpreter::reset()
     m_state.r = 0x3F800000u;
     m_cycle = 0;
     m_running = false;
+    m_debugExecutionCount.store(0u, std::memory_order_relaxed);
+    m_debugResumeCount.store(0u, std::memory_order_relaxed);
+    m_debugXgkickStartCount.store(0u, std::memory_order_relaxed);
+    m_debugXgkickFinishCount.store(0u, std::memory_order_relaxed);
     resetScheduler();
 }
 
@@ -1320,6 +1324,8 @@ void VU1Interpreter::finishXgkick()
     if (!m_xgkick.active)
         return;
 
+    m_debugXgkickFinishCount.fetch_add(1u, std::memory_order_relaxed);
+
     const XmenXgkickCbpConfig &cbpConfig = xmenXgkickCbpConfig();
     static uint32_t cbpTraceCount = 0u;
     if (cbpConfig.enabled && xmenXgkickIssueTick >= cbpConfig.minTick &&
@@ -1747,6 +1753,8 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
 {
     if (m_unit != Unit::VU1 || !m_activeVuData || m_activeVuDataSize < 16u)
         return;
+
+    m_debugXgkickStartCount.fetch_add(1u, std::memory_order_relaxed);
 
     const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
     xmenXgkickProgramStart = xmenCurrentVuProgramStart;
@@ -2425,6 +2433,7 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                              uint32_t startPC, uint32_t top, uint32_t itop,
                              uint32_t maxCycles)
 {
+    m_debugExecutionCount.fetch_add(1u, std::memory_order_relaxed);
     static std::atomic<uint32_t> titleExecutionCount{0u};
     const uint64_t titleTick = memory
         ? memory->gs().vsyncTick.load(std::memory_order_relaxed)
@@ -2677,6 +2686,7 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
                             GS &gs, PS2Memory *memory,
                             uint32_t top, uint32_t itop, uint32_t maxCycles)
 {
+    m_debugResumeCount.fetch_add(1u, std::memory_order_relaxed);
     if (m_unit == Unit::VU1 && memory)
         xmenCurrentVuTick = memory->gs().vsyncTick.load(std::memory_order_relaxed);
     m_state.top = top;

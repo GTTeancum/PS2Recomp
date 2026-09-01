@@ -436,7 +436,10 @@ bool PS2Memory::dispatchPendingVu1Mscal()
     m_vif1MscalPending = false;
     m_vif1PendingMscalUnpacks = 0u;
     if (m_vu1MscalCallback)
+    {
+        m_vif1MscalDispatchCount.fetch_add(1u, std::memory_order_relaxed);
         m_vu1MscalCallback(startPC, top, itop);
+    }
     return true;
 }
 
@@ -444,6 +447,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u)
         return;
+
+    m_vif1TransferCount.fetch_add(1u, std::memory_order_relaxed);
 
     static std::atomic<uint32_t> vif1TransferTraceCount{0u};
     const uint32_t transferIndex = vif1TransferTraceCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
