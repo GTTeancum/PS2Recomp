@@ -745,6 +745,14 @@ void GS::latchHostPresentationFrame()
             return std::pair<uint32_t, uint32_t>{start, end};
         return std::pair<uint32_t, uint32_t>{UINT32_MAX, 0u};
     }();
+    static const uint32_t latestCaptureInterval = []
+    {
+        uint32_t interval = 0u;
+        const char *value = std::getenv("PS2X_CAPTURE_LATEST_PRESENT_INTERVAL");
+        if (value && std::sscanf(value, "%u", &interval) == 1)
+            return interval;
+        return 0u;
+    }();
     const bool dumpRequestedPresent = presentIndex >= requestedDumpRange.first &&
                                       presentIndex <= requestedDumpRange.second;
     static std::atomic<bool> dumpedFirstNonBlack{false};
@@ -768,6 +776,17 @@ void GS::latchHostPresentationFrame()
             std::fprintf(stderr, "[gs:first-nonblack] index=%u path=%s wrote=%u\n",
                          presentIndex, path.c_str(), wrote ? 1u : 0u);
         }
+    }
+    if (hasFrame && latestCaptureInterval != 0u &&
+        presentIndex % latestCaptureInterval == 0u &&
+        frame.pixels.size() >= static_cast<size_t>(width) * height * 4u)
+    {
+        const bool wrote = writePresentationPpm("gs-present-latest.ppm",
+                                                frame.pixels,
+                                                width,
+                                                height);
+        std::fprintf(stderr, "[gs:present-latest] index=%u wrote=%u\n",
+                     presentIndex, wrote ? 1u : 0u);
     }
     if (hasFrame && (dumpRequestedPresent || presentIndex == 23u || presentIndex == 24u || presentIndex == 128u ||
                      presentIndex == 256u || presentIndex == 384u || presentIndex == 640u ||
