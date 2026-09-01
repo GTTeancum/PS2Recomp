@@ -387,33 +387,47 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
 
 #define READ8(addr) ([&]() -> uint8_t {                       \
     uint32_t _addr = (uint32_t)(addr);                        \
-    return PS2Runtime::isSpecialAddress(_addr)                \
-        ? runtime->Load8(rdram, ctx, _addr)                   \
-        : FAST_READ8(_addr); }())
+    if (PS2Runtime::isSpecialAddress(_addr))                   \
+        return runtime->Load8(rdram, ctx, _addr);              \
+    const uint8_t _value = FAST_READ8(_addr);                  \
+    ps2TraceGuestRead(_addr, 1u, _value, 0u, "READ8", ctx);   \
+    return _value; }())
 
 #define READ16(addr) ([&]() -> uint16_t {                     \
     uint32_t _addr = (uint32_t)(addr);                        \
-    return PS2Runtime::isSpecialAddress(_addr)                \
-        ? runtime->Load16(rdram, ctx, _addr)                  \
-        : FAST_READ16(_addr); }())
+    if (PS2Runtime::isSpecialAddress(_addr))                   \
+        return runtime->Load16(rdram, ctx, _addr);             \
+    const uint16_t _value = FAST_READ16(_addr);                \
+    ps2TraceGuestRead(_addr, 2u, _value, 0u, "READ16", ctx);  \
+    return _value; }())
 
 #define READ32(addr) ([&]() -> uint32_t {                     \
     uint32_t _addr = (uint32_t)(addr);                        \
-    return PS2Runtime::isSpecialAddress(_addr)                \
-        ? runtime->Load32(rdram, ctx, _addr)                  \
-        : FAST_READ32(_addr); }())
+    if (PS2Runtime::isSpecialAddress(_addr))                   \
+        return runtime->Load32(rdram, ctx, _addr);             \
+    const uint32_t _value = FAST_READ32(_addr);                \
+    ps2TraceGuestRead(_addr, 4u, _value, 0u, "READ32", ctx);  \
+    return _value; }())
 
 #define READ64(addr) ([&]() -> uint64_t {                     \
     uint32_t _addr = (uint32_t)(addr);                        \
-    return PS2Runtime::isSpecialAddress(_addr)                \
-        ? runtime->Load64(rdram, ctx, _addr)                  \
-        : FAST_READ64(_addr); }())
+    if (PS2Runtime::isSpecialAddress(_addr))                   \
+        return runtime->Load64(rdram, ctx, _addr);             \
+    const uint64_t _value = FAST_READ64(_addr);                \
+    ps2TraceGuestRead(_addr, 8u, _value, 0u, "READ64", ctx);  \
+    return _value; }())
 
 #define READ128(addr) ([&]() -> __m128i {                     \
     uint32_t _addr = (uint32_t)(addr);                        \
-    return PS2Runtime::isSpecialAddress(_addr)                \
-        ? runtime->Load128(rdram, ctx, _addr)                 \
-        : FAST_READ128(_addr); }())
+    if (PS2Runtime::isSpecialAddress(_addr))                   \
+        return runtime->Load128(rdram, ctx, _addr);            \
+    const __m128i _value = FAST_READ128(_addr);                \
+    ps2TraceGuestRead(                                         \
+        _addr, 16u,                                            \
+        (uint64_t)_mm_cvtsi128_si64(_value),                   \
+        (uint64_t)_mm_cvtsi128_si64(_mm_srli_si128(_value, 8)),\
+        "READ128", ctx);                                      \
+    return _value; }())
 
 #define WRITE8(addr, val)                                                            \
     do                                                                               \

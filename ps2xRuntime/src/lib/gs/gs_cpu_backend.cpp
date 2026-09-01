@@ -110,6 +110,29 @@ namespace
     std::atomic<uint64_t> s_xmenLastDrawTick{0u};
     std::atomic<uint32_t> s_xmenVramDrawTraceCount{0u};
     std::atomic<uint32_t> s_xmenLocalTransferTraceCount{0u};
+    std::atomic<uint32_t> s_xmenHostUploadTraceCount{0u};
+
+    uint64_t parseTraceU64(const char *name, uint64_t fallback)
+    {
+        const char *value = std::getenv(name);
+        if (!value || value[0] == '\0')
+            return fallback;
+
+        char *end = nullptr;
+        const uint64_t parsed = std::strtoull(value, &end, 0);
+        return end && end != value && *end == '\0' ? parsed : fallback;
+    }
+
+    uint64_t fnv1a64Color(uint64_t hash, uint32_t color)
+    {
+        constexpr uint64_t fnvPrime = 1099511628211ull;
+        for (uint32_t shift = 0u; shift < 32u; shift += 8u)
+        {
+            hash ^= static_cast<uint8_t>(color >> shift);
+            hash *= fnvPrime;
+        }
+        return hash;
+    }
 
     bool traceXmenVramRegion()
     {
@@ -121,6 +144,25 @@ namespace
     {
         static const bool enabled = std::getenv("PS2X_TRACE_LOCAL_TRANSFER") != nullptr;
         return enabled;
+    }
+
+    bool traceXmenHostUploads()
+    {
+        static const bool enabled = std::getenv("PS2X_TRACE_HOST_UPLOAD") != nullptr;
+        return enabled;
+    }
+
+    uint64_t xmenHostUploadMinTick()
+    {
+        static const uint64_t tick = parseTraceU64("PS2X_TRACE_HOST_UPLOAD_MIN_TICK", 0u);
+        return tick;
+    }
+
+    uint32_t xmenHostUploadMaxCount()
+    {
+        static const uint32_t count = static_cast<uint32_t>(std::min<uint64_t>(
+            parseTraceU64("PS2X_TRACE_HOST_UPLOAD_MAX_COUNT", 512u), UINT32_MAX));
+        return count;
     }
 
     uint64_t tracedRasterTick()
@@ -171,7 +213,7 @@ namespace
 
     bool isXmenVramRegionBlock(uint32_t block)
     {
-        return block >= 11000u && block <= 11700u;
+        return (block >= 11000u && block <= 11700u) || block == 16256u;
     }
 
     struct XmenTextureSampleTrace
@@ -1065,8 +1107,15 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
         break;
     }
 
+    const uint64_t traceTbp = parseTraceU64("PS2X_TRACE_CLUT_TBP", UINT64_MAX);
+    const uint64_t traceCbp = parseTraceU64("PS2X_TRACE_CLUT_CBP", UINT64_MAX);
+    const bool hasTraceFilter = traceTbp != UINT64_MAX || traceCbp != UINT64_MAX;
+    const bool matchesTraceFilter =
+        (traceTbp == UINT64_MAX || tex0.tbp0 == traceTbp) &&
+        (traceCbp == UINT64_MAX || tex0.cbp == traceCbp);
     const bool traceTarget = std::getenv("PS2X_TRACE_CLUT_LOAD") != nullptr &&
-                             (tex0.tbp0 == 15168u || tex0.cbp == 16256u);
+                             (hasTraceFilter ? matchesTraceFilter
+                                             : (tex0.tbp0 == 15168u || tex0.cbp == 16256u));
     uint32_t traceIndex = UINT32_MAX;
     if (traceTarget)
     {
@@ -1074,7 +1123,7 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
         traceIndex = traceCount.fetch_add(1u, std::memory_order_relaxed);
     }
 
-    constexpr std::array<uint8_t, 4> sampleIndices = {43u, 49u, 58u, 63u};
+    constexpr std::array<uint8_t, 6> sampleIndices = {0u, 1u, 28u, 63u, 205u, 248u};
     const auto readClutSource = [&](uint32_t cacheIndex, bool &available)
     {
         available = cacheIndex >= base && cacheIndex - base < count;
@@ -1117,12 +1166,24 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
 
     if (traceIndex < 256u)
     {
+        uint64_t sourceHash = 14695981039346656037ull;
+        uint32_t sourceCount = 0u;
+        for (uint32_t i = 0u; i < count; ++i)
+        {
+            bool sourceAvailable = false;
+            const uint32_t source = readClutSource(base + i, sourceAvailable);
+            if (!sourceAvailable)
+                break;
+            sourceHash = fnv1a64Color(sourceHash, source);
+            ++sourceCount;
+        }
         std::fprintf(stderr,
                      "[xmen-clut-load] seq=%u tbp=%u psm=%u cbp=%u cpsm=%u csm=%u csa=%u cld=%u "
-                     "cbw=%u cou=%u cov=%u decision=%s cbp0=%u cbp1=%u",
+                     "cbw=%u cou=%u cov=%u decision=%s cbp0=%u cbp1=%u sourceCount=%u sourceHash=%016llx",
                      traceIndex, tex0.tbp0, tex0.psm, tex0.cbp, tex0.cpsm, tex0.csm,
                      tex0.csa, tex0.cld, texclut.cbw, texclut.cou, texclut.cov, decision,
-                     m_clutCbp[0], m_clutCbp[1]);
+                     m_clutCbp[0], m_clutCbp[1], sourceCount,
+                     static_cast<unsigned long long>(sourceHash));
         for (const uint8_t sampleIndex : sampleIndices)
         {
             const uint32_t cacheIndex = resolveClutCacheIndex(sampleIndex, tex0.cpsm,
@@ -1186,7 +1247,15 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
 
     if (traceIndex < 256u)
     {
-        std::fprintf(stderr, "[xmen-clut-loaded] seq=%u", traceIndex);
+        uint64_t cacheHash = 14695981039346656037ull;
+        uint32_t cacheCount = 0u;
+        for (uint32_t i = 0u; i < count && base + i < m_clutCache.size(); ++i)
+        {
+            cacheHash = fnv1a64Color(cacheHash, m_clutCache[base + i]);
+            ++cacheCount;
+        }
+        std::fprintf(stderr, "[xmen-clut-loaded] seq=%u cacheCount=%u cacheHash=%016llx",
+                     traceIndex, cacheCount, static_cast<unsigned long long>(cacheHash));
         for (const uint8_t sampleIndex : sampleIndices)
         {
             const uint32_t cacheIndex = resolveClutCacheIndex(sampleIndex, tex0.cpsm,
@@ -1261,6 +1330,99 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
     };
     const uint32_t before = traceXmenLegal ? readTracePixel() : 0u;
     const GSContext &xmenContext = batch.state.context;
+    static const uint64_t traceTex0Tbp = parseTraceU64("PS2X_TRACE_TEX0_TBP", UINT64_MAX);
+    static const uint64_t traceTex0Cbp = parseTraceU64("PS2X_TRACE_TEX0_CBP", UINT64_MAX);
+    static const uint64_t traceTex0MinPresent = parseTraceU64(
+        "PS2X_TRACE_TEX0_MIN_PRESENT", 0u);
+    const bool traceTex0Draw =
+        (traceTex0Tbp != UINT64_MAX || traceTex0Cbp != UINT64_MAX) &&
+        batch.debugPresentCount >= traceTex0MinPresent &&
+        (traceTex0Tbp == UINT64_MAX || xmenContext.tex0.tbp0 == traceTex0Tbp) &&
+        (traceTex0Cbp == UINT64_MAX || xmenContext.tex0.cbp == traceTex0Cbp);
+    if (traceTex0Draw)
+    {
+        static std::atomic<uint32_t> traceCount{0u};
+        const uint32_t traceIndex = traceCount.fetch_add(1u, std::memory_order_relaxed);
+        if (traceIndex < 256u)
+        {
+            uint64_t clutHash = 14695981039346656037ull;
+            for (uint32_t index = 0u; index < 256u; ++index)
+            {
+                const uint32_t cacheIndex = resolveClutCacheIndex(
+                    static_cast<uint8_t>(index), xmenContext.tex0.cpsm,
+                    xmenContext.tex0.csa, xmenContext.tex0.psm);
+                const uint32_t color = cacheIndex < m_clutCache.size()
+                    ? m_clutCache[cacheIndex]
+                    : 0u;
+                clutHash = fnv1a64Color(clutHash, color);
+            }
+            const uint32_t clut0Index = resolveClutCacheIndex(
+                0u, xmenContext.tex0.cpsm, xmenContext.tex0.csa,
+                xmenContext.tex0.psm);
+            const uint32_t clut0 = clut0Index < m_clutCache.size()
+                ? m_clutCache[clut0Index]
+                : 0u;
+            const GSVertex &v0 = batch.vertices[0u];
+            const GSVertex &v1 = batch.vertices[std::min<uint32_t>(1u, batch.vertexCount - 1u)];
+            const GSVertex &v2 = batch.vertices[batch.vertexCount - 1u];
+            std::fprintf(stderr,
+                         "[xmen-tex0-draw] seq=%u present=%u tick=%llu gifTag=%016llx "
+                         "prim=%u/%u/%u/%u/%u/%u frame=%u/%u/%u/%08x "
+                         "tex0=%u/%u/%u/%u/%u/%u/%u/%u/%u/%u/%u/%u "
+                         "texclut=%u/%u/%u texa=%u/%u/%u alpha=%016llx test=%016llx "
+                         "pabe=%u colclamp=%016llx clamp=%016llx clutHash=%016llx clut0=%08x "
+                         "vertices=%u v0=%.3f,%.3f,%.0f/%u,%u,%u,%u "
+                         "v1=%.3f,%.3f,%.0f/%u,%u,%u,%u "
+                         "v2=%.3f,%.3f,%.0f/%u,%u,%u,%u\n",
+                         traceIndex, batch.debugPresentCount,
+                         static_cast<unsigned long long>(batch.debugVsyncTick),
+                         static_cast<unsigned long long>(batch.debugGifTagLo),
+                         static_cast<unsigned>(batch.state.prim.type),
+                         batch.state.prim.tme ? 1u : 0u,
+                         batch.state.prim.abe ? 1u : 0u,
+                         batch.state.prim.fst ? 1u : 0u,
+                         batch.state.prim.iip ? 1u : 0u,
+                         batch.state.prim.fge ? 1u : 0u,
+                         xmenContext.frame.fbp, xmenContext.frame.fbw,
+                         static_cast<unsigned>(xmenContext.frame.psm),
+                         xmenContext.frame.fbmsk,
+                         xmenContext.tex0.tbp0,
+                         static_cast<unsigned>(xmenContext.tex0.tbw),
+                         static_cast<unsigned>(xmenContext.tex0.psm),
+                         static_cast<unsigned>(xmenContext.tex0.tw),
+                         static_cast<unsigned>(xmenContext.tex0.th),
+                         static_cast<unsigned>(xmenContext.tex0.tcc),
+                         static_cast<unsigned>(xmenContext.tex0.tfx),
+                         xmenContext.tex0.cbp,
+                         static_cast<unsigned>(xmenContext.tex0.cpsm),
+                         static_cast<unsigned>(xmenContext.tex0.csm),
+                         static_cast<unsigned>(xmenContext.tex0.csa),
+                         static_cast<unsigned>(xmenContext.tex0.cld),
+                         static_cast<unsigned>(batch.state.texclut.cbw),
+                         static_cast<unsigned>(batch.state.texclut.cou),
+                         static_cast<unsigned>(batch.state.texclut.cov),
+                         static_cast<unsigned>(batch.state.texa.ta0),
+                         batch.state.texa.aem ? 1u : 0u,
+                         static_cast<unsigned>(batch.state.texa.ta1),
+                         static_cast<unsigned long long>(xmenContext.alpha),
+                         static_cast<unsigned long long>(xmenContext.test),
+                         batch.state.pabe ? 1u : 0u,
+                         static_cast<unsigned long long>(batch.state.colclamp),
+                         static_cast<unsigned long long>(xmenContext.clamp),
+                         static_cast<unsigned long long>(clutHash), clut0,
+                         static_cast<unsigned>(batch.vertexCount),
+                         v0.x, v0.y, v0.z, static_cast<unsigned>(v0.r),
+                         static_cast<unsigned>(v0.g), static_cast<unsigned>(v0.b),
+                         static_cast<unsigned>(v0.a),
+                         v1.x, v1.y, v1.z, static_cast<unsigned>(v1.r),
+                         static_cast<unsigned>(v1.g), static_cast<unsigned>(v1.b),
+                         static_cast<unsigned>(v1.a),
+                         v2.x, v2.y, v2.z, static_cast<unsigned>(v2.r),
+                         static_cast<unsigned>(v2.g), static_cast<unsigned>(v2.b),
+                         static_cast<unsigned>(v2.a));
+            std::fflush(stderr);
+        }
+    }
     const bool isXmenWorldStrip = batch.debugVsyncTick >= 1910u &&
                                   (xmenContext.frame.fbp == 0u || xmenContext.frame.fbp == 140u) &&
                                   batch.state.prim.type == GS_PRIM_TRISTRIP;
@@ -1296,29 +1458,44 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
     }
     static const std::pair<uint32_t, uint32_t> xmenGameplayRasterRange = []
     {
-        uint32_t start = 636u;
-        uint32_t end = 644u;
+        uint32_t start = UINT32_MAX;
+        uint32_t end = 0u;
         const char *value = std::getenv("PS2X_XMEN_GAMEPLAY_RASTER_RANGE");
         if (value && std::sscanf(value, "%u-%u", &start, &end) == 2 && start <= end)
             return std::pair<uint32_t, uint32_t>{start, end};
-        return std::pair<uint32_t, uint32_t>{636u, 644u};
+        return std::pair<uint32_t, uint32_t>{UINT32_MAX, 0u};
     }();
     const bool traceXmenGameplayRaster =
         batch.debugPresentCount >= xmenGameplayRasterRange.first &&
         batch.debugPresentCount <= xmenGameplayRasterRange.second;
-    static const uint32_t traceTopChromaPresent = []
+    static const std::pair<uint32_t, uint32_t> traceTopChromaRange = []
     {
+        if (const char *value = std::getenv("PS2X_TRACE_TOP_CHROMA_RANGE"))
+        {
+            uint32_t start = UINT32_MAX;
+            uint32_t end = 0u;
+            if (std::sscanf(value, "%u-%u", &start, &end) == 2 && start <= end)
+                return std::pair<uint32_t, uint32_t>{start, end};
+        }
+
         const char *value = std::getenv("PS2X_TRACE_TOP_CHROMA_PRESENT");
         if (!value)
-            return UINT32_MAX;
+            return std::pair<uint32_t, uint32_t>{UINT32_MAX, 0u};
 
         char *end = nullptr;
         const unsigned long parsed = std::strtoul(value, &end, 10);
-        return end != value && *end == '\0'
-            ? static_cast<uint32_t>(std::min<unsigned long>(parsed, UINT32_MAX))
-            : UINT32_MAX;
+        if (end != value && *end == '\0')
+        {
+            const uint32_t present =
+                static_cast<uint32_t>(std::min<unsigned long>(parsed, UINT32_MAX));
+            return std::pair<uint32_t, uint32_t>{present, present};
+        }
+
+        return std::pair<uint32_t, uint32_t>{UINT32_MAX, 0u};
     }();
-    const bool traceTopChroma = batch.debugPresentCount == traceTopChromaPresent;
+    const bool traceTopChroma =
+        batch.debugPresentCount >= traceTopChromaRange.first &&
+        batch.debugPresentCount <= traceTopChromaRange.second;
     const bool traceRasterTick = batch.debugVsyncTick == tracedRasterTick();
     if (traceXmenGameplayRaster && s_xmenGameplayRaster.present == UINT32_MAX)
     {
@@ -3435,6 +3612,43 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         return;
     if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
         return;
+
+    const uint64_t uploadTick = s_xmenLastDrawTick.load(std::memory_order_relaxed);
+    if (traceXmenHostUploads() && uploadTick >= xmenHostUploadMinTick())
+    {
+        const uint32_t traceIndex = s_xmenHostUploadTraceCount.fetch_add(1u, std::memory_order_relaxed);
+        if (traceIndex < xmenHostUploadMaxCount())
+        {
+            uint64_t hash = 14695981039346656037ull;
+            for (uint32_t i = 0u; i < sizeBytes; ++i)
+            {
+                hash ^= data[i];
+                hash *= 1099511628211ull;
+            }
+            std::fprintf(stderr,
+                         "[xmen-host-upload] index=%u present=%u tick=%llu "
+                         "dst=%u/%u/0x%x pos=%u,%u size=%u,%u copied=%u/%u "
+                         "bytes=%u fnv1a64=%016llx head=",
+                         traceIndex,
+                         s_xmenLastDrawPresent.load(std::memory_order_relaxed),
+                         static_cast<unsigned long long>(uploadTick),
+                         m_transfer.bitbltbuf.dbp,
+                         static_cast<unsigned>(m_transfer.bitbltbuf.dbw),
+                         static_cast<unsigned>(m_transfer.bitbltbuf.dpsm),
+                         m_transfer.trxpos.dsax,
+                         m_transfer.trxpos.dsay,
+                         m_transfer.trxreg.rrw,
+                         m_transfer.trxreg.rrh,
+                         m_transferState.copiedPixels,
+                         m_transferState.totalPixels,
+                         sizeBytes,
+                         static_cast<unsigned long long>(hash));
+            for (uint32_t i = 0u; i < std::min<uint32_t>(sizeBytes, 16u); ++i)
+                std::fprintf(stderr, "%02x", static_cast<unsigned>(data[i]));
+            std::fprintf(stderr, "\n");
+            std::fflush(stderr);
+        }
+    }
 
     if (traceXmenVramRegion() && isXmenVramRegionBlock(m_transfer.bitbltbuf.dbp))
     {

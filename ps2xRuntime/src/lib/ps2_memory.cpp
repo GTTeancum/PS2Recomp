@@ -53,6 +53,18 @@ namespace
         return enabled;
     }
 
+    uint32_t tracedGifDestinationBlock()
+    {
+        static const uint32_t block = []()
+        {
+            const char *value = std::getenv("PS2X_TRACE_GIF_DESTINATION_BLOCK");
+            return value && value[0] != '\0'
+                ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0))
+                : 0u;
+        }();
+        return block;
+    }
+
 #if defined(_WIN32)
     struct RdramPageWatch
     {
@@ -63,6 +75,7 @@ namespace
         uint32_t size = 0u;
         bool match32Enabled = false;
         bool match32Any = false;
+        bool reportAnyWrite = false;
         uint32_t match32 = 0u;
         uint64_t armTick = 0u;
         uint8_t *page = nullptr;
@@ -70,6 +83,7 @@ namespace
         DWORD originalProtection = PAGE_READWRITE;
         PVOID handler = nullptr;
         uintptr_t instruction = 0u;
+        uintptr_t accessAddress = 0u;
         uintptr_t moduleBase = 0u;
         DWORD threadId = 0u;
         USHORT frameCount = 0u;
@@ -81,6 +95,7 @@ namespace
     RdramPageWatch rdramPageWatch;
     thread_local bool rdramPageWatchSingleStep = false;
     thread_local uintptr_t rdramPageWatchInstruction = 0u;
+    thread_local uintptr_t rdramPageWatchAccessAddress = 0u;
     thread_local DWORD rdramPageWatchThreadId = 0u;
     thread_local USHORT rdramPageWatchFrameCount = 0u;
     thread_local std::array<void *, 24> rdramPageWatchFrames{};
@@ -119,6 +134,7 @@ namespace
             rdramPageWatchInstruction =
                 static_cast<uintptr_t>(exception->ContextRecord->Eip);
 #endif
+            rdramPageWatchAccessAddress = accessAddress;
             rdramPageWatchThreadId = GetCurrentThreadId();
             rdramPageWatchFrameCount = RtlCaptureStackBackTrace(
                 0u, static_cast<DWORD>(rdramPageWatchFrames.size()),
@@ -147,6 +163,11 @@ namespace
             const bool changed =
                 std::memcmp(rdramPageWatchBefore.data(), after.data(),
                             rdramPageWatch.size) != 0;
+            const uintptr_t watchedStart = reinterpret_cast<uintptr_t>(
+                rdramPageWatch.rdram + rdramPageWatch.guestAddress);
+            const bool wroteWatchedRange =
+                rdramPageWatchAccessAddress >= watchedStart &&
+                rdramPageWatchAccessAddress < watchedStart + rdramPageWatch.size;
             bool matched = !rdramPageWatch.match32Enabled;
             if (rdramPageWatch.match32Enabled)
             {
@@ -166,9 +187,11 @@ namespace
                     }
                 }
             }
-            if (changed && matched)
+            if ((changed || (rdramPageWatch.reportAnyWrite && wroteWatchedRange)) &&
+                matched)
             {
                 rdramPageWatch.instruction = rdramPageWatchInstruction;
+                rdramPageWatch.accessAddress = rdramPageWatchAccessAddress;
                 rdramPageWatch.threadId = rdramPageWatchThreadId;
                 rdramPageWatch.frameCount = rdramPageWatchFrameCount;
                 rdramPageWatch.frames = rdramPageWatchFrames;
@@ -227,7 +250,8 @@ namespace
         rdramPageWatch.enabled.store(true);
         std::fprintf(stderr,
                      "[xmen-rdram-page-watch:armed] tick=%llu guest=0x%08x size=0x%x "
-                     "host=%p page=%p module=0x%llx match32=%s0x%08x any=%u\n",
+                     "host=%p page=%p module=0x%llx match32=%s0x%08x any=%u "
+                     "reportAnyWrite=%u\n",
                      static_cast<unsigned long long>(tick),
                      rdramPageWatch.guestAddress, rdramPageWatch.size,
                      rdramPageWatch.rdram + rdramPageWatch.guestAddress,
@@ -235,7 +259,8 @@ namespace
                      static_cast<unsigned long long>(rdramPageWatch.moduleBase),
                      rdramPageWatch.match32Enabled ? "" : "disabled:",
                      rdramPageWatch.match32,
-                     rdramPageWatch.match32Any ? 1u : 0u);
+                     rdramPageWatch.match32Any ? 1u : 0u,
+                     rdramPageWatch.reportAnyWrite ? 1u : 0u);
     }
 
     void initializeRdramPageWatch(uint8_t *rdram, size_t ramSize)
@@ -275,6 +300,8 @@ namespace
             : 0u;
         rdramPageWatch.match32Any =
             std::getenv("PS2X_WATCH_RDRAM_PAGE_MATCH32_ANY") != nullptr;
+        rdramPageWatch.reportAnyWrite =
+            std::getenv("PS2X_WATCH_RDRAM_PAGE_REPORT_ANY_WRITE") != nullptr;
         const char *armTickValue = std::getenv("PS2X_WATCH_RDRAM_PAGE_ARM_TICK");
         rdramPageWatch.armTick = armTickValue
             ? std::strtoull(armTickValue, nullptr, 0)
@@ -301,8 +328,11 @@ namespace
 
         std::fprintf(stderr,
                      "[xmen-rdram-page-watch:changed] guest=0x%08x size=0x%x "
-                     "thread=%lu rip=0x%llx module=0x%llx offset=0x%llx before=",
+                     "accessGuest=0x%08x thread=%lu rip=0x%llx module=0x%llx "
+                     "offset=0x%llx before=",
                      rdramPageWatch.guestAddress, rdramPageWatch.size,
+                     static_cast<uint32_t>(rdramPageWatch.accessAddress -
+                         reinterpret_cast<uintptr_t>(rdramPageWatch.rdram)),
                      static_cast<unsigned long>(rdramPageWatch.threadId),
                      static_cast<unsigned long long>(rdramPageWatch.instruction),
                      static_cast<unsigned long long>(rdramPageWatch.moduleBase),
@@ -1850,6 +1880,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     std::vector<uint8_t> chainBuf;
                     std::vector<Vif1TraceProvenance> chainProvenance;
                     bool chainEnded = false;
+                    uint32_t tracedDestinationFollowups = 0u;
                     const uint32_t chainStartTagAddr = tagAddr;
                     const bool traceXmenCorruptChain =
                         channelBase == 0x10009000u &&
@@ -2107,6 +2138,56 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                         if (hasPayload)
                             appendData(dataAddr, tagQwc, currentTagAddr);
+                        if (channelBase == 0x1000A000u && tracedGifDestinationBlock() != 0u)
+                        {
+                            bool foundDestination = false;
+                            for (size_t offset = flattenedStart + 8u;
+                                 offset + 8u <= chainBuf.size(); offset += 8u)
+                            {
+                                uint64_t bitbltbuf = 0u;
+                                uint64_t bitbltbufReg = 0u;
+                                std::memcpy(&bitbltbuf, chainBuf.data() + offset - 8u,
+                                            sizeof(bitbltbuf));
+                                std::memcpy(&bitbltbufReg, chainBuf.data() + offset,
+                                            sizeof(bitbltbufReg));
+                                const uint32_t dbp =
+                                    static_cast<uint32_t>((bitbltbuf >> 32u) & 0x3FFFu);
+                                if ((bitbltbufReg & 0xFFu) == 0x50u &&
+                                    dbp == tracedGifDestinationBlock())
+                                {
+                                    foundDestination = true;
+                                    tracedDestinationFollowups = 4u;
+                                    std::fprintf(stderr,
+                                                 "[gif-destination-source] phase=setup start=%08x "
+                                                 "tag=%08x id=%u qwc=%u payload=%08x source=%08x "
+                                                 "flat=0x%zx bitblt=%016llx\n",
+                                                 chainStartTagAddr, currentTagAddr, id, tagQwc,
+                                                 dataAddr,
+                                                 dataAddr + static_cast<uint32_t>(
+                                                     offset - flattenedStart - 8u),
+                                                 offset - 8u,
+                                                 static_cast<unsigned long long>(bitbltbuf));
+                                    break;
+                                }
+                            }
+
+                            if (foundDestination || tracedDestinationFollowups != 0u)
+                            {
+                                std::fprintf(stderr,
+                                             "[gif-destination-source] phase=payload start=%08x "
+                                             "tag=%08x id=%u qwc=%u payload=%08x flat=0x%zx..0x%zx "
+                                             "head=",
+                                             chainStartTagAddr, currentTagAddr, id, tagQwc,
+                                             dataAddr, flattenedStart, chainBuf.size());
+                                const size_t dumpEnd = std::min<size_t>(
+                                    chainBuf.size(), flattenedStart + 64u);
+                                for (size_t index = flattenedStart; index < dumpEnd; ++index)
+                                    std::fprintf(stderr, "%02x", chainBuf[index]);
+                                std::fprintf(stderr, "\n");
+                                if (!foundDestination)
+                                    --tracedDestinationFollowups;
+                            }
+                        }
                         if (xmenVifChainMap)
                         {
                             std::fprintf(xmenVifChainMap,

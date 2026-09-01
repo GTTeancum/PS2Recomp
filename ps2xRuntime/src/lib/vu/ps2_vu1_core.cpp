@@ -109,6 +109,7 @@ namespace
     {
         bool enabled = false;
         uint64_t minTick = 0u;
+        uint64_t minExecution = 0u;
         uint32_t maxEntries = 256u;
     };
 
@@ -127,6 +128,20 @@ namespace
             if (!tickEnd || tickEnd == tickValue || *tickEnd != '\0')
                 return XmenXgkickCensusConfig{};
 
+            const char *executionValue =
+                std::getenv("PS2X_TRACE_XGKICK_CENSUS_MIN_EXECUTION");
+            if (executionValue && executionValue[0] != '\0')
+            {
+                char *executionEnd = nullptr;
+                const uint64_t parsedExecution =
+                    std::strtoull(executionValue, &executionEnd, 0);
+                if (executionEnd && executionEnd != executionValue &&
+                    *executionEnd == '\0')
+                {
+                    result.minExecution = parsedExecution;
+                }
+            }
+
             const char *maxValue =
                 std::getenv("PS2X_TRACE_XGKICK_CENSUS_MAX");
             if (maxValue && maxValue[0] != '\0')
@@ -141,6 +156,63 @@ namespace
                         std::min<unsigned long>(parsedMax, 65536u));
                 }
             }
+            result.enabled = true;
+            return result;
+        }();
+        return config;
+    }
+
+    struct XmenXgkickCbpConfig
+    {
+        bool enabled = false;
+        uint32_t cbp = 0u;
+        uint64_t minTick = 0u;
+        uint32_t maxEntries = 64u;
+    };
+
+    const XmenXgkickCbpConfig &xmenXgkickCbpConfig()
+    {
+        static const XmenXgkickCbpConfig config = []()
+        {
+            XmenXgkickCbpConfig result{};
+            const char *cbpValue = std::getenv("PS2X_TRACE_XGKICK_CBP");
+            if (!cbpValue || cbpValue[0] == '\0')
+                return result;
+
+            char *cbpEnd = nullptr;
+            const unsigned long parsedCbp = std::strtoul(cbpValue, &cbpEnd, 0);
+            if (!cbpEnd || cbpEnd == cbpValue || *cbpEnd != '\0' ||
+                parsedCbp > 0x3FFFu)
+            {
+                return XmenXgkickCbpConfig{};
+            }
+            result.cbp = static_cast<uint32_t>(parsedCbp);
+
+            const char *tickValue =
+                std::getenv("PS2X_TRACE_XGKICK_CBP_MIN_TICK");
+            if (tickValue && tickValue[0] != '\0')
+            {
+                char *tickEnd = nullptr;
+                const uint64_t parsedTick = std::strtoull(tickValue, &tickEnd, 0);
+                if (tickEnd && tickEnd != tickValue && *tickEnd == '\0')
+                    result.minTick = parsedTick;
+            }
+
+            const char *maxValue =
+                std::getenv("PS2X_TRACE_XGKICK_CBP_MAX");
+            if (maxValue && maxValue[0] != '\0')
+            {
+                char *maxEnd = nullptr;
+                const unsigned long parsedMax =
+                    std::strtoul(maxValue, &maxEnd, 0);
+                if (maxEnd && maxEnd != maxValue && *maxEnd == '\0' &&
+                    parsedMax > 0u)
+                {
+                    result.maxEntries = static_cast<uint32_t>(
+                        std::min<unsigned long>(parsedMax, 4096u));
+                }
+            }
+
             result.enabled = true;
             return result;
         }();
@@ -867,6 +939,54 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
 
 void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
 {
+    static const uint32_t xmenTargetStoreAddressFirst = []()
+    {
+        const char *value = std::getenv("PS2X_TRACE_VU_STORE_ADDRESS_FIRST");
+        if (!value || value[0] == '\0')
+            return UINT32_MAX;
+
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 0);
+        return end && end != value && *end == '\0' && parsed <= UINT32_MAX
+            ? static_cast<uint32_t>(parsed)
+            : UINT32_MAX;
+    }();
+    static const uint32_t xmenTargetStoreAddressLast = []()
+    {
+        const char *value = std::getenv("PS2X_TRACE_VU_STORE_ADDRESS_LAST");
+        if (!value || value[0] == '\0')
+            return UINT32_MAX;
+
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 0);
+        return end && end != value && *end == '\0' && parsed <= UINT32_MAX
+            ? static_cast<uint32_t>(parsed)
+            : UINT32_MAX;
+    }();
+    static const uint64_t xmenTargetStoreMinTick = []()
+    {
+        const char *value = std::getenv("PS2X_TRACE_VU_STORE_MIN_TICK");
+        if (!value || value[0] == '\0')
+            return uint64_t{0};
+
+        char *end = nullptr;
+        const unsigned long long parsed = std::strtoull(value, &end, 0);
+        return end && end != value && *end == '\0'
+            ? static_cast<uint64_t>(parsed)
+            : uint64_t{0};
+    }();
+    static const uint32_t xmenTargetStoreMaxTraces = []()
+    {
+        const char *value = std::getenv("PS2X_TRACE_VU_STORE_MAX_TRACES");
+        if (!value || value[0] == '\0')
+            return 512u;
+
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 0);
+        return end && end != value && *end == '\0' && parsed > 0u && parsed <= UINT32_MAX
+            ? static_cast<uint32_t>(parsed)
+            : 512u;
+    }();
     static const uint32_t xmenTargetStoreWordIndex = []()
     {
         const char *value = std::getenv("PS2X_TRACE_VU_STORE_WORD_INDEX");
@@ -891,9 +1011,20 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
             ? static_cast<uint64_t>(static_cast<uint32_t>(parsed))
             : UINT64_MAX;
     }();
-    if (xmenTargetStoreWord0 != UINT64_MAX &&
-        words[xmenTargetStoreWordIndex] ==
-            static_cast<uint32_t>(xmenTargetStoreWord0))
+    const bool matchAddress = xmenTargetStoreAddressFirst != UINT32_MAX &&
+        address >= xmenTargetStoreAddressFirst &&
+        address <= (xmenTargetStoreAddressLast != UINT32_MAX
+            ? xmenTargetStoreAddressLast
+            : xmenTargetStoreAddressFirst);
+    const bool matchWord = xmenTargetStoreWord0 != UINT64_MAX &&
+        words[xmenTargetStoreWordIndex] == static_cast<uint32_t>(xmenTargetStoreWord0);
+    static std::atomic<uint32_t> xmenTargetStoreTraceCount{0u};
+    if ((xmenTargetStoreAddressFirst != UINT32_MAX || xmenTargetStoreWord0 != UINT64_MAX) &&
+        (xmenTargetStoreAddressFirst == UINT32_MAX || matchAddress) &&
+        (xmenTargetStoreWord0 == UINT64_MAX || matchWord) &&
+        xmenCurrentVuTick >= xmenTargetStoreMinTick &&
+        xmenTargetStoreTraceCount.fetch_add(1u, std::memory_order_relaxed) <
+            xmenTargetStoreMaxTraces)
     {
         std::fprintf(stderr,
                      "[xmen-vu1:target-store] tick=%llu execution=%llu "
@@ -1189,6 +1320,181 @@ void VU1Interpreter::finishXgkick()
     if (!m_xgkick.active)
         return;
 
+    const XmenXgkickCbpConfig &cbpConfig = xmenXgkickCbpConfig();
+    static uint32_t cbpTraceCount = 0u;
+    if (cbpConfig.enabled && xmenXgkickIssueTick >= cbpConfig.minTick &&
+        cbpTraceCount < cbpConfig.maxEntries)
+    {
+        const uint32_t packetBytes = std::min<uint32_t>(
+            m_xgkick.totalBytes,
+            static_cast<uint32_t>(m_xgkick.packet.size()));
+        uint32_t tagOffset = 0u;
+        bool packetEnded = false;
+        while (!packetEnded && tagOffset + 16u <= packetBytes &&
+               cbpTraceCount < cbpConfig.maxEntries)
+        {
+            uint64_t tagLo = 0u;
+            uint64_t tagHi = 0u;
+            std::memcpy(&tagLo, m_xgkick.packet.data() + tagOffset, sizeof(tagLo));
+            std::memcpy(&tagHi,
+                        m_xgkick.packet.data() + tagOffset + sizeof(tagLo),
+                        sizeof(tagHi));
+
+            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+            const uint32_t format =
+                static_cast<uint32_t>((tagLo >> 58u) & 0x3u);
+            uint32_t nreg = static_cast<uint32_t>((tagLo >> 60u) & 0xFu);
+            if (nreg == 0u)
+                nreg = 16u;
+            packetEnded = ((tagLo >> 15u) & 1u) != 0u;
+
+            uint32_t payloadOffset = tagOffset + 16u;
+            const auto traceRegister = [&](uint32_t valueOffset,
+                                           uint8_t regAddr,
+                                           uint64_t value,
+                                           uint8_t descriptor)
+            {
+                if (regAddr != GS_REG_TEX0_1 && regAddr != GS_REG_TEX0_2 &&
+                    regAddr != GS_REG_TEX2_1 && regAddr != GS_REG_TEX2_2)
+                {
+                    return;
+                }
+                const uint32_t cbp = static_cast<uint32_t>((value >> 37u) & 0x3FFFu);
+                if (cbp != cbpConfig.cbp ||
+                    cbpTraceCount >= cbpConfig.maxEntries)
+                {
+                    return;
+                }
+
+                ++cbpTraceCount;
+                std::fprintf(stderr,
+                             "[xmen-vu1:xgkick-cbp] tick=%llu execution=%llu "
+                             "program=0x%x issuePc=0x%x source=0x%x bytes=%u "
+                             "tagOffset=0x%x valueOffset=0x%x format=%u "
+                             "descriptor=0x%x reg=0x%x value=0x%016llx "
+                             "tbp=0x%x cbp=0x%x\n",
+                             static_cast<unsigned long long>(xmenXgkickIssueTick),
+                             static_cast<unsigned long long>(xmenXgkickExecution),
+                             xmenXgkickProgramStart,
+                             xmenXgkickIssuePc,
+                             m_xgkick.sourceAddress,
+                             m_xgkick.totalBytes,
+                             tagOffset,
+                             valueOffset,
+                             format,
+                             descriptor,
+                             regAddr,
+                             static_cast<unsigned long long>(value),
+                             static_cast<uint32_t>(value & 0x3FFFu),
+                             cbp);
+
+                const uint32_t firstQword =
+                    valueOffset >= 32u ? valueOffset / 16u - 2u : 0u;
+                const uint32_t lastQword = std::min<uint32_t>(
+                    packetBytes / 16u,
+                    valueOffset / 16u + 3u);
+                std::fprintf(stderr, "[xmen-vu1:xgkick-cbp-payload]");
+                for (uint32_t qword = firstQword; qword < lastQword; ++qword)
+                {
+                    uint64_t lo = 0u;
+                    uint64_t hi = 0u;
+                    std::memcpy(&lo,
+                                m_xgkick.packet.data() + qword * 16u,
+                                sizeof(lo));
+                    std::memcpy(&hi,
+                                m_xgkick.packet.data() + qword * 16u + sizeof(lo),
+                                sizeof(hi));
+                    std::fprintf(stderr,
+                                 " q%u=%016llx:%016llx",
+                                 qword,
+                                 static_cast<unsigned long long>(lo),
+                                 static_cast<unsigned long long>(hi));
+                }
+                std::fprintf(stderr, "\n");
+                std::fflush(stderr);
+            };
+
+            if (format == GIF_FMT_PACKED)
+            {
+                for (uint32_t loop = 0u; loop < nloop; ++loop)
+                {
+                    for (uint32_t reg = 0u; reg < nreg; ++reg)
+                    {
+                        if (payloadOffset + 16u > packetBytes)
+                        {
+                            packetEnded = true;
+                            break;
+                        }
+                        const uint8_t descriptor = static_cast<uint8_t>(
+                            (tagHi >> (reg * 4u)) & 0xFu);
+                        uint64_t lo = 0u;
+                        uint64_t hi = 0u;
+                        std::memcpy(&lo,
+                                    m_xgkick.packet.data() + payloadOffset,
+                                    sizeof(lo));
+                        std::memcpy(&hi,
+                                    m_xgkick.packet.data() + payloadOffset + sizeof(lo),
+                                    sizeof(hi));
+                        if (descriptor == 0x0Eu)
+                        {
+                            traceRegister(payloadOffset,
+                                          static_cast<uint8_t>(hi & 0xFFu),
+                                          lo,
+                                          descriptor);
+                        }
+                        else
+                        {
+                            traceRegister(payloadOffset,
+                                          descriptor,
+                                          lo,
+                                          descriptor);
+                        }
+                        payloadOffset += 16u;
+                    }
+                }
+            }
+            else if (format == GIF_FMT_REGLIST)
+            {
+                const uint64_t valueCount =
+                    static_cast<uint64_t>(nloop) * nreg;
+                for (uint64_t valueIndex = 0u; valueIndex < valueCount;
+                     ++valueIndex)
+                {
+                    if (payloadOffset + 8u > packetBytes)
+                    {
+                        packetEnded = true;
+                        break;
+                    }
+                    const uint32_t reg = static_cast<uint32_t>(valueIndex % nreg);
+                    const uint8_t descriptor = static_cast<uint8_t>(
+                        (tagHi >> (reg * 4u)) & 0xFu);
+                    uint64_t value = 0u;
+                    std::memcpy(&value,
+                                m_xgkick.packet.data() + payloadOffset,
+                                sizeof(value));
+                    traceRegister(payloadOffset,
+                                  descriptor,
+                                  value,
+                                  descriptor);
+                    payloadOffset += 8u;
+                }
+                payloadOffset = (payloadOffset + 15u) & ~15u;
+            }
+            else
+            {
+                const uint64_t imageBytes = static_cast<uint64_t>(nloop) * 16u;
+                if (imageBytes > packetBytes - payloadOffset)
+                    payloadOffset = packetBytes;
+                else
+                    payloadOffset += static_cast<uint32_t>(imageBytes);
+            }
+
+            if (payloadOffset <= tagOffset || payloadOffset > packetBytes)
+                break;
+            tagOffset = payloadOffset;
+        }
+    }
+
     const XmenTargetXgkickConfig &targetConfig = xmenTargetXgkickConfig();
     if (targetConfig.enabled && m_xgkick.totalBytes >= 16u &&
         xmenXgkickIssueTick >= targetConfig.minTick)
@@ -1268,6 +1574,7 @@ void VU1Interpreter::finishXgkick()
     static uint32_t censusTraceCount = 0u;
     if (censusConfig.enabled && m_xgkick.totalBytes >= 16u &&
         xmenXgkickIssueTick >= censusConfig.minTick &&
+        xmenXgkickExecution >= censusConfig.minExecution &&
         censusTraceCount++ < censusConfig.maxEntries)
     {
         uint64_t tagLo = 0u;

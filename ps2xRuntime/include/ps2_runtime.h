@@ -271,6 +271,82 @@ inline uint32_t ps2TraceGuestRegisterLo32(const R5900Context *ctx, uint32_t reg)
     return static_cast<uint32_t>(_mm_cvtsi128_si64(ctx->r[reg]));
 }
 
+inline void ps2TraceGuestRead(uint32_t guestAddr,
+                              uint32_t size,
+                              uint64_t valueLo,
+                              uint64_t valueHi,
+                              const char *op,
+                              const R5900Context *ctx)
+{
+    static const uint32_t firstAddress = []()
+    {
+        const char *value = std::getenv("PS2X_TRACE_GUEST_READ_ADDRESS_FIRST");
+        if (!value || value[0] == '\0')
+            return UINT32_MAX;
+
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 0);
+        return end && end != value && *end == '\0' && parsed <= UINT32_MAX
+            ? static_cast<uint32_t>(parsed) & PS2_RAM_MASK
+            : UINT32_MAX;
+    }();
+    if (firstAddress == UINT32_MAX || size == 0u)
+        return;
+
+    static const uint32_t lastAddress = []()
+    {
+        const char *value = std::getenv("PS2X_TRACE_GUEST_READ_ADDRESS_LAST");
+        if (!value || value[0] == '\0')
+            return UINT32_MAX;
+
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 0);
+        return end && end != value && *end == '\0' && parsed <= UINT32_MAX
+            ? static_cast<uint32_t>(parsed) & PS2_RAM_MASK
+            : UINT32_MAX;
+    }();
+    static const uint32_t maxTraces = []()
+    {
+        const char *value = std::getenv("PS2X_TRACE_GUEST_READ_MAX_TRACES");
+        if (!value || value[0] == '\0')
+            return 256u;
+
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 0);
+        return end && end != value && *end == '\0' && parsed > 0u &&
+                parsed <= UINT32_MAX
+            ? static_cast<uint32_t>(parsed)
+            : 256u;
+    }();
+
+    const uint32_t readStart = guestAddr & PS2_RAM_MASK;
+    const uint32_t readLast = readStart + size - 1u;
+    const uint32_t rangeLast = lastAddress != UINT32_MAX ? lastAddress : firstAddress;
+    if (readLast < firstAddress || readStart > rangeLast)
+        return;
+
+    static std::atomic<uint32_t> traceCount{0u};
+    const uint32_t index = traceCount.fetch_add(1u, std::memory_order_relaxed);
+    if (index >= maxTraces)
+        return;
+
+    std::cerr << "[guest-read-watch] index=" << std::dec << index
+              << " op=" << op
+              << " addr=0x" << std::hex << guestAddr
+              << " physical=0x" << readStart
+              << " size=0x" << size
+              << " lo=0x" << valueLo
+              << " hi=0x" << valueHi
+              << " pc=0x" << (ctx ? ctx->pc : 0u)
+              << " ra=0x" << ps2TraceGuestRegisterLo32(ctx, 31)
+              << " sp=0x" << ps2TraceGuestRegisterLo32(ctx, 29)
+              << " a0=0x" << ps2TraceGuestRegisterLo32(ctx, 4)
+              << " a1=0x" << ps2TraceGuestRegisterLo32(ctx, 5)
+              << " a2=0x" << ps2TraceGuestRegisterLo32(ctx, 6)
+              << " a3=0x" << ps2TraceGuestRegisterLo32(ctx, 7)
+              << std::dec << std::endl;
+}
+
 inline void ps2TraceGuestWrite(uint8_t *rdram,
                                uint32_t guestAddr,
                                uint32_t size,
@@ -547,6 +623,53 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
     }
 
     const uint32_t writeWords = std::min(size / 4u, 4u);
+    static const uint32_t targetWriteValue = []()
+    {
+        const char *value = std::getenv("PS2X_TRACE_GUEST_WRITE_VALUE");
+        if (!value || value[0] == '\0')
+            return UINT32_MAX;
+
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 0);
+        return end && end != value && *end == '\0' && parsed <= UINT32_MAX
+            ? static_cast<uint32_t>(parsed)
+            : UINT32_MAX;
+    }();
+    bool containsTargetWriteValue = false;
+    for (uint32_t word = 0u; word < writeWords; ++word)
+    {
+        const uint64_t source = word < 2u ? valueLo : valueHi;
+        const uint32_t shift = (word & 1u) * 32u;
+        containsTargetWriteValue |=
+            static_cast<uint32_t>(source >> shift) == targetWriteValue;
+    }
+    if (targetWriteValue != UINT32_MAX && containsTargetWriteValue)
+    {
+        static std::atomic<uint32_t> targetWriteValueLogCount{0u};
+        const uint32_t index =
+            targetWriteValueLogCount.fetch_add(1u, std::memory_order_relaxed);
+        if (index < 256u)
+        {
+            std::cerr << "[guest-write-value] index=" << std::dec << index
+                      << " value=0x" << std::hex << targetWriteValue
+                      << " op=" << op
+                      << " addr=0x" << guestAddr
+                      << " size=0x" << size
+                      << " lo=0x" << valueLo
+                      << " hi=0x" << valueHi
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      << " ra=0x" << ps2TraceGuestRegisterLo32(ctx, 31)
+                      << " sp=0x" << ps2TraceGuestRegisterLo32(ctx, 29)
+                      << " a0=0x" << ps2TraceGuestRegisterLo32(ctx, 4)
+                      << " a1=0x" << ps2TraceGuestRegisterLo32(ctx, 5)
+                      << " a2=0x" << ps2TraceGuestRegisterLo32(ctx, 6)
+                      << " a3=0x" << ps2TraceGuestRegisterLo32(ctx, 7)
+                      << " s0=0x" << ps2TraceGuestRegisterLo32(ctx, 16)
+                      << " s1=0x" << ps2TraceGuestRegisterLo32(ctx, 17)
+                      << std::dec << std::endl;
+        }
+    }
+
     constexpr uint32_t xmenBadRegistryValue = 0x0028F6B0u;
     bool containsBadRegistryValue = false;
     for (uint32_t word = 0u; word < writeWords; ++word)

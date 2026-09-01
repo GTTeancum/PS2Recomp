@@ -1951,6 +1951,312 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 {
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+    static thread_local std::array<uint32_t, 256> s_guestReturnTargets{};
+    static thread_local std::array<uint32_t, 256> s_guestCallSources{};
+    static thread_local uint32_t s_guestReturnDepth = 0u;
+    static const bool profileXmenBranchHooks =
+        std::getenv("PS2X_PROFILE_XMEN_BRANCH_HOOKS") != nullptr;
+    const auto xmenBranchHookStart = profileXmenBranchHooks
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+    static const bool bypassXmenBranchHooks =
+        std::getenv("PS2X_BYPASS_XMEN_BRANCH_HOOKS") != nullptr;
+    // Keep every address referenced by the compatibility region on the proven
+    // path. All other edges can use the generic dispatcher without scanning
+    // thousands of game-specific diagnostics.
+    static constexpr std::array<uint32_t, 466> kXmenCompatibilityBranchAddresses = {
+        0x0010AC00u, 0x0010AC30u, 0x0010AF50u, 0x0010AFA0u, 0x00116780u, 0x00116AB8u,
+        0x00116C28u, 0x001176D0u, 0x00130BBCu, 0x00130F04u, 0x001375A0u, 0x0013781Cu,
+        0x00137A28u, 0x0014AD80u, 0x0014AD90u, 0x0014AE50u, 0x0014B200u, 0x0014B240u,
+        0x0014B600u, 0x0014B610u, 0x0014B7C0u, 0x0014B838u, 0x0014B884u, 0x0014B89Cu,
+        0x0014B8F8u, 0x0014B920u, 0x0014B934u, 0x0014BE90u, 0x0014BFA0u, 0x0014BFB0u,
+        0x0014C470u, 0x0014CB0Cu, 0x0014CB28u, 0x0014CB3Cu, 0x0014CBB4u, 0x0014CC5Cu,
+        0x00158300u, 0x00158380u, 0x00158508u, 0x00158CA0u, 0x00158CB8u, 0x0018B920u,
+        0x0018BAB8u, 0x0018BACCu, 0x001CDF6Cu, 0x001EAB68u, 0x001EAB7Cu, 0x001EAB90u,
+        0x001EABB0u, 0x001EABC8u, 0x001EABECu, 0x001EABF8u, 0x001EB930u, 0x001ED190u,
+        0x001EDC70u, 0x001EDD38u, 0x001F9990u, 0x001F9C30u, 0x001FC0D0u, 0x001FC10Cu,
+        0x001FC15Cu, 0x001FC16Cu, 0x001FC180u, 0x001FC1C4u, 0x001FC1D4u, 0x001FC1E8u,
+        0x001FC224u, 0x001FC234u, 0x001FC264u, 0x001FD030u, 0x001FD0B0u, 0x001FD6E4u,
+        0x001FD740u, 0x001FDA00u, 0x001FDB10u, 0x001FDB5Cu, 0x001FE3C0u, 0x001FE740u,
+        0x00200CE0u, 0x00200D6Cu, 0x00200E90u, 0x00200EECu, 0x00200F30u, 0x00200FA0u,
+        0x00202890u, 0x0020297Cu, 0x0020298Cu, 0x002029ACu, 0x002029BCu, 0x002029E0u,
+        0x00202A98u, 0x00202B40u, 0x00202B74u, 0x00202BC0u, 0x00202C40u, 0x00202CA4u,
+        0x00203100u, 0x0020318Cu, 0x002031B8u, 0x00203280u, 0x00212660u, 0x00213A80u,
+        0x002150B0u, 0x002151B0u, 0x00215FA0u, 0x00217500u, 0x00219EC0u, 0x0021D220u,
+        0x0021D570u, 0x0021D670u, 0x0022C710u, 0x00231EB0u, 0x00231ED0u, 0x00231EE8u,
+        0x00231EF0u, 0x00232020u, 0x00232040u, 0x00232048u, 0x002336F0u, 0x00233ED0u,
+        0x002346ECu, 0x00235140u, 0x002351A4u, 0x00244EA0u, 0x00245198u, 0x00245D20u,
+        0x0024B2ACu, 0x0024B2E0u, 0x0024B4FCu, 0x0024B52Cu, 0x0024B8F0u, 0x0024C104u,
+        0x0024C158u, 0x0024C174u, 0x0024C194u, 0x0024C1B0u, 0x0026CA00u, 0x0026DBA0u,
+        0x00271BA0u, 0x00271BC8u, 0x00271F08u, 0x00271F14u, 0x00271F1Cu, 0x00273BBCu,
+        0x00273C0Cu, 0x00274000u, 0x00274074u, 0x00274B20u, 0x00274B3Cu, 0x00274B44u,
+        0x00274B4Cu, 0x00277520u, 0x00279118u, 0x00282D40u, 0x002AF000u, 0x002AF040u,
+        0x002AF2E0u, 0x002B705Cu, 0x002B7B60u, 0x002B7B94u, 0x002B7BB8u, 0x002B7C24u,
+        0x002B7C38u, 0x002B7C48u, 0x002B7C60u, 0x002B7C70u, 0x002B7C88u, 0x002B7C98u,
+        0x002BCF78u, 0x002BCFE8u, 0x002BD4B8u, 0x002BD4D0u, 0x002BD504u, 0x002D92E0u,
+        0x002D9490u, 0x002DDE20u, 0x002DE000u, 0x002DE01Cu, 0x002DE130u, 0x002DE1E8u,
+        0x002DE268u, 0x002DE284u, 0x002DE3ACu, 0x002DE51Cu, 0x002DE69Cu, 0x002DE9F0u,
+        0x002DED70u, 0x002DEDA4u, 0x002DEF90u, 0x002DF1C0u, 0x002DF208u, 0x002DF224u,
+        0x002DF450u, 0x002DF4D4u, 0x002E66F4u, 0x002E6C60u, 0x002E6E14u, 0x002F6130u,
+        0x002F6158u, 0x002F62D0u, 0x002F6AB0u, 0x002F6ACCu, 0x002F6E90u, 0x002F6EC4u,
+        0x002F6F80u, 0x002F7020u, 0x002F7250u, 0x002F8560u, 0x002F8864u, 0x002F9FE0u,
+        0x002F9FF0u, 0x002FA54Cu, 0x002FA560u, 0x002FA5A4u, 0x002FA610u, 0x002FA688u,
+        0x002FA890u, 0x002FAB70u, 0x002FAD08u, 0x002FB570u, 0x002FC000u, 0x00300600u,
+        0x00300900u, 0x0030A7F0u, 0x0030AA10u, 0x0030AA38u, 0x0030B080u, 0x0030B0ECu,
+        0x0030B860u, 0x0030BDB0u, 0x0030BEE0u, 0x0030C4B0u, 0x0030C660u, 0x0030C674u,
+        0x0030CA00u, 0x0030E400u, 0x0030F840u, 0x0030F87Cu, 0x0030F8B8u, 0x0031A380u,
+        0x0031C918u, 0x0031E928u, 0x0031F000u, 0x0031F46Cu, 0x0031F5BCu, 0x0031F600u,
+        0x003201E8u, 0x00320250u, 0x003203D4u, 0x003203E8u, 0x003207C8u, 0x003208D8u,
+        0x00320A3Cu, 0x00320BF0u, 0x00321B90u, 0x003246E0u, 0x00325840u, 0x00325890u,
+        0x003258F8u, 0x0032592Cu, 0x00325948u, 0x00325994u, 0x003259A8u, 0x00325AD8u,
+        0x00325AE0u, 0x00325F38u, 0x00326E6Cu, 0x00326E78u, 0x003272A0u, 0x00327334u,
+        0x00344FE4u, 0x0034AB00u, 0x0034AB28u, 0x0034AC10u, 0x00372480u, 0x00373060u,
+        0x003771F0u, 0x003772C0u, 0x00377D60u, 0x00377E2Cu, 0x00378378u, 0x00378450u,
+        0x00378514u, 0x00378548u, 0x0037855Cu, 0x003785F0u, 0x003835B0u, 0x003887F0u,
+        0x003AF824u, 0x003AF8B4u, 0x003B1160u, 0x003B16D0u, 0x003B1710u, 0x003B2000u,
+        0x003B21B4u, 0x003B2510u, 0x003B25F4u, 0x003EBF40u, 0x003EFDC0u, 0x00420F08u,
+        0x00422430u, 0x0042268Cu, 0x00422694u, 0x004226ACu, 0x004226B4u, 0x00431C24u,
+        0x00431C4Cu, 0x00431C74u, 0x00431C9Cu, 0x004A32E0u, 0x004B3CE0u, 0x004B3DF0u,
+        0x004B3F50u, 0x004B7C3Cu, 0x004B7C78u, 0x004B7D38u, 0x004B8140u, 0x004B8190u,
+        0x004B82D0u, 0x004B8320u, 0x004B83B0u, 0x004B84F0u, 0x004B8550u, 0x004B85E0u,
+        0x004B8600u, 0x004B8640u, 0x004B86A0u, 0x004B8770u, 0x004B87C0u, 0x004B8810u,
+        0x004B8990u, 0x004B8A10u, 0x004B8A90u, 0x004B9AA0u, 0x004B9E60u, 0x004F5930u,
+        0x004F71B0u, 0x00521460u, 0x005226DCu, 0x00525000u, 0x00525270u, 0x00525388u,
+        0x005257D0u, 0x0052A0CCu, 0x0054C958u, 0x0054CC30u, 0x0054CC98u, 0x0054E5ACu,
+        0x0054E5D4u, 0x0054E6A0u, 0x0054E6CCu, 0x0054ED48u, 0x0054F2B0u, 0x005506D0u,
+        0x00550BA0u, 0x00550C04u, 0x005526A8u, 0x005527F8u, 0x00552850u, 0x00552CA0u,
+        0x005539F0u, 0x00553AB4u, 0x00553ABCu, 0x00553AC8u, 0x00553BD4u, 0x00553C50u,
+        0x00553CC0u, 0x00554028u, 0x00554040u, 0x005542BCu, 0x005542E0u, 0x00554380u,
+        0x00554530u, 0x005545B8u, 0x005545D0u, 0x005545D8u, 0x005545E4u, 0x00557DE8u,
+        0x00557F80u, 0x00559DA0u, 0x00559FC0u, 0x00561948u, 0x005624F8u, 0x00562D18u,
+        0x00562D34u, 0x00562DC8u, 0x00562DECu, 0x00562DF8u, 0x00562EE0u, 0x00562F08u,
+        0x005640E0u, 0x00564124u, 0x00565BB8u, 0x00565D20u, 0x00567EE8u, 0x00568480u,
+        0x00568518u, 0x0056D7A4u, 0x0056D7B4u, 0x0056D824u, 0x0056D834u, 0x0056D84Cu,
+        0x0056D8F0u, 0x0056D904u, 0x0056D90Cu, 0x0056D920u, 0x0056D930u, 0x0056D940u,
+        0x0056D948u, 0x0056D95Cu, 0x0056D964u, 0x0056D984u, 0x0056D98Cu, 0x0056D994u,
+        0x0056D9D4u, 0x0057A608u, 0x0057EDC0u, 0x0057EE38u, 0x0057EF78u, 0x0057F2B8u,
+        0x005880E0u, 0x005883E0u, 0x00588508u, 0x00588690u, 0x005886E8u, 0x00588780u,
+        0x005887B8u, 0x00588960u, 0x00588A60u, 0x00588A98u, 0x00588AA0u, 0x00588C38u,
+        0x00591440u, 0x00591510u, 0x00591588u, 0x005917B8u, 0x00593E7Cu, 0x00594660u,
+        0x005947B0u, 0x00594D90u, 0x0059AE20u, 0x0059C1A0u, 0x0059C2B8u, 0x0059C2C8u,
+        0x0059C2E4u, 0x0059C9D0u, 0x0059CAECu, 0x0059E388u, 0x005A2480u, 0x005A2938u,
+        0x005A2940u, 0x005A2948u, 0x005A2958u, 0x005C1470u, 0x005C1770u, 0x005C1900u,
+        0x005C1A3Cu, 0x005C1AA0u, 0x005C1B80u, 0x005D54C0u, 0x005D54F4u, 0x006128F8u,
+        0x00613720u, 0x00613C2Cu, 0x00613CA8u, 0x00614140u
+    };
+    static constexpr uint32_t kXmenCompatibilityFirstPage =
+        kXmenCompatibilityBranchAddresses.front() >> 12u;
+    static constexpr uint32_t kXmenCompatibilityLastPage =
+        kXmenCompatibilityBranchAddresses.back() >> 12u;
+    static constexpr auto kXmenCompatibilityPageMask = []
+    {
+        constexpr size_t pageCount =
+            kXmenCompatibilityLastPage - kXmenCompatibilityFirstPage + 1u;
+        std::array<uint64_t, (pageCount + 63u) / 64u> mask{};
+        for (const uint32_t address : kXmenCompatibilityBranchAddresses)
+        {
+            const size_t page = (address >> 12u) - kXmenCompatibilityFirstPage;
+            mask[page / 64u] |= uint64_t{1} << (page % 64u);
+        }
+        return mask;
+    }();
+    const auto findXmenCompatibilityAddress = [&](uint32_t address)
+    {
+        const uint32_t page = address >> 12u;
+        if (page < kXmenCompatibilityFirstPage || page > kXmenCompatibilityLastPage)
+        {
+            return kXmenCompatibilityBranchAddresses.end();
+        }
+        const size_t pageOffset = page - kXmenCompatibilityFirstPage;
+        if ((kXmenCompatibilityPageMask[pageOffset / 64u] &
+             (uint64_t{1} << (pageOffset % 64u))) == 0u)
+        {
+            return kXmenCompatibilityBranchAddresses.end();
+        }
+        return std::lower_bound(kXmenCompatibilityBranchAddresses.begin(),
+                                kXmenCompatibilityBranchAddresses.end(),
+                                address);
+    };
+    const auto sourceCompatibilityIt = findXmenCompatibilityAddress(sourcePc);
+    const auto targetCompatibilityIt = findXmenCompatibilityAddress(targetPc);
+    const bool sourceRequiresXmenCompatibility =
+        sourceCompatibilityIt != kXmenCompatibilityBranchAddresses.end() &&
+        *sourceCompatibilityIt == sourcePc;
+    const bool targetRequiresXmenCompatibility =
+        targetCompatibilityIt != kXmenCompatibilityBranchAddresses.end() &&
+        *targetCompatibilityIt == targetPc;
+    const bool requiresXmenCompatibility =
+        targetPc == 0u || sourceRequiresXmenCompatibility ||
+        targetRequiresXmenCompatibility;
+    static const bool profileXmenBranchSelector =
+        std::getenv("PS2X_PROFILE_XMEN_BRANCH_SELECTOR") != nullptr;
+    if (profileXmenBranchSelector)
+    {
+        static thread_local uint64_t calls = 0u;
+        static thread_local uint64_t compatibilityCalls = 0u;
+        static thread_local uint64_t nullTargetCalls = 0u;
+        static thread_local std::array<uint64_t,
+                                       kXmenCompatibilityBranchAddresses.size()>
+            addressHits{};
+        ++calls;
+        if (requiresXmenCompatibility)
+        {
+            ++compatibilityCalls;
+        }
+        if (targetPc == 0u)
+        {
+            ++nullTargetCalls;
+        }
+        if (sourceRequiresXmenCompatibility)
+        {
+            ++addressHits[static_cast<size_t>(
+                sourceCompatibilityIt - kXmenCompatibilityBranchAddresses.begin())];
+        }
+        if (targetRequiresXmenCompatibility)
+        {
+            ++addressHits[static_cast<size_t>(
+                targetCompatibilityIt - kXmenCompatibilityBranchAddresses.begin())];
+        }
+
+        if ((calls & 0xFFFFFu) == 0u)
+        {
+            std::array<std::pair<uint64_t, uint32_t>,
+                       kXmenCompatibilityBranchAddresses.size()>
+                ranked{};
+            for (size_t index = 0; index < ranked.size(); ++index)
+            {
+                ranked[index] = {
+                    addressHits[index], kXmenCompatibilityBranchAddresses[index]};
+            }
+            std::partial_sort(
+                ranked.begin(), ranked.begin() + 16u, ranked.end(),
+                [](const auto &left, const auto &right) {
+                    return left.first > right.first;
+                });
+
+            std::fprintf(
+                stderr,
+                "[xmen-branch-selector-profile] calls=%llu compatibility=%llu fast=%llu "
+                "null=%llu top=",
+                static_cast<unsigned long long>(calls),
+                static_cast<unsigned long long>(compatibilityCalls),
+                static_cast<unsigned long long>(calls - compatibilityCalls),
+                static_cast<unsigned long long>(nullTargetCalls));
+            for (size_t index = 0; index < 16u && ranked[index].first != 0u;
+                 ++index)
+            {
+                std::fprintf(stderr, "%s0x%08X:%llu", index == 0u ? "" : ",",
+                             ranked[index].second,
+                             static_cast<unsigned long long>(ranked[index].first));
+            }
+            std::fprintf(stderr, "\n");
+        }
+    }
+    if (bypassXmenBranchHooks && !requiresXmenCompatibility)
+    {
+        if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+        {
+            ++g_guestDispatchYieldGeneration;
+            return false;
+        }
+
+        if (!isCall)
+        {
+            if (kind == GuestBranchKind::Return && s_guestReturnDepth > 0u &&
+                !hasFunction(targetPc))
+            {
+                targetPc = s_guestReturnTargets[s_guestReturnDepth - 1u];
+            }
+            const bool isRootReturn =
+                kind == GuestBranchKind::Return && targetPc == 0u && s_guestReturnDepth == 0u;
+            if (!isRootReturn && !hasFunction(targetPc))
+            {
+                reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
+            }
+            ctx->pc = targetPc;
+            return false;
+        }
+
+        if (targetPc == 0u ||
+            (kind == GuestBranchKind::IndirectCall &&
+             (targetPc < g_ps2RecompiledFunctionTableBase ||
+              !m_memory.isCodeAddress(targetPc))))
+        {
+            ctx->pc = fallthroughPc;
+            return true;
+        }
+
+        if (!hasFunction(targetPc))
+        {
+            reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
+            const MissingFunctionPolicy policy = missingFunctionPolicy();
+            if (policy == MissingFunctionPolicy::SkipCallDebug)
+            {
+                ctx->pc = fallthroughPc;
+                return true;
+            }
+            if (policy == MissingFunctionPolicy::ContinueToTarget)
+            {
+                ctx->pc = targetPc;
+                return true;
+            }
+            return false;
+        }
+
+        static thread_local uint32_t fastDispatchDepth = 0u;
+        if (fastDispatchDepth >= 32u)
+        {
+            ++g_guestDispatchYieldGeneration;
+            ctx->pc = targetPc;
+            return false;
+        }
+        struct FastDispatchDepthGuard
+        {
+            uint32_t &depth;
+            ~FastDispatchDepthGuard() { --depth; }
+        };
+        ++fastDispatchDepth;
+        FastDispatchDepthGuard fastDispatchDepthGuard{fastDispatchDepth};
+
+        RecompiledFunction targetFn = lookupFunction(targetPc);
+        const uint32_t entryPc = ctx->pc;
+        const uint64_t yieldGeneration = g_guestDispatchYieldGeneration;
+        const bool pushedGuestReturn =
+            fallthroughPc != 0u && s_guestReturnDepth < s_guestReturnTargets.size();
+        if (pushedGuestReturn)
+        {
+            s_guestReturnTargets[s_guestReturnDepth] = fallthroughPc;
+            s_guestCallSources[s_guestReturnDepth] = sourcePc;
+            ++s_guestReturnDepth;
+        }
+        struct FastGuestReturnDepthGuard
+        {
+            bool armed = false;
+            uint32_t &depth;
+            ~FastGuestReturnDepthGuard()
+            {
+                if (armed && depth > 0u)
+                {
+                    --depth;
+                }
+            }
+        };
+        FastGuestReturnDepthGuard guestReturnDepthGuard{pushedGuestReturn, s_guestReturnDepth};
+        targetFn(rdram, ctx, this);
+        if (isStopRequested() || ctx->pc == 0u)
+        {
+            return false;
+        }
+        if (g_guestDispatchYieldGeneration != yieldGeneration)
+        {
+            return false;
+        }
+        if (ctx->pc == entryPc)
+        {
+            ctx->pc = fallthroughPc;
+        }
+        return ctx->pc == fallthroughPc;
+    }
     constexpr uint32_t kXmenDispatchTable = 0x006AC600u;
     constexpr std::array<uint32_t, 14> kXmenExpectedDispatchTable = {
         0x002F3400u, 0x002F3400u, 0x002F3400u, 0x002F313Cu,
@@ -1967,6 +2273,428 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     static thread_local bool s_xmenSlotGrowActive = false;
     static thread_local uint32_t s_xmenSlotGrowOldAddress = 0u;
     static thread_local uint32_t s_xmenSlotGrowBytes = 0u;
+    static std::atomic<uint32_t> s_xmenNycLevelPackage{0u};
+    static std::atomic<uint32_t> s_xmenNycLevelObjectEntries{0u};
+    static std::atomic<uint32_t> s_xmenNycSceneAmbientLightSet{0u};
+    static std::atomic<uint32_t> s_xmenNycSceneAmbientLight{0u};
+    static std::atomic<uint32_t> s_xmenNycSceneAmbientLightState{0u};
+    static std::atomic<uint32_t> s_xmenNycSceneRootLightStateList{0u};
+    static std::atomic<uint32_t> s_xmenNycSceneRootLightStateSet{0u};
+    static std::atomic<uint32_t> s_xmenNycSceneInfo{0u};
+    static std::atomic<uint32_t> s_xmenPlanterPotTexture{0u};
+    static std::atomic<uint32_t> s_xmenPlanterLeafTexture{0u};
+    static thread_local bool s_xmenTextureReservationTraceActive = false;
+    static thread_local uint32_t s_xmenTextureReservationOwner = 0u;
+    static thread_local uint32_t s_xmenTextureReservationNode = 0u;
+    static thread_local uint32_t s_xmenTextureReservationAddress = 0u;
+    static thread_local bool s_xmenTextureReloadTraceActive = false;
+    static thread_local uint32_t s_xmenTextureReloadTexture = 0u;
+    const bool isXmenRendererDiagnosticBranch =
+        kind == GuestBranchKind::IndirectCall ||
+        kind == GuestBranchKind::IndirectJump ||
+        sourcePc == 0x002B7B94u ||
+        sourcePc == 0x002B7BB8u ||
+        sourcePc == 0x002B7C38u ||
+        sourcePc == 0x002B7C48u ||
+        sourcePc == 0x002B7C60u ||
+        sourcePc == 0x002B7C70u ||
+        sourcePc == 0x002B7C88u ||
+        sourcePc == 0x002B7C98u;
+    if (rdram && std::getenv("PS2X_TRACE_XMEN_WORLD_MIN_TICK") != nullptr &&
+        isXmenRendererDiagnosticBranch)
+    {
+        const uint64_t currentTick = m_eeScheduler->currentVSyncTick();
+        const uint64_t minimumTick = std::strtoull(
+            std::getenv("PS2X_TRACE_XMEN_WORLD_MIN_TICK"), nullptr, 0);
+        const uint32_t object = GPR_U32(ctx, 4);
+        uint32_t vtable = 0u;
+        if (object <= PS2_RAM_SIZE - sizeof(vtable))
+            std::memcpy(&vtable, rdram + object, sizeof(vtable));
+
+        const bool isRendererLifecycleSource =
+            sourcePc == 0x0018B920u ||
+            sourcePc == 0x0018BAB8u ||
+            sourcePc == 0x0018BACCu ||
+            sourcePc == 0x0032592Cu ||
+            sourcePc == 0x00325948u ||
+            sourcePc == 0x00325994u ||
+            sourcePc == 0x003259A8u ||
+            sourcePc == 0x002B705Cu ||
+            sourcePc == 0x002B7B94u ||
+            sourcePc == 0x002B7BB8u ||
+            sourcePc == 0x002B7C24u ||
+            sourcePc == 0x002B7C38u ||
+            sourcePc == 0x002B7C48u ||
+            sourcePc == 0x002B7C60u ||
+            sourcePc == 0x002B7C70u ||
+            sourcePc == 0x002B7C88u ||
+            sourcePc == 0x002B7C98u ||
+            sourcePc == 0x00274074u;
+        const bool traceAllRendererDispatch =
+            std::getenv("PS2X_TRACE_XMEN_RENDERER_DISPATCH_ALL") != nullptr;
+        const bool isTrackedRendererObject =
+            object == 0x00AA5C00u || vtable == 0x006F49B0u;
+
+        if (currentTick >= minimumTick &&
+            (isRendererLifecycleSource ||
+             (traceAllRendererDispatch && isTrackedRendererObject)))
+        {
+            static std::atomic<uint32_t> s_xmenRendererDispatchCount{0u};
+            const uint32_t index = s_xmenRendererDispatchCount.fetch_add(
+                1u, std::memory_order_relaxed);
+            if (index < 512u)
+            {
+                std::cerr << "[xmen-renderer-dispatch] index=" << std::dec << index
+                          << " tick=" << currentTick
+                          << " kind=" << describeGuestBranchKind(kind)
+                          << " source=0x" << std::hex << sourcePc
+                          << " target=0x" << targetPc
+                          << " fallthrough=0x" << fallthroughPc
+                          << " object=0x" << object
+                          << " vtable=0x" << vtable
+                          << " a1=0x" << GPR_U32(ctx, 5)
+                          << " a2=0x" << GPR_U32(ctx, 6)
+                          << " a3=0x" << GPR_U32(ctx, 7)
+                          << " ra=0x" << GPR_U32(ctx, 31)
+                          << std::dec;
+                if (sourcePc == 0x002B705Cu && targetPc == 0x002B7B60u &&
+                    object <= PS2_RAM_SIZE - 0x34u)
+                {
+                    std::cerr << " fields={0c:0x" << std::hex
+                              << readRdramProbeU32(rdram, object + 0x0Cu)
+                              << ",10:0x" << readRdramProbeU32(rdram, object + 0x10u)
+                              << ",14:0x" << readRdramProbeU32(rdram, object + 0x14u)
+                              << ",18:0x" << readRdramProbeU32(rdram, object + 0x18u)
+                              << ",1c:0x" << readRdramProbeU32(rdram, object + 0x1Cu)
+                              << ",30:0x" << readRdramProbeU32(rdram, object + 0x30u)
+                              << "}" << std::dec;
+                }
+                std::cerr << std::endl;
+            }
+        }
+    }
+    if (rdram && std::getenv("PS2X_TRACE_XMEN_SCENE_AMBIENT_USAGE") != nullptr)
+    {
+        const char *minimumTickValue =
+            std::getenv("PS2X_TRACE_XMEN_SCENE_AMBIENT_USAGE_MIN_TICK");
+        const uint64_t minimumTick = minimumTickValue != nullptr
+            ? std::strtoull(minimumTickValue, nullptr, 0)
+            : 0u;
+        const bool leafObjectsOnly =
+            std::getenv("PS2X_TRACE_XMEN_SCENE_AMBIENT_USAGE_LEAF_ONLY") != nullptr;
+        const uint64_t currentTick = m_eeScheduler->currentVSyncTick();
+        const uint32_t light =
+            s_xmenNycSceneAmbientLight.load(std::memory_order_relaxed);
+        const uint32_t lightState =
+            s_xmenNycSceneAmbientLightState.load(std::memory_order_relaxed);
+        const uint32_t lightStateList =
+            s_xmenNycSceneRootLightStateList.load(std::memory_order_relaxed);
+        const uint32_t lightStateSet =
+            s_xmenNycSceneRootLightStateSet.load(std::memory_order_relaxed);
+        const uint32_t sceneInfo =
+            s_xmenNycSceneInfo.load(std::memory_order_relaxed);
+        if (currentTick >= minimumTick && light != 0u && lightState != 0u)
+        {
+            constexpr std::array<uint32_t, 16> kTrackedRegisters = {
+                2u, 3u, 4u, 5u, 6u, 7u, 16u, 17u,
+                18u, 19u, 20u, 21u, 22u, 23u, 30u, 31u,
+            };
+            uint32_t lightRegisterMask = 0u;
+            uint32_t stateRegisterMask = 0u;
+            uint32_t listRegisterMask = 0u;
+            uint32_t setRegisterMask = 0u;
+            uint32_t sceneInfoRegisterMask = 0u;
+            for (const uint32_t reg : kTrackedRegisters)
+            {
+                const uint32_t value = GPR_U32(ctx, reg);
+                if (value == light)
+                    lightRegisterMask |= 1u << reg;
+                if (value == lightState)
+                    stateRegisterMask |= 1u << reg;
+                if (value == lightStateList)
+                    listRegisterMask |= 1u << reg;
+                if (value == lightStateSet)
+                    setRegisterMask |= 1u << reg;
+                if (value == sceneInfo)
+                    sceneInfoRegisterMask |= 1u << reg;
+            }
+            const bool leafObjectUsed = lightRegisterMask != 0u ||
+                stateRegisterMask != 0u || listRegisterMask != 0u;
+            const bool ownerObjectUsed = setRegisterMask != 0u ||
+                sceneInfoRegisterMask != 0u;
+            if (leafObjectUsed || (!leafObjectsOnly && ownerObjectUsed))
+            {
+                static std::atomic<uint32_t> s_xmenSceneAmbientUsageTraceCount{0u};
+                const uint32_t index = s_xmenSceneAmbientUsageTraceCount.fetch_add(
+                    1u, std::memory_order_relaxed);
+                if (index < 1024u)
+                {
+                    std::cerr << "[xmen-scene-ambient-usage] index=" << std::dec << index
+                              << " tick=" << currentTick
+                              << " kind=" << describeGuestBranchKind(kind)
+                              << " source=0x" << std::hex << sourcePc
+                              << " target=0x" << targetPc
+                              << " light=0x" << light
+                              << " lightRegs=0x" << lightRegisterMask
+                              << " lightState=0x" << lightState
+                              << " stateRegs=0x" << stateRegisterMask
+                              << " lightStateList=0x" << lightStateList
+                              << " listRegs=0x" << listRegisterMask
+                              << " lightStateSet=0x" << lightStateSet
+                              << " setRegs=0x" << setRegisterMask
+                              << " sceneInfo=0x" << sceneInfo
+                              << " sceneInfoRegs=0x" << sceneInfoRegisterMask
+                              << " a0=0x" << GPR_U32(ctx, 4)
+                              << " a1=0x" << GPR_U32(ctx, 5)
+                              << " a2=0x" << GPR_U32(ctx, 6)
+                              << " a3=0x" << GPR_U32(ctx, 7)
+                              << " s0=0x" << GPR_U32(ctx, 16)
+                              << " s1=0x" << GPR_U32(ctx, 17)
+                              << " s2=0x" << GPR_U32(ctx, 18)
+                              << " s3=0x" << GPR_U32(ctx, 19)
+                              << " ra=0x" << GPR_U32(ctx, 31)
+                              << std::dec << std::endl;
+                }
+            }
+        }
+    }
+    if (rdram)
+    {
+        const char *sceneAmbientScanTickValue =
+            std::getenv("PS2X_TRACE_XMEN_SCENE_AMBIENT_MEMORY_TICK");
+        if (sceneAmbientScanTickValue != nullptr)
+        {
+            static std::atomic<bool> s_xmenSceneAmbientMemoryScanned{false};
+            const uint64_t scanTick = std::strtoull(sceneAmbientScanTickValue, nullptr, 0);
+            const uint64_t currentTick = m_eeScheduler->currentVSyncTick();
+            bool expected = false;
+            if (currentTick >= scanTick &&
+                s_xmenSceneAmbientMemoryScanned.compare_exchange_strong(
+                    expected, true, std::memory_order_relaxed))
+            {
+                constexpr std::array<uint32_t, 4> kSceneAmbient = {
+                    0x3D20A0A1u, 0x3D888889u, 0x3E1C9C9Du, 0x3F800000u,
+                };
+                uint32_t matchCount = 0u;
+                for (uint32_t address = 0u;
+                     address + sizeof(kSceneAmbient) <= PS2_RAM_SIZE;
+                     address += sizeof(uint32_t))
+                {
+                    bool matches = true;
+                    for (uint32_t word = 0u; word < kSceneAmbient.size(); ++word)
+                    {
+                        if (readRdramProbeU32(rdram, address + word * sizeof(uint32_t)) !=
+                            kSceneAmbient[word])
+                        {
+                            matches = false;
+                            break;
+                        }
+                    }
+                    if (matches)
+                    {
+                        if (matchCount < 64u)
+                        {
+                            std::cerr << "[xmen-scene-ambient-memory-match] tick=" << std::dec
+                                      << currentTick << " address=0x" << std::hex << address
+                                      << std::dec << std::endl;
+                        }
+                        ++matchCount;
+                    }
+                }
+                std::cerr << "[xmen-scene-ambient-memory-summary] tick=" << std::dec
+                          << currentTick << " requestedTick=" << scanTick
+                          << " matches=" << matchCount << std::endl;
+            }
+        }
+    }
+    if (rdram && std::getenv("PS2X_TRACE_XMEN_LIGHT_STATE_ATTR") != nullptr)
+    {
+        static std::atomic<bool> s_xmenSceneAmbientObjectsLogged{false};
+        const uint32_t objectEntries =
+            s_xmenNycLevelObjectEntries.load(std::memory_order_relaxed);
+        const char *objectSnapshotTickValue =
+            std::getenv("PS2X_TRACE_XMEN_SCENE_AMBIENT_OBJECT_TICK");
+        const uint64_t objectSnapshotTick = objectSnapshotTickValue != nullptr
+            ? std::strtoull(objectSnapshotTickValue, nullptr, 0)
+            : 0u;
+        const uint64_t currentTick = m_eeScheduler->currentVSyncTick();
+        bool expected = false;
+        if (objectEntries != 0u && currentTick >= objectSnapshotTick &&
+            s_xmenSceneAmbientObjectsLogged.compare_exchange_strong(
+                expected, true, std::memory_order_relaxed))
+        {
+            const uint32_t package =
+                s_xmenNycLevelPackage.load(std::memory_order_relaxed);
+            const uint32_t lightSet =
+                s_xmenNycSceneAmbientLightSet.load(std::memory_order_relaxed);
+            const uint32_t light =
+                s_xmenNycSceneAmbientLight.load(std::memory_order_relaxed);
+            const uint32_t lightState =
+                s_xmenNycSceneAmbientLightState.load(std::memory_order_relaxed);
+            const uint32_t lightStateList =
+                s_xmenNycSceneRootLightStateList.load(std::memory_order_relaxed);
+            const uint32_t lightStateSet =
+                s_xmenNycSceneRootLightStateSet.load(std::memory_order_relaxed);
+            const uint32_t sceneInfo =
+                s_xmenNycSceneInfo.load(std::memory_order_relaxed);
+            std::cerr << "[xmen-scene-ambient-objects] tick=" << std::dec
+                      << currentTick << " requestedTick=" << objectSnapshotTick
+                      << " package=0x" << std::hex << package
+                      << " objectEntries=0x" << objectEntries
+                      << " lightSet=0x" << lightSet
+                      << " lightSetVtable=0x" << readRdramProbeU32(rdram, lightSet)
+                      << " light=0x" << light
+                      << " lightVtable=0x" << readRdramProbeU32(rdram, light)
+                      << " lightType=0x" << readRdramProbeU32(rdram, light + 0x0Cu)
+                      << " lightId=0x" << readRdramProbeU32(rdram, light + 0x10u)
+                      << " ambient0=0x" << readRdramProbeU32(rdram, light + 0x20u)
+                      << " ambient1=0x" << readRdramProbeU32(rdram, light + 0x24u)
+                      << " ambient2=0x" << readRdramProbeU32(rdram, light + 0x28u)
+                      << " ambient3=0x" << readRdramProbeU32(rdram, light + 0x2Cu)
+                      << " lightState=0x" << lightState
+                      << " lightStateVtable=0x"
+                      << readRdramProbeU32(rdram, lightState)
+                      << " lightStateLight=0x"
+                      << readRdramProbeU32(rdram, lightState + 0x10u)
+                      << " lightStateEnabled=0x"
+                      << readRdramProbeU32(rdram, lightState + 0x14u)
+                      << std::dec << std::endl;
+
+            const auto dumpObjectWords = [rdram](
+                const char *name, const uint32_t address)
+            {
+                if (address == 0u)
+                    return;
+
+                constexpr uint32_t kDumpBytes = 0x80u;
+                constexpr uint32_t kWordsPerLine = 8u;
+                for (uint32_t offset = 0u; offset < kDumpBytes;
+                     offset += kWordsPerLine * sizeof(uint32_t))
+                {
+                    std::cerr << "[xmen-scene-object-words] name=" << name
+                              << " address=0x" << std::hex << address
+                              << " offset=0x" << offset;
+                    for (uint32_t word = 0u; word < kWordsPerLine; ++word)
+                    {
+                        std::cerr << " w" << std::dec << word << "=0x" << std::hex
+                                  << readRdramProbeU32(
+                                         rdram, address + offset + word * sizeof(uint32_t));
+                    }
+                    std::cerr << std::dec << std::endl;
+                }
+            };
+            dumpObjectWords("lightState", lightState);
+            dumpObjectWords("lightStateList", lightStateList);
+            dumpObjectWords("lightStateSet", lightStateSet);
+            dumpObjectWords("sceneInfo", sceneInfo);
+        }
+    }
+    const char *xmenLightStateAttrMinimumTick =
+        std::getenv("PS2X_TRACE_XMEN_LIGHT_STATE_ATTR_MIN_TICK");
+    if (rdram && std::getenv("PS2X_TRACE_XMEN_LIGHT_STATE_ATTR") != nullptr &&
+        (xmenLightStateAttrMinimumTick == nullptr ||
+         m_eeScheduler->currentVSyncTick() >=
+             std::strtoull(xmenLightStateAttrMinimumTick, nullptr, 0)) &&
+        (targetPc == 0x002AF000u || targetPc == 0x002AF040u ||
+         targetPc == 0x002AF2E0u || targetPc == 0x00279118u ||
+         sourcePc == 0x00420F08u))
+    {
+        if (sourcePc == 0x00420F08u)
+        {
+            static std::atomic<bool> s_xmenLightMetaFieldsLogged{false};
+            if (!s_xmenLightMetaFieldsLogged.exchange(true, std::memory_order_relaxed))
+            {
+                constexpr uint32_t kLightMetaFieldGlobals = 0x00749EF0u;
+                for (uint32_t fieldIndex = 0u; fieldIndex < 16u; ++fieldIndex)
+                {
+                    const uint32_t global = kLightMetaFieldGlobals + fieldIndex * 8u;
+                    const uint32_t field = readRdramProbeU32(rdram, global);
+                    std::cerr << "[xmen-light-meta-field] index=" << std::dec << fieldIndex
+                              << " global=0x" << std::hex << global
+                              << " field=0x" << field
+                              << " word0=0x" << readRdramProbeU32(rdram, field)
+                              << " word4=0x" << readRdramProbeU32(rdram, field + 0x04u)
+                              << " word8=0x" << readRdramProbeU32(rdram, field + 0x08u)
+                              << " wordC=0x" << readRdramProbeU32(rdram, field + 0x0Cu)
+                              << " word10=0x" << readRdramProbeU32(rdram, field + 0x10u)
+                              << " word14=0x" << readRdramProbeU32(rdram, field + 0x14u)
+                              << " word18=0x" << readRdramProbeU32(rdram, field + 0x18u)
+                              << " word1C=0x" << readRdramProbeU32(rdram, field + 0x1Cu)
+                              << " word20=0x" << readRdramProbeU32(rdram, field + 0x20u)
+                              << " word24=0x" << readRdramProbeU32(rdram, field + 0x24u)
+                              << " word28=0x" << readRdramProbeU32(rdram, field + 0x28u)
+                              << " word2C=0x" << readRdramProbeU32(rdram, field + 0x2Cu)
+                              << " word30=0x" << readRdramProbeU32(rdram, field + 0x30u)
+                              << " word34=0x" << readRdramProbeU32(rdram, field + 0x34u)
+                              << " word38=0x" << readRdramProbeU32(rdram, field + 0x38u)
+                              << " word3C=0x" << readRdramProbeU32(rdram, field + 0x3Cu)
+                              << std::dec << std::endl;
+                }
+
+            }
+        }
+        static std::atomic<uint32_t> s_xmenLightStateAttrTraceCount{0u};
+        const uint32_t index =
+            s_xmenLightStateAttrTraceCount.fetch_add(1u, std::memory_order_relaxed);
+        if (index < 2048u)
+        {
+            const uint32_t object = GPR_U32(ctx, 4);
+            const uint32_t linkedLight = readRdramProbeU32(rdram, object + 0x10u);
+            int32_t sceneAmbientOffset = -1;
+            for (uint32_t offset = 0u; offset <= 0x100u; offset += 4u)
+            {
+                if (readRdramProbeU32(rdram, linkedLight + offset) == 0x3D20A0A1u &&
+                    readRdramProbeU32(rdram, linkedLight + offset + 4u) == 0x3D888889u &&
+                    readRdramProbeU32(rdram, linkedLight + offset + 8u) == 0x3E1C9C9Du &&
+                    readRdramProbeU32(rdram, linkedLight + offset + 12u) == 0x3F800000u)
+                {
+                    sceneAmbientOffset = static_cast<int32_t>(offset);
+                    break;
+                }
+            }
+            std::cerr << "[xmen-light-state-attr] index=" << std::dec << index
+                      << " tick=" << m_eeScheduler->currentVSyncTick()
+                      << " kind=" << static_cast<uint32_t>(kind)
+                      << " source=0x" << std::hex << sourcePc
+                      << " target=0x" << targetPc
+                      << " a0=0x" << object
+                      << " a1=0x" << GPR_U32(ctx, 5)
+                      << " object0=0x" << readRdramProbeU32(rdram, object)
+                      << " object4=0x" << readRdramProbeU32(rdram, object + 0x04u)
+                      << " object8=0x" << readRdramProbeU32(rdram, object + 0x08u)
+                      << " objectC=0x" << readRdramProbeU32(rdram, object + 0x0Cu)
+                      << " object10=0x" << linkedLight
+                      << " object14=0x" << readRdramProbeU32(rdram, object + 0x14u)
+                      << " lightType=0x" << readRdramProbeU32(rdram, linkedLight + 0x0Cu)
+                      << " lightId=0x" << readRdramProbeU32(rdram, linkedLight + 0x10u)
+                      << " position=(" << std::dec
+                      << readRdramProbeF32(rdram, linkedLight + 0x14u) << ","
+                      << readRdramProbeF32(rdram, linkedLight + 0x18u) << ","
+                      << readRdramProbeF32(rdram, linkedLight + 0x1Cu) << ")"
+                      << " ambient=("
+                      << readRdramProbeF32(rdram, linkedLight + 0x20u) << ","
+                      << readRdramProbeF32(rdram, linkedLight + 0x24u) << ","
+                      << readRdramProbeF32(rdram, linkedLight + 0x28u) << ","
+                      << readRdramProbeF32(rdram, linkedLight + 0x2Cu) << ")"
+                      << " diffuse=("
+                      << readRdramProbeF32(rdram, linkedLight + 0x30u) << ","
+                      << readRdramProbeF32(rdram, linkedLight + 0x34u) << ","
+                      << readRdramProbeF32(rdram, linkedLight + 0x38u) << ","
+                      << readRdramProbeF32(rdram, linkedLight + 0x3Cu) << ")"
+                      << " specular=("
+                      << readRdramProbeF32(rdram, linkedLight + 0x40u) << ","
+                      << readRdramProbeF32(rdram, linkedLight + 0x44u) << ","
+                      << readRdramProbeF32(rdram, linkedLight + 0x48u) << ","
+                      << readRdramProbeF32(rdram, linkedLight + 0x4Cu) << ")"
+                      << " direction=("
+                      << readRdramProbeF32(rdram, linkedLight + 0x50u) << ","
+                      << readRdramProbeF32(rdram, linkedLight + 0x54u) << ","
+                      << readRdramProbeF32(rdram, linkedLight + 0x58u) << ")"
+                      << " cutoff=" << readRdramProbeF32(rdram, linkedLight + 0x60u)
+                      << " sceneAmbientOffset=" << std::dec << sceneAmbientOffset
+                      << std::dec << std::endl;
+        }
+    }
     if (rdram && targetPc == 0x002F7250u &&
         (std::getenv("PS2X_TRACE_XMEN_TEXTURE_LINK") != nullptr ||
          std::getenv("PS2X_TRACE_XMEN_TEXTURE_LINK_ALL") != nullptr))
@@ -1981,7 +2709,13 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         const uint32_t paletteImage = readRdramProbeU32(rdram, palette + 0x0Cu);
         const uint32_t paletteBase =
             readRdramProbeU32(rdram, paletteImage + 0x38u) & 0x3FFFu;
-        if (traceAll || textureBase == 0x3F20u || paletteBase == 0x3F80u)
+        const uint32_t planterPot =
+            s_xmenPlanterPotTexture.load(std::memory_order_relaxed);
+        const uint32_t planterLeaf =
+            s_xmenPlanterLeafTexture.load(std::memory_order_relaxed);
+        const bool trackedPlanter =
+            texture != 0u && (texture == planterPot || texture == planterLeaf);
+        if (traceAll || trackedPlanter || textureBase == 0x3F20u || paletteBase == 0x3F80u)
         {
             static std::atomic<uint32_t> s_xmenTextureLinkTraceCount{0u};
             const uint32_t index =
@@ -2011,6 +2745,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                           << " texture40=0x" << readRdramProbeU32(rdram, texture + 0x40u)
                           << " texture44=0x" << readRdramProbeU32(rdram, texture + 0x44u)
                           << " texture48=0x" << readRdramProbeU32(rdram, texture + 0x48u)
+                          << " trackedPlanter=" << std::dec << (trackedPlanter ? 1u : 0u)
                           << " palette=0x" << palette
                           << " palette0=0x" << readRdramProbeU32(rdram, palette)
                           << " paletteC=0x" << paletteImage
@@ -2025,6 +2760,75 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                           << std::dec << std::endl;
             }
         }
+    }
+    if (rdram && isCall && targetPc == 0x002FA890u &&
+        std::getenv("PS2X_TRACE_XMEN_TEXTURE_RESIDENCY") != nullptr)
+    {
+        const uint32_t textureList = GPR_U32(ctx, 4);
+        const uint32_t texture = readRdramProbeU32(rdram, textureList);
+        const uint32_t planterPot =
+            s_xmenPlanterPotTexture.load(std::memory_order_relaxed);
+        const uint32_t planterLeaf =
+            s_xmenPlanterLeafTexture.load(std::memory_order_relaxed);
+        if (texture != 0u && (texture == planterPot || texture == planterLeaf))
+        {
+            std::cerr << "[xmen-texture-residency:bind] tick=" << std::dec
+                      << m_eeScheduler->currentVSyncTick()
+                      << " source=0x" << std::hex << sourcePc
+                      << " list=0x" << textureList
+                      << " texture=0x" << texture
+                      << " current=0x"
+                      << readRdramProbeU32(rdram, 0x00753950u + (GPR_U32(ctx, 5) * 4u))
+                      << " slot=0x" << GPR_U32(ctx, 5)
+                      << " mode=0x" << GPR_U32(ctx, 6)
+                      << " base=0x" << readRdramProbeU32(rdram, texture + 0x38u)
+                      << " size=0x" << readRdramProbeU32(rdram, texture + 0x40u)
+                      << " state46=0x" << readRdramProbeU32(rdram, texture + 0x46u)
+                      << " state48=0x" << readRdramProbeU32(rdram, texture + 0x48u)
+                      << " trace=" << formatDispatchHistory()
+                      << std::dec << std::endl;
+        }
+    }
+    if (rdram && isCall && targetPc == 0x002FA560u &&
+        std::getenv("PS2X_TRACE_XMEN_TEXTURE_RESIDENCY") != nullptr)
+    {
+        const uint32_t texture = GPR_U32(ctx, 4);
+        const uint32_t planterPot =
+            s_xmenPlanterPotTexture.load(std::memory_order_relaxed);
+        const uint32_t planterLeaf =
+            s_xmenPlanterLeafTexture.load(std::memory_order_relaxed);
+        if (texture != 0u && (texture == planterPot || texture == planterLeaf))
+        {
+            s_xmenTextureReloadTraceActive = true;
+            s_xmenTextureReloadTexture = texture;
+            std::cerr << "[xmen-texture-residency:reload-before] tick=" << std::dec
+                      << m_eeScheduler->currentVSyncTick()
+                      << " source=0x" << std::hex << sourcePc
+                      << " texture=0x" << texture
+                      << " base=0x" << readRdramProbeU32(rdram, texture + 0x38u)
+                      << " size=0x" << readRdramProbeU32(rdram, texture + 0x40u)
+                      << " state46=0x" << readRdramProbeU32(rdram, texture + 0x46u)
+                      << " state48=0x" << readRdramProbeU32(rdram, texture + 0x48u)
+                      << " trace=" << formatDispatchHistory()
+                      << std::dec << std::endl;
+        }
+    }
+    if (rdram && kind == GuestBranchKind::Return && targetPc == 0x002FAB70u &&
+        s_xmenTextureReloadTraceActive)
+    {
+        const uint32_t texture = s_xmenTextureReloadTexture;
+        std::cerr << "[xmen-texture-residency:reload-after] tick=" << std::dec
+                  << m_eeScheduler->currentVSyncTick()
+                  << " texture=0x" << std::hex << texture
+                  << " result=0x" << GPR_U32(ctx, 2)
+                  << " base=0x" << readRdramProbeU32(rdram, texture + 0x38u)
+                  << " size=0x" << readRdramProbeU32(rdram, texture + 0x40u)
+                  << " state46=0x" << readRdramProbeU32(rdram, texture + 0x46u)
+                  << " state48=0x" << readRdramProbeU32(rdram, texture + 0x48u)
+                  << " trace=" << formatDispatchHistory()
+                  << std::dec << std::endl;
+        s_xmenTextureReloadTraceActive = false;
+        s_xmenTextureReloadTexture = 0u;
     }
     if (rdram && targetPc == 0x002D9490u && sourcePc == 0x002FAD08u &&
         std::getenv("PS2X_TRACE_XMEN_TEXTURE_LINK_ALL") != nullptr)
@@ -3311,6 +4115,89 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                   << " trace=" << formatDispatchHistory()
                   << std::dec << std::endl;
     }
+    if (rdram && isCall && targetPc == 0x002F9FF0u &&
+        std::getenv("PS2X_TRACE_XMEN_TEXTURE_RESIDENCY") != nullptr)
+    {
+        const uint32_t owner = GPR_U32(ctx, 4);
+        const uint32_t node = GPR_U32(ctx, 5);
+        const uint32_t address = GPR_U32(ctx, 6);
+        const char *traceStartValue =
+            std::getenv("PS2X_TRACE_XMEN_TEXTURE_UPLOAD_DESTINATION_START");
+        const char *traceEndValue =
+            std::getenv("PS2X_TRACE_XMEN_TEXTURE_UPLOAD_DESTINATION_END");
+        const uint32_t traceStart = traceStartValue
+            ? static_cast<uint32_t>(std::strtoul(traceStartValue, nullptr, 0))
+            : 0u;
+        const uint32_t traceEnd = traceEndValue
+            ? static_cast<uint32_t>(std::strtoul(traceEndValue, nullptr, 0))
+            : traceStart;
+        if (traceStartValue && address >= traceStart && address <= traceEnd)
+        {
+            s_xmenTextureReservationTraceActive = true;
+            s_xmenTextureReservationOwner = owner;
+            s_xmenTextureReservationNode = node;
+            s_xmenTextureReservationAddress = address;
+            const uint32_t planterPot =
+                s_xmenPlanterPotTexture.load(std::memory_order_relaxed);
+            const uint32_t planterLeaf =
+                s_xmenPlanterLeafTexture.load(std::memory_order_relaxed);
+            const auto traceNode = [&](const char *name, uint32_t texture) {
+                std::cerr << " " << name << "=0x" << std::hex << texture;
+                if (texture != 0u && texture != 0xFFFFFFFFu)
+                {
+                    std::cerr << "{prev=0x" << readRdramProbeU32(rdram, texture + 0x18u)
+                              << ",next=0x" << readRdramProbeU32(rdram, texture + 0x1Cu)
+                              << ",base=0x" << readRdramProbeU32(rdram, texture + 0x38u)
+                              << ",size=0x" << readRdramProbeU32(rdram, texture + 0x40u)
+                              << ",flags=0x" << readRdramProbeU32(rdram, texture + 0x44u)
+                              << ",state46=0x" << readRdramProbeU32(rdram, texture + 0x46u)
+                              << ",state48=0x" << readRdramProbeU32(rdram, texture + 0x48u)
+                              << "}";
+                }
+            };
+            std::cerr << "[xmen-texture-residency:before] tick=" << std::dec
+                      << m_eeScheduler->currentVSyncTick()
+                      << " source=0x" << std::hex << sourcePc
+                      << " owner=0x" << owner
+                      << " node=0x" << node
+                      << " address=0x" << address;
+            traceNode("pot", planterPot);
+            traceNode("leaf", planterLeaf);
+            std::cerr << " trace=" << formatDispatchHistory() << std::dec << std::endl;
+        }
+    }
+    if (rdram && kind == GuestBranchKind::Return &&
+        (targetPc == 0x002FA5A4u || targetPc == 0x002FA610u ||
+         targetPc == 0x002FA688u) && s_xmenTextureReservationTraceActive)
+    {
+        const uint32_t planterPot =
+            s_xmenPlanterPotTexture.load(std::memory_order_relaxed);
+        const uint32_t planterLeaf =
+            s_xmenPlanterLeafTexture.load(std::memory_order_relaxed);
+        const auto traceNode = [&](const char *name, uint32_t texture) {
+            std::cerr << " " << name << "=0x" << std::hex << texture;
+            if (texture != 0u && texture != 0xFFFFFFFFu)
+            {
+                std::cerr << "{prev=0x" << readRdramProbeU32(rdram, texture + 0x18u)
+                          << ",next=0x" << readRdramProbeU32(rdram, texture + 0x1Cu)
+                          << ",base=0x" << readRdramProbeU32(rdram, texture + 0x38u)
+                          << ",size=0x" << readRdramProbeU32(rdram, texture + 0x40u)
+                          << ",flags=0x" << readRdramProbeU32(rdram, texture + 0x44u)
+                          << ",state46=0x" << readRdramProbeU32(rdram, texture + 0x46u)
+                          << ",state48=0x" << readRdramProbeU32(rdram, texture + 0x48u)
+                          << "}";
+            }
+        };
+        std::cerr << "[xmen-texture-residency:after] tick=" << std::dec
+                  << m_eeScheduler->currentVSyncTick()
+                  << " owner=0x" << std::hex << s_xmenTextureReservationOwner
+                  << " node=0x" << s_xmenTextureReservationNode
+                  << " address=0x" << s_xmenTextureReservationAddress;
+        traceNode("pot", planterPot);
+        traceNode("leaf", planterLeaf);
+        std::cerr << " trace=" << formatDispatchHistory() << std::dec << std::endl;
+        s_xmenTextureReservationTraceActive = false;
+    }
     if (isCall && targetPc == 0x002F6F80u)
     {
         constexpr uint32_t kTextureFreeList = 0x00753938u;
@@ -3355,14 +4242,57 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         const uint32_t rowBytes = width * multiplier;
         const uint32_t chunkRows = rowBytes != 0u ? 0x000FFFE0u / rowBytes
                                                    : 0xFFFFFFFFu;
-        if (index < 64u || chunkRows == 0u || destination == 0x2D84u || destination == 0x2D88u)
+        const char *traceStartValue =
+            std::getenv("PS2X_TRACE_XMEN_TEXTURE_UPLOAD_DESTINATION_START");
+        const char *traceEndValue =
+            std::getenv("PS2X_TRACE_XMEN_TEXTURE_UPLOAD_DESTINATION_END");
+        const uint32_t traceStart = traceStartValue
+            ? static_cast<uint32_t>(std::strtoul(traceStartValue, nullptr, 0))
+            : 0u;
+        const uint32_t traceEnd = traceEndValue
+            ? static_cast<uint32_t>(std::strtoul(traceEndValue, nullptr, 0))
+            : traceStart;
+        const bool traceDestination = traceStartValue &&
+            destination >= traceStart && destination <= traceEnd;
+        const bool traceUpload = index < 64u || chunkRows == 0u ||
+            destination == 0x2D84u || destination == 0x2D88u || traceDestination;
+        const bool traceResidency =
+            std::getenv("PS2X_TRACE_XMEN_TEXTURE_RESIDENCY") != nullptr;
+        const uint32_t data = readRdramProbeU32(rdram, descriptor + 0x30u);
+        const uint32_t dataPhysical = data & PS2_RAM_MASK;
+        uint32_t sourceBytes = 0u;
+        if (format == 0x04u)
+            sourceBytes = width * height;
+        else if (format == 0x0Eu)
+            sourceBytes = width * height * 4u;
+        const bool validSource = sourceBytes != 0u &&
+            dataPhysical < PS2_RAM_SIZE && sourceBytes <= PS2_RAM_SIZE - dataPhysical;
+        uint64_t sourceHash = 14695981039346656037ull;
+        if ((traceUpload || traceResidency) && validSource)
+        {
+            for (uint32_t byte = 0u; byte < sourceBytes; ++byte)
+            {
+                sourceHash ^= rdram[dataPhysical + byte];
+                sourceHash *= 1099511628211ull;
+            }
+        }
+        const bool trackedPot = traceResidency && validSource &&
+            sourceHash == 0x5B9B7B2C10ABF5FDull;
+        const bool trackedLeaf = traceResidency && validSource &&
+            sourceHash == 0xD7C087AC44EAD2F5ull;
+        if (trackedPot)
+            s_xmenPlanterPotTexture.store(descriptor, std::memory_order_relaxed);
+        else if (trackedLeaf)
+            s_xmenPlanterLeafTexture.store(descriptor, std::memory_order_relaxed);
+
+        if (traceUpload || trackedPot || trackedLeaf)
         {
             const uint32_t manager = readRdramProbeU32(rdram, 0x00750778u);
             std::cerr << "[xmen-texture-upload:entry] index=" << std::dec << index
                       << " source=0x" << std::hex << sourcePc
                       << " upload=0x" << upload
                       << " descriptor=0x" << descriptor
-                      << " data=0x" << readRdramProbeU32(rdram, descriptor + 0x30u)
+                      << " data=0x" << data
                       << " destination=0x" << destination
                       << " width=0x" << width
                       << " height=0x" << height
@@ -3374,6 +4304,20 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                       << " packet=0x" << readRdramProbeU32(rdram, manager + 0x30u)
                       << " packetEnd=0x" << readRdramProbeU32(rdram, manager + 0x28u)
                       << " sp=0x" << GPR_U32(ctx, 29)
+                      << " sourceBytes=0x" << sourceBytes
+                      << " sourceValid=" << std::dec << (validSource ? 1u : 0u)
+                      << " sourceHash=0x" << std::hex << sourceHash
+                      << " sourceHead=";
+            if (validSource)
+            {
+                for (uint32_t byte = 0u; byte < std::min<uint32_t>(sourceBytes, 32u); ++byte)
+                {
+                    const uint32_t value = rdram[dataPhysical + byte];
+                    std::cerr << "0123456789abcdef"[(value >> 4u) & 0xFu]
+                              << "0123456789abcdef"[value & 0xFu];
+                }
+            }
+            std::cerr
                       << std::dec << std::endl;
             if (descriptor == 0xFFFFFFFFu)
             {
@@ -3415,7 +4359,19 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         const uint32_t upload = GPR_U32(ctx, 22);
         const uint32_t descriptor = readRdramProbeU32(rdram, upload);
         const uint32_t destination = readRdramProbeU32(rdram, descriptor + 0x38u);
-        if (index < 256u || (chunk == 0u && zeroIndex < 32u) ||
+        const char *traceStartValue =
+            std::getenv("PS2X_TRACE_XMEN_TEXTURE_UPLOAD_DESTINATION_START");
+        const char *traceEndValue =
+            std::getenv("PS2X_TRACE_XMEN_TEXTURE_UPLOAD_DESTINATION_END");
+        const uint32_t traceStart = traceStartValue
+            ? static_cast<uint32_t>(std::strtoul(traceStartValue, nullptr, 0))
+            : 0u;
+        const uint32_t traceEnd = traceEndValue
+            ? static_cast<uint32_t>(std::strtoul(traceEndValue, nullptr, 0))
+            : traceStart;
+        const bool traceDestination = traceStartValue &&
+            destination >= traceStart && destination <= traceEnd;
+        if (index < 256u || (chunk == 0u && zeroIndex < 32u) || traceDestination ||
             destination == 0x2D84u || destination == 0x2D88u)
         {
             const uint32_t manager = readRdramProbeU32(rdram, 0x00750778u);
@@ -4989,8 +5945,27 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     }
     const uint32_t xmenLegalEd4 = readRdramProbeU32(rdram, xmenLegalViewer + 0xED4u);
     const bool xmenLegalSceneActive = xmenLegalEd4 != 0u && xmenLegalEd4 != 0x3FFFFFFFu;
+    if (xmenLegalSceneActive && sourcePc == 0x0031F46Cu &&
+        std::getenv("PS2X_FAST_FORWARD_XMEN_LEGAL") != nullptr && ctx->f[12] < 10.0f)
+    {
+        static std::atomic<uint32_t> s_xmenLegalFastForwardTraceCount{0u};
+        const uint32_t traceIndex = s_xmenLegalFastForwardTraceCount.fetch_add(
+            1u, std::memory_order_relaxed);
+        if (traceIndex < 4u)
+        {
+            std::cerr << "[xmen-legal-fast-forward] index=" << traceIndex
+                      << " tick=" << m_eeScheduler->currentVSyncTick()
+                      << " originalDelta=" << ctx->f[12]
+                      << " viewer=0x" << std::hex << xmenLegalViewer
+                      << " image=0x" << xmenLegalEd4
+                      << std::dec << std::endl;
+        }
+        ctx->f[12] = 10.0f;
+    }
+    static const bool traceXmenLegalDiagnostics =
+        std::getenv("PS2X_TRACE_XMEN_LEGAL") != nullptr;
     static std::atomic<bool> s_xmenLegalLayerTraceArmed{false};
-    if (xmenLegalSceneActive && targetPc == 0x003272A0u)
+    if (traceXmenLegalDiagnostics && xmenLegalSceneActive && targetPc == 0x003272A0u)
     {
         s_xmenLegalLayerTraceArmed.store(true, std::memory_order_relaxed);
     }
@@ -5053,7 +6028,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                       << std::dec << std::endl;
         }
     }
-    if (xmenLegalSceneActive && (sourcePc == 0x00326E6Cu || sourcePc == 0x00326E78u))
+    if (traceXmenLegalDiagnostics && xmenLegalSceneActive &&
+        (sourcePc == 0x00326E6Cu || sourcePc == 0x00326E78u))
     {
         static std::atomic<uint32_t> s_xmenLegalManagerLookupTraceCount{0u};
         const uint32_t count = s_xmenLegalManagerLookupTraceCount.fetch_add(1u, std::memory_order_relaxed);
@@ -5081,7 +6057,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                       << std::dec << std::endl;
         }
     }
-    if (isCall && xmenLegalSceneActive &&
+    if (traceXmenLegalDiagnostics && isCall && xmenLegalSceneActive &&
         (targetPc == 0x001375A0u ||
          (sourcePc >= 0x001375A0u && sourcePc < 0x00137A28u)))
     {
@@ -5116,7 +6092,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                       << std::dec << std::endl;
         }
     }
-    if (isCall && xmenLegalSceneActive && sourcePc == 0x002E66F4u)
+    if (traceXmenLegalDiagnostics && isCall && xmenLegalSceneActive &&
+        sourcePc == 0x002E66F4u)
     {
         static std::atomic<uint32_t> s_xmenLegalVifProducerTraceCount{0u};
         const uint32_t count = s_xmenLegalVifProducerTraceCount.fetch_add(1u, std::memory_order_relaxed);
@@ -5204,7 +6181,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             targetPc == 0x002133D0u || targetPc == 0x002133F0u ||
             targetPc == 0x00213400u || targetPc == 0x00213410u ||
             targetPc == 0x00213420u;
-        if (xmenLegalSceneActive && (isIgRenderMethod || isIgListOrNodeMethod))
+        if (traceXmenLegalDiagnostics && xmenLegalSceneActive &&
+            (isIgRenderMethod || isIgListOrNodeMethod))
         {
             static std::atomic<uint32_t> s_xmenIgDispatchTraceCount{0u};
             const uint32_t count = s_xmenIgDispatchTraceCount.fetch_add(1u, std::memory_order_relaxed);
@@ -5705,7 +6683,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     const uint32_t xmenCallObject = GPR_U32(ctx, 4);
     const bool isXmenLegalManagerCall =
         isCall && xmenCallObject != 0u && readRdramProbeU32(rdram, xmenCallObject) == 0x00708C00u;
-    if (isXmenLegalManagerCall)
+    if (traceXmenLegalDiagnostics && isXmenLegalManagerCall)
     {
         static std::atomic<uint32_t> s_xmenLegalManagerCallCount{0u};
         const uint32_t count = s_xmenLegalManagerCallCount.fetch_add(1u, std::memory_order_relaxed);
@@ -6099,7 +7077,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                       << std::endl;
         }
     }
-    if (isCall && sourcePc >= 0x0031F000u && sourcePc < 0x0031F600u)
+    if (traceXmenLegalDiagnostics && isCall &&
+        sourcePc >= 0x0031F000u && sourcePc < 0x0031F600u)
     {
         static std::atomic<uint32_t> s_xmenLegalMenuUpdateTraceCount{0u};
         const uint32_t count = s_xmenLegalMenuUpdateTraceCount.fetch_add(1u, std::memory_order_relaxed);
@@ -6122,7 +7101,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                       << std::dec << std::endl;
         }
     }
-    if (isCall && ((sourcePc >= 0x005C1AA0u && sourcePc < 0x005C1B80u) ||
+    if (traceXmenLegalDiagnostics && isCall &&
+        ((sourcePc >= 0x005C1AA0u && sourcePc < 0x005C1B80u) ||
                    (sourcePc >= 0x0034AB00u && sourcePc < 0x0034AC10u)))
     {
         static std::atomic<uint32_t> s_xmenLegalViewerTraversalTraceCount{0u};
@@ -6145,7 +7125,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                       << std::dec << std::endl;
         }
     }
-    if (isCall && sourcePc == 0x0034AB28u)
+    if (traceXmenLegalDiagnostics && isCall && sourcePc == 0x0034AB28u)
     {
         static std::atomic<uint32_t> s_xmenLegalViewerContainerTraceCount{0u};
         const uint32_t count = s_xmenLegalViewerContainerTraceCount.fetch_add(1u, std::memory_order_relaxed);
@@ -6558,6 +7538,74 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     {
         const uint32_t path = GPR_U32(ctx, 17);
         const std::string pathText = readGuestPrintableString(rdram, path, 128u);
+        if (pathText.find("maps/nyc/alison/nyc1_1_1.igb") != std::string::npos)
+        {
+            const uint32_t package = GPR_U32(ctx, 18);
+            const uint32_t objectTable = readRdramProbeU32(rdram, package + 0x2Cu);
+            const uint32_t objectEntries = readRdramProbeU32(rdram, objectTable + 0x10u);
+            const uint32_t lightSet = objectEntries != 0u
+                ? readRdramProbeU32(rdram, objectEntries + 1616u * 4u)
+                : 0u;
+            const uint32_t light = objectEntries != 0u
+                ? readRdramProbeU32(rdram, objectEntries + 1619u * 4u)
+                : 0u;
+            const uint32_t lightState = objectEntries != 0u
+                ? readRdramProbeU32(rdram, objectEntries + 4620u * 4u)
+                : 0u;
+            const uint32_t lightStateList = objectEntries != 0u
+                ? readRdramProbeU32(rdram, objectEntries + 1150u * 4u)
+                : 0u;
+            const uint32_t lightStateSet = objectEntries != 0u
+                ? readRdramProbeU32(rdram, objectEntries + 3952u * 4u)
+                : 0u;
+            const uint32_t sceneInfo = objectEntries != 0u
+                ? readRdramProbeU32(rdram, objectEntries + 4063u * 4u)
+                : 0u;
+            if (lightSet != 0u && light != 0u && lightState != 0u)
+            {
+                s_xmenNycSceneAmbientLightSet.store(lightSet, std::memory_order_relaxed);
+                s_xmenNycSceneAmbientLight.store(light, std::memory_order_relaxed);
+                s_xmenNycSceneAmbientLightState.store(lightState, std::memory_order_relaxed);
+                s_xmenNycSceneRootLightStateList.store(
+                    lightStateList, std::memory_order_relaxed);
+                s_xmenNycSceneRootLightStateSet.store(
+                    lightStateSet, std::memory_order_relaxed);
+                s_xmenNycSceneInfo.store(sceneInfo, std::memory_order_relaxed);
+            }
+            s_xmenNycLevelPackage.store(package, std::memory_order_relaxed);
+            s_xmenNycLevelObjectEntries.store(objectEntries, std::memory_order_relaxed);
+            static std::atomic<uint32_t> s_xmenNycLevelLoadTraceCount{0u};
+            const uint32_t count =
+                s_xmenNycLevelLoadTraceCount.fetch_add(1u, std::memory_order_relaxed);
+            if (count < 32u)
+            {
+                std::cerr << "[xmen-nyc-level-igb-load] index=" << std::dec << count
+                          << " tick=" << xmenBranchTick
+                          << " source=0x" << std::hex << sourcePc
+                          << " target=0x" << targetPc
+                          << " path=\"" << pathText << "\""
+                          << " package=0x" << package
+                          << " objectTable=0x" << objectTable
+                          << " objectCount=0x"
+                          << readRdramProbeU32(rdram, objectTable + 0x08u)
+                          << " objectEntries=0x" << objectEntries
+                          << " lightSet=0x" << lightSet
+                          << " light=0x" << light
+                          << " ambient0=0x" << readRdramProbeU32(rdram, light + 0x20u)
+                          << " ambient1=0x" << readRdramProbeU32(rdram, light + 0x24u)
+                          << " ambient2=0x" << readRdramProbeU32(rdram, light + 0x28u)
+                          << " ambient3=0x" << readRdramProbeU32(rdram, light + 0x2Cu)
+                          << " lightState=0x" << lightState
+                          << " lightStateLight=0x"
+                          << readRdramProbeU32(rdram, lightState + 0x10u)
+                          << " lightStateEnabled=0x"
+                          << readRdramProbeU32(rdram, lightState + 0x14u)
+                          << " lightStateList=0x" << lightStateList
+                          << " lightStateSet=0x" << lightStateSet
+                          << " sceneInfo=0x" << sceneInfo
+                          << std::dec << std::endl;
+            }
+        }
         if (pathText.find("maps/menu/main_back.igb") != std::string::npos)
         {
             const uint32_t package = GPR_U32(ctx, 18);
@@ -7489,6 +8537,30 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             return true;
         }
     }
+    if (isCall && targetPc == 0x00277520u)
+    {
+        const char *minimumTickValue =
+            std::getenv("PS2X_TRACE_XMEN_LIGHT_PACKET_MIN_TICK");
+        if (minimumTickValue != nullptr)
+        {
+            const uint64_t minimumTick = std::strtoull(minimumTickValue, nullptr, 0);
+            const uint64_t currentTick = m_eeScheduler->currentVSyncTick();
+            static std::atomic<uint32_t> xmenLightingDispatchLogCount{0u};
+            if (currentTick >= minimumTick &&
+                xmenLightingDispatchLogCount.fetch_add(1u, std::memory_order_relaxed) < 64u)
+            {
+                std::cerr << "[xmen-lighting-dispatch] tick=" << currentTick
+                          << " source=0x" << std::hex << sourcePc
+                          << " target=0x" << targetPc
+                          << " return=0x" << fallthroughPc
+                          << " state=0x" << GPR_U32(ctx, 4)
+                          << " requested=0x" << GPR_U32(ctx, 5)
+                          << " sp=0x" << GPR_U32(ctx, 29)
+                          << " trace=" << formatDispatchHistory()
+                          << std::dec << std::endl;
+            }
+        }
+    }
     if (isCall && (targetPc == 0x0010AC00u || targetPc == 0x0010AC30u))
     {
         std::cerr << "[xmen-irq-install-call] source=0x" << std::hex << sourcePc
@@ -7680,9 +8752,6 @@ xmen_component_attach_trace_done:
                       << " ra=0x" << GPR_U32(ctx, 31) << std::dec << std::endl;
         }
     }
-    static thread_local std::array<uint32_t, 256> s_guestReturnTargets{};
-    static thread_local std::array<uint32_t, 256> s_guestCallSources{};
-    static thread_local uint32_t s_guestReturnDepth = 0u;
     static std::atomic<bool> s_xmenSteadyFrameCoverageEnabled{false};
 
     if (targetPc == 0x00235140u || sourcePc == 0x002351A4u)
@@ -8789,6 +9858,31 @@ xmen_component_attach_trace_done:
         }
         ctx->pc = fallthroughPc;
         return true;
+    }
+
+    if (profileXmenBranchHooks)
+    {
+        static thread_local uint64_t profileCalls = 0u;
+        static thread_local uint64_t profileNanoseconds = 0u;
+        const auto elapsed = std::chrono::steady_clock::now() - xmenBranchHookStart;
+        profileNanoseconds += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+        ++profileCalls;
+        if ((profileCalls & 0xFFFu) == 0u)
+        {
+            const double elapsedMilliseconds =
+                static_cast<double>(profileNanoseconds) / 1'000'000.0;
+            const double averageMicroseconds =
+                static_cast<double>(profileNanoseconds) /
+                static_cast<double>(profileCalls) / 1'000.0;
+            std::fprintf(stderr,
+                         "[xmen-branch-profile] calls=%llu total_ms=%.3f avg_us=%.3f tick=%llu\n",
+                         static_cast<unsigned long long>(profileCalls),
+                         elapsedMilliseconds,
+                         averageMicroseconds,
+                         static_cast<unsigned long long>(
+                             m_eeScheduler ? m_eeScheduler->currentVSyncTick() : 0u));
+        }
     }
 
     // Every inter-function transfer is also a deterministic EE safe point.
@@ -10050,7 +11144,9 @@ uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
     try
     {
-        return m_memory.read8(vaddr);
+        const uint8_t value = m_memory.read8(vaddr);
+        ps2TraceGuestRead(vaddr, sizeof(value), value, 0u, "READ8", ctx);
+        return value;
     }
     catch (const std::exception &)
     {
@@ -10063,7 +11159,9 @@ uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
     try
     {
-        return m_memory.read16(vaddr);
+        const uint16_t value = m_memory.read16(vaddr);
+        ps2TraceGuestRead(vaddr, sizeof(value), value, 0u, "READ16", ctx);
+        return value;
     }
     catch (const std::exception &)
     {
@@ -10077,6 +11175,7 @@ uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     try
     {
         const uint32_t value = m_memory.read32(vaddr);
+        ps2TraceGuestRead(vaddr, sizeof(value), value, 0u, "READ32", ctx);
         if (isIpuHardwareAddress(vaddr))
         {
             static std::atomic<uint32_t> s_xmenIpuRead32Count{0u};
@@ -10107,6 +11206,7 @@ uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     try
     {
         const uint64_t value = m_memory.read64(vaddr);
+        ps2TraceGuestRead(vaddr, sizeof(value), value, 0u, "READ64", ctx);
         if (isIpuHardwareAddress(vaddr))
         {
             static std::atomic<uint32_t> s_xmenIpuRead64Count{0u};
@@ -10136,7 +11236,11 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
     try
     {
-        return m_memory.read128(vaddr);
+        const __m128i value = m_memory.read128(vaddr);
+        alignas(16) uint64_t parts[2]{};
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(parts), value);
+        ps2TraceGuestRead(vaddr, sizeof(value), parts[0], parts[1], "READ128", ctx);
+        return value;
     }
     catch (const std::exception &)
     {
