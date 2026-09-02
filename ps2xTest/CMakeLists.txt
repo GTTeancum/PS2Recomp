@@ -133,7 +133,5 @@ endif()
 
 include("${CMAKE_SOURCE_DIR}/ps2xRuntime/cmake/ReleaseMode.cmake")
 
-if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
-    EnableFastReleaseMode(ps2_test_lib)
-    EnableFastReleaseMode(ps2x_tests)
-endif()
+EnableFastReleaseMode(ps2_test_lib)
+EnableFastReleaseMode(ps2x_tests)

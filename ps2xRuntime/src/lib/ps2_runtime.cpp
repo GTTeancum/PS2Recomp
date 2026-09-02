@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <chrono>
@@ -35,6 +36,23 @@ namespace ps2_stubs
     void resetSifState();
 }
 
+extern "C" void ps2xGetXmenGifPrimitiveDebug(
+    uint64_t *counts, uint64_t *tags, uint64_t *ticks,
+    uint32_t *presents, uint32_t *flags, uint32_t *fbps);
+
+extern "C" void ps2xGetXmenXgkickProgramDebug(
+    uint32_t capacity, uint32_t *programs, uint64_t *counts,
+    uint64_t *ticks, uint64_t *executions, uint64_t *tagLo,
+    uint64_t *tagHi, uint32_t *issuePcs, uint32_t *sources,
+    uint32_t *bytes);
+
+extern "C" void ps2xGetXmenVif1Debug(
+    uint32_t capacity, uint32_t *programs, uint64_t *counts, uint64_t *ticks,
+    uint32_t *transfers, uint32_t *sources, uint32_t *tags, uint32_t *offsets,
+    uint64_t *chainCount, uint64_t *chainTick, uint32_t *chainStart,
+    uint32_t *chainEnd, uint32_t *chainTags, uint32_t *chainBytes,
+    uint32_t *chainChcr, uint32_t *chainEnded);
+
 static std::atomic<bool> g_xmenTitleBranchTraceArmed{false};
 static std::atomic<uint32_t> g_xmenTitleBranchTraceCount{0u};
 static std::atomic<uint32_t> g_xmenMainBackIgbPackage{0u};
@@ -45,6 +63,93 @@ static thread_local uint32_t g_xmenLiveChainSavedReturnSlot = 0u;
 static thread_local uint32_t g_xmenLiveChainExpectedReturn = 0u;
 static thread_local uint32_t g_xmenLiveChainSequence = 0u;
 static thread_local uint64_t g_xmenLiveChainLastObserved = 0u;
+
+static bool xmenRuntimeDiagnosticsEnabled()
+{
+    static const bool enabled = std::getenv("PS2X_XMEN_DIAGNOSTICS") != nullptr;
+    return enabled;
+}
+
+static constexpr size_t kXmenVif1GuestStartSiteCount = 4u;
+static constexpr size_t kXmenVif1GuestSlotCount = 16u;
+static std::array<std::atomic<uint64_t>, kXmenVif1GuestStartSiteCount>
+    g_xmenVif1GuestStartCounts{};
+static std::array<std::atomic<uint64_t>, kXmenVif1GuestStartSiteCount>
+    g_xmenVif1GuestStartTicks{};
+static std::array<std::atomic<uint32_t>, kXmenVif1GuestStartSiteCount>
+    g_xmenVif1GuestStartCallers{};
+static std::array<std::atomic<uint32_t>, kXmenVif1GuestStartSiteCount>
+    g_xmenVif1GuestStartDescriptors{};
+static std::array<std::atomic<uint32_t>, kXmenVif1GuestStartSiteCount>
+    g_xmenVif1GuestStartAux{};
+static std::array<std::atomic<uint32_t>, kXmenVif1GuestStartSiteCount>
+    g_xmenVif1GuestStartTadr{};
+static std::array<std::atomic<uint32_t>, kXmenVif1GuestStartSiteCount>
+    g_xmenVif1GuestStartMadr{};
+static std::array<std::atomic<uint32_t>, kXmenVif1GuestStartSiteCount>
+    g_xmenVif1GuestStartQwc{};
+static std::array<std::atomic<uint32_t>, kXmenVif1GuestStartSiteCount>
+    g_xmenVif1GuestStartChcr{};
+static std::array<std::atomic<uint64_t>, kXmenVif1GuestSlotCount>
+    g_xmenVif1GuestSlotCounts{};
+static std::array<std::atomic<uint64_t>, kXmenVif1GuestSlotCount>
+    g_xmenVif1GuestSlotTicks{};
+static std::array<std::atomic<uint32_t>, kXmenVif1GuestSlotCount>
+    g_xmenVif1GuestSlotCallers{};
+static std::array<std::atomic<uint32_t>, kXmenVif1GuestSlotCount>
+    g_xmenVif1GuestSlotDescriptors{};
+static std::array<std::atomic<uint32_t>, kXmenVif1GuestSlotCount>
+    g_xmenVif1GuestSlotTadr{};
+
+static constexpr size_t kXmenSceneRenderKindCount = 2u;
+static constexpr size_t kXmenGameplayRenderMethodCount = 8u;
+static std::array<std::atomic<uint64_t>, kXmenSceneRenderKindCount>
+    g_xmenSceneRenderEntryCounts{};
+static std::array<std::atomic<uint64_t>, kXmenSceneRenderKindCount>
+    g_xmenSceneRenderCompleteCounts{};
+static std::array<std::atomic<uint64_t>, kXmenSceneRenderKindCount>
+    g_xmenSceneRenderLastTicks{};
+static std::array<std::atomic<uint32_t>, kXmenSceneRenderKindCount>
+    g_xmenSceneRenderLastOwners{};
+static std::array<std::atomic<uint32_t>, kXmenSceneRenderKindCount>
+    g_xmenSceneRenderLastQueues{};
+static std::array<std::atomic<uint32_t>, kXmenSceneRenderKindCount>
+    g_xmenSceneRenderLastStarts{};
+static std::array<std::atomic<uint32_t>, kXmenSceneRenderKindCount>
+    g_xmenSceneRenderLastEnds{};
+static std::array<std::atomic<uint32_t>, kXmenSceneRenderKindCount>
+    g_xmenSceneRenderLastBytes{};
+static std::atomic<uint64_t> g_xmenGameplayIteratorStarts{0u};
+static std::atomic<uint64_t> g_xmenGameplayIterations{0u};
+static std::atomic<uint64_t> g_xmenGameplayCullCalls{0u};
+static std::atomic<uint64_t> g_xmenGameplayCullSkips{0u};
+static std::atomic<uint64_t> g_xmenGameplayRenderCalls{0u};
+static std::atomic<uint64_t> g_xmenGameplayRenderReturns{0u};
+static std::atomic<uint32_t> g_xmenGameplayLastCollection{0u};
+static std::atomic<uint32_t> g_xmenGameplayLastCollectionRoot{0u};
+static std::atomic<uint32_t> g_xmenGameplayLastIterator{0u};
+static std::atomic<uint32_t> g_xmenGameplayLastCullTarget{0u};
+static std::atomic<uint32_t> g_xmenGameplayLastCullObject{0u};
+static std::atomic<uint32_t> g_xmenGameplayLastRenderTarget{0u};
+static std::atomic<uint32_t> g_xmenGameplayLastRenderObject{0u};
+static std::atomic<uint32_t> g_xmenGameplayLastRenderFlags{0u};
+static std::atomic<uint32_t> g_xmenGameplayLastRenderResult{0u};
+static std::atomic<uint32_t> g_xmenGameplayLastRenderBytes{0u};
+static std::array<std::atomic<uint32_t>, kXmenGameplayRenderMethodCount>
+    g_xmenGameplayRenderMethods{};
+static std::array<std::atomic<uint64_t>, kXmenGameplayRenderMethodCount>
+    g_xmenGameplayRenderMethodCounts{};
+static std::atomic<uint64_t> g_xmenFrameRenderGateCalls{0u};
+static std::atomic<uint64_t> g_xmenFrameRenderGateReturns{0u};
+static std::atomic<uint64_t> g_xmenFrameRenderGateTrue{0u};
+static std::atomic<uint64_t> g_xmenFrameRenderGateFalse{0u};
+static std::atomic<uint64_t> g_xmenFrameRenderGateLastTick{0u};
+static std::atomic<uint32_t> g_xmenFrameRenderGateLastTarget{0u};
+static std::atomic<uint32_t> g_xmenFrameRenderGateLastOwner{0u};
+static std::atomic<uint32_t> g_xmenFrameRenderGateLastActive{0u};
+static std::atomic<uint32_t> g_xmenFrameRenderGateLastVtable{0u};
+static std::atomic<uint32_t> g_xmenFrameRenderGateLastRender{0u};
+static std::atomic<uint32_t> g_xmenFrameRenderGateLastResult{0u};
 
 static void traceXmenLiveChainWrite(uint8_t *rdram,
                                     uint32_t guestAddr,
@@ -127,6 +232,9 @@ static void traceXmenVu1MailboxCode(const uint8_t *vuCode)
 
 void ps2xArmXmenTitleBranchTrace()
 {
+    if (!xmenRuntimeDiagnosticsEnabled())
+        return;
+
     g_xmenTitleBranchTraceCount.store(0u, std::memory_order_relaxed);
     g_xmenTitleBranchTraceArmed.store(true, std::memory_order_release);
 }
@@ -225,6 +333,55 @@ namespace
 
     thread_local DispatchHistory g_dispatchHistory;
     thread_local uint64_t g_guestDispatchYieldGeneration = 0u;
+    thread_local uint32_t g_xmenPendingFastCheckpointCycles = 0u;
+    struct XmenPacingProfile
+    {
+        uint64_t tick = 0u;
+        uint64_t branches = 0u;
+        uint64_t returns = 0u;
+        uint64_t fastCalls = 0u;
+        uint64_t fastUnwinds = 0u;
+        uint64_t compatibilityCalls = 0u;
+        uint64_t checkpointYields = 0u;
+        uint64_t depthYields = 0u;
+    };
+    thread_local XmenPacingProfile g_xmenPacingProfile{};
+
+    bool xmenPacingProfileEnabled()
+    {
+        static const bool enabled = std::getenv("PS2X_PROFILE_XMEN_PACING") != nullptr;
+        return enabled;
+    }
+
+    void advanceXmenPacingProfile(uint64_t tick)
+    {
+        if (!xmenPacingProfileEnabled())
+        {
+            return;
+        }
+        if (g_xmenPacingProfile.tick != 0u && tick != g_xmenPacingProfile.tick)
+        {
+            std::fprintf(stderr,
+                         "[xmen-pacing] tick=%llu branches=%llu returns=%llu fastCalls=%llu "
+                         "fastUnwinds=%llu compatibility=%llu checkpointYields=%llu depthYields=%llu\n",
+                         static_cast<unsigned long long>(g_xmenPacingProfile.tick),
+                         static_cast<unsigned long long>(g_xmenPacingProfile.branches),
+                         static_cast<unsigned long long>(g_xmenPacingProfile.returns),
+                         static_cast<unsigned long long>(g_xmenPacingProfile.fastCalls),
+                         static_cast<unsigned long long>(g_xmenPacingProfile.fastUnwinds),
+                         static_cast<unsigned long long>(g_xmenPacingProfile.compatibilityCalls),
+                         static_cast<unsigned long long>(g_xmenPacingProfile.checkpointYields),
+                         static_cast<unsigned long long>(g_xmenPacingProfile.depthYields));
+            g_xmenPacingProfile.branches = 0u;
+            g_xmenPacingProfile.returns = 0u;
+            g_xmenPacingProfile.fastCalls = 0u;
+            g_xmenPacingProfile.fastUnwinds = 0u;
+            g_xmenPacingProfile.compatibilityCalls = 0u;
+            g_xmenPacingProfile.checkpointYields = 0u;
+            g_xmenPacingProfile.depthYields = 0u;
+        }
+        g_xmenPacingProfile.tick = tick;
+    }
 
     bool isIpuHardwareAddress(uint32_t vaddr)
     {
@@ -1098,7 +1255,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                   if (m_eeScheduler)
                                   {
                                       const uint64_t csr = m_memory.gs().csr.load(std::memory_order_relaxed);
-                                      if ((csr & 0x2u) != 0u)
+                                      if (xmenRuntimeDiagnosticsEnabled() && (csr & 0x2u) != 0u)
                                       {
                                           static std::atomic<uint32_t> finishPostTraceCount{0u};
                                           const uint32_t index = finishPostTraceCount.fetch_add(1u, std::memory_order_relaxed);
@@ -1924,7 +2081,20 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
 
 void PS2Runtime::dispatchGuestReturn(R5900Context *ctx, uint32_t targetPc) noexcept
 {
+    if (xmenPacingProfileEnabled())
+    {
+        advanceXmenPacingProfile(m_memory.gs().vsyncTick.load(std::memory_order_relaxed));
+        ++g_xmenPacingProfile.returns;
+    }
     const uint32_t sourcePc = ctx->pc;
+    if (targetPc == 0x0031F5A0u)
+    {
+        const uint32_t result = GPR_U32(ctx, 2);
+        g_xmenFrameRenderGateReturns.fetch_add(1u, std::memory_order_relaxed);
+        (result != 0u ? g_xmenFrameRenderGateTrue : g_xmenFrameRenderGateFalse)
+            .fetch_add(1u, std::memory_order_relaxed);
+        g_xmenFrameRenderGateLastResult.store(result, std::memory_order_relaxed);
+    }
     if (targetPc == 0x003B1160u || sourcePc == 0x002FA54Cu)
     {
         (void)dispatchGuestBranch(m_memory.getRDRAM(),
@@ -1938,7 +2108,38 @@ void PS2Runtime::dispatchGuestReturn(R5900Context *ctx, uint32_t targetPc) noexc
     }
 
     ctx->pc = targetPc;
-    (void)eeCheckpointDue(EeScheduler::kGuestDispatchCycles);
+    static const bool bypassXmenBranchHooks =
+        std::getenv("PS2X_BYPASS_XMEN_BRANCH_HOOKS") != nullptr;
+    bool checkpointDue = false;
+    if (bypassXmenBranchHooks)
+    {
+        constexpr uint32_t kFastCheckpointBatchCycles = 128u;
+        g_xmenPendingFastCheckpointCycles += EeScheduler::kGuestDispatchCycles;
+        if (g_xmenPendingFastCheckpointCycles >= kFastCheckpointBatchCycles)
+        {
+            checkpointDue = eeCheckpointDue(g_xmenPendingFastCheckpointCycles);
+            g_xmenPendingFastCheckpointCycles = 0u;
+        }
+    }
+    else
+    {
+        checkpointDue = eeCheckpointDue(EeScheduler::kGuestDispatchCycles);
+    }
+    if (checkpointDue && xmenPacingProfileEnabled())
+    {
+        ++g_xmenPacingProfile.checkpointYields;
+    }
+    static const bool traceXmenFastReturnEnabled =
+        std::getenv("PS2X_TRACE_XMEN_FAST_RETURN") != nullptr;
+    if (traceXmenFastReturnEnabled && targetPc == 0x003DF434u)
+    {
+        std::cerr << "[xmen-fast-return] phase=guest-return"
+                  << " source=0x" << std::hex << sourcePc
+                  << " target=0x" << targetPc
+                  << " checkpointDue=" << std::dec << (checkpointDue ? 1 : 0)
+                  << " generation=" << g_guestDispatchYieldGeneration
+                  << std::endl;
+    }
 }
 
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
@@ -1949,6 +2150,11 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      GuestBranchKind kind,
                                      const char *debugName)
 {
+    if (xmenPacingProfileEnabled())
+    {
+        advanceXmenPacingProfile(m_memory.gs().vsyncTick.load(std::memory_order_relaxed));
+        ++g_xmenPacingProfile.branches;
+    }
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
     static thread_local std::array<uint32_t, 256> s_guestReturnTargets{};
@@ -2060,6 +2266,22 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
         return mask;
     }();
+    static constexpr uint32_t kXmenCompatibilityFirstAddress =
+        kXmenCompatibilityBranchAddresses.front();
+    static constexpr uint32_t kXmenCompatibilityLastAddress =
+        kXmenCompatibilityBranchAddresses.back();
+    static constexpr size_t kXmenCompatibilityAddressSlotCount =
+        (kXmenCompatibilityLastAddress - kXmenCompatibilityFirstAddress) / 4u + 1u;
+    static constexpr auto kXmenCompatibilityAddressMask = []
+    {
+        std::array<uint64_t, (kXmenCompatibilityAddressSlotCount + 63u) / 64u> mask{};
+        for (const uint32_t address : kXmenCompatibilityBranchAddresses)
+        {
+            const size_t slot = (address - kXmenCompatibilityFirstAddress) / 4u;
+            mask[slot / 64u] |= uint64_t{1} << (slot % 64u);
+        }
+        return mask;
+    }();
     static_assert((kXmenCompatibilityPageMask[
                        (((0x00325900u >> 12u) - kXmenCompatibilityFirstPage) / 64u)] &
                    (uint64_t{1} <<
@@ -2083,10 +2305,124 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return (kXmenCompatibilityPageMask[pageOffset / 64u] &
                 (uint64_t{1} << (pageOffset % 64u))) != 0u;
     };
-    const bool sourceRequiresXmenCompatibility =
-        isXmenCompatibilityPage(sourcePc);
-    const bool targetRequiresXmenCompatibility =
-        isXmenCompatibilityPage(targetPc);
+    const auto isXmenCompatibilityAddress = [&](uint32_t address)
+    {
+        if (!isXmenCompatibilityPage(address))
+        {
+            return false;
+        }
+
+        // These addresses are observed by diagnostics only. Keeping them on the
+        // compatibility path makes hot, otherwise ordinary guest functions scan
+        // the full bring-up hook set on every call.
+        switch (address)
+        {
+        case 0x00158CB8u:
+        case 0x0018B920u:
+        case 0x0018BAB8u:
+        case 0x0018BACCu:
+        case 0x0014CB0Cu:
+        case 0x0014CB28u:
+        case 0x0014CB3Cu:
+        case 0x0014CBB4u:
+        case 0x0014CC5Cu:
+        case 0x001EAB68u:
+        case 0x001EAB7Cu:
+        case 0x001EAB90u:
+        case 0x001EABB0u:
+        case 0x001EABC8u:
+        case 0x001EABECu:
+        case 0x001EABF8u:
+        case 0x001EB930u:
+        case 0x001FC15Cu:
+        case 0x001FC16Cu:
+        case 0x001FC180u:
+        case 0x001FC1C4u:
+        case 0x001FC1D4u:
+        case 0x001FC1E8u:
+        case 0x001FC224u:
+        case 0x001FC234u:
+        case 0x001FC264u:
+        case 0x001FDB5Cu:
+        case 0x00202890u:
+        case 0x0020297Cu:
+        case 0x0020298Cu:
+        case 0x002029ACu:
+        case 0x002029BCu:
+        case 0x002029E0u:
+        case 0x00202A98u:
+        case 0x00202B40u:
+        case 0x00202B74u:
+        case 0x00202BC0u:
+        case 0x00202C40u:
+        case 0x00202CA4u:
+        case 0x00203100u:
+        case 0x0020318Cu:
+        case 0x002031B8u:
+        case 0x00203280u:
+        case 0x00213A80u:
+        case 0x002151B0u:
+        case 0x00215FA0u:
+        case 0x00217500u:
+        case 0x00271F08u:
+        case 0x00271F14u:
+        case 0x00271F1Cu:
+        case 0x00274074u:
+        case 0x00277520u:
+        case 0x002B705Cu:
+        case 0x002B7B60u:
+        case 0x002B7B94u:
+        case 0x002B7BB8u:
+        case 0x002B7C24u:
+        case 0x002B7C38u:
+        case 0x002B7C48u:
+        case 0x002B7C60u:
+        case 0x002B7C70u:
+        case 0x002B7C88u:
+        case 0x002B7C98u:
+        case 0x002BCF78u:
+        case 0x002BCFE8u:
+        case 0x002D92E0u:
+        case 0x002D9490u:
+        case 0x002DE1E8u:
+        case 0x002DEDA4u:
+        case 0x002DF1C0u:
+        case 0x002DF450u:
+        case 0x002F6ACCu:
+        case 0x002F7250u:
+        case 0x002F9FE0u:
+        case 0x002FA890u:
+        case 0x002FAD08u:
+        case 0x002FB570u:
+        case 0x002336F0u:
+        case 0x0030CA00u:
+        case 0x003B2000u:
+        case 0x003B21B4u:
+        case 0x003B2510u:
+        case 0x003B25F4u:
+        case 0x004A32E0u:
+            return false;
+        default:
+            break;
+        }
+
+        if (address < kXmenCompatibilityFirstAddress ||
+            address > kXmenCompatibilityLastAddress ||
+            ((address - kXmenCompatibilityFirstAddress) & 3u) != 0u)
+        {
+            return false;
+        }
+        const size_t slot = (address - kXmenCompatibilityFirstAddress) / 4u;
+        return (kXmenCompatibilityAddressMask[slot / 64u] &
+                (uint64_t{1} << (slot % 64u))) != 0u;
+    };
+    const bool conservativeXmenCompatibility = xmenRuntimeDiagnosticsEnabled();
+    const bool sourceRequiresXmenCompatibility = conservativeXmenCompatibility
+        ? isXmenCompatibilityPage(sourcePc)
+        : isXmenCompatibilityAddress(sourcePc);
+    const bool targetRequiresXmenCompatibility = conservativeXmenCompatibility
+        ? isXmenCompatibilityPage(targetPc)
+        : isXmenCompatibilityAddress(targetPc);
     const bool requiresXmenCompatibility =
         targetPc == 0u || sourceRequiresXmenCompatibility ||
         targetRequiresXmenCompatibility;
@@ -2121,12 +2457,12 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         {
             ++nullTargetCalls;
         }
-        if (sourceMatchesExactCompatibilityAddress)
+        if (sourceMatchesExactCompatibilityAddress && sourceRequiresXmenCompatibility)
         {
             ++addressHits[static_cast<size_t>(
                 sourceCompatibilityIt - kXmenCompatibilityBranchAddresses.begin())];
         }
-        if (targetMatchesExactCompatibilityAddress)
+        if (targetMatchesExactCompatibilityAddress && targetRequiresXmenCompatibility)
         {
             ++addressHits[static_cast<size_t>(
                 targetCompatibilityIt - kXmenCompatibilityBranchAddresses.begin())];
@@ -2143,7 +2479,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                     addressHits[index], kXmenCompatibilityBranchAddresses[index]};
             }
             std::partial_sort(
-                ranked.begin(), ranked.begin() + 16u, ranked.end(),
+                ranked.begin(), ranked.begin() + 32u, ranked.end(),
                 [](const auto &left, const auto &right) {
                     return left.first > right.first;
                 });
@@ -2156,7 +2492,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                 static_cast<unsigned long long>(compatibilityCalls),
                 static_cast<unsigned long long>(calls - compatibilityCalls),
                 static_cast<unsigned long long>(nullTargetCalls));
-            for (size_t index = 0; index < 16u && ranked[index].first != 0u;
+            for (size_t index = 0; index < 32u && ranked[index].first != 0u;
                  ++index)
             {
                 std::fprintf(stderr, "%s0x%08X:%llu", index == 0u ? "" : ",",
@@ -2166,16 +2502,108 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             std::fprintf(stderr, "\n");
         }
     }
+    static std::atomic<uint32_t> s_xmenControlledPlayer{0u};
+    static std::atomic<uint32_t> s_xmenGameplayCamera{0u};
+    static const bool traceXmenPlayerPlacement =
+        std::getenv("PS2X_TRACE_XMEN_PLAYER_PLACEMENT") != nullptr;
+    constexpr std::array<uint32_t, 18> kXmenPlayerPlacementCallSites = {
+        0x003DF3E8u, 0x003DF3F8u, 0x003DF40Cu, 0x003DF42Cu,
+        0x003DF44Cu, 0x003DF454u, 0x003DF460u, 0x003DF46Cu,
+        0x003DF484u, 0x003DF4F0u, 0x003DF4CCu, 0x003DF510u,
+        0x003DF52Cu, 0x003DF558u, 0x003DF56Cu, 0x003DF580u,
+        0x003DF590u, 0x003DF61Cu,
+    };
+    if (rdram && isCall && traceXmenPlayerPlacement &&
+        std::find(kXmenPlayerPlacementCallSites.begin(),
+                  kXmenPlayerPlacementCallSites.end(), sourcePc) !=
+            kXmenPlayerPlacementCallSites.end())
+    {
+        const uint64_t xmenBranchTick =
+            m_memory.gs().vsyncTick.load(std::memory_order_relaxed);
+        if (sourcePc == 0x003DF4F0u)
+        {
+            s_xmenGameplayCamera.store(GPR_U32(ctx, 4), std::memory_order_relaxed);
+        }
+        if (sourcePc == 0x003DF56Cu)
+        {
+            s_xmenGameplayCamera.store(GPR_U32(ctx, 4), std::memory_order_relaxed);
+            s_xmenControlledPlayer.store(GPR_U32(ctx, 5), std::memory_order_relaxed);
+        }
+
+        static std::atomic<uint32_t> s_xmenPlayerPlacementTraceCount{0u};
+        const uint32_t count =
+            s_xmenPlayerPlacementTraceCount.fetch_add(1u, std::memory_order_relaxed);
+        if (count < 128u)
+        {
+            const uint32_t characters = readRdramProbeU32(rdram, 0x00764350u);
+            const uint32_t player =
+                s_xmenControlledPlayer.load(std::memory_order_relaxed);
+            const uint32_t camera =
+                s_xmenGameplayCamera.load(std::memory_order_relaxed);
+            std::cerr << "[xmen-player-placement] index=" << std::dec << count
+                      << " tick=" << xmenBranchTick
+                      << " source=0x" << std::hex << sourcePc
+                      << " target=0x" << targetPc
+                      << " a0=0x" << GPR_U32(ctx, 4)
+                      << " a1=0x" << GPR_U32(ctx, 5)
+                      << " a2=0x" << GPR_U32(ctx, 6)
+                      << " a3=0x" << GPR_U32(ctx, 7)
+                      << " s0=0x" << GPR_U32(ctx, 16)
+                      << " s1=0x" << GPR_U32(ctx, 17)
+                      << " s2=0x" << GPR_U32(ctx, 18)
+                      << " characters=0x" << characters
+                      << " charactersVtable=0x"
+                      << (characters != 0u ? readRdramProbeU32(rdram, characters) : 0u)
+                      << " player=0x" << player
+                      << " playerEntityVtable=0x"
+                      << (player != 0u ? readRdramProbeU32(rdram, player + 0x6Cu) : 0u)
+                      << " camera=0x" << camera
+                      << " cameraVtable=0x"
+                      << (camera != 0u ? readRdramProbeU32(rdram, camera) : 0u)
+                      << std::dec << std::endl;
+        }
+    }
     if (bypassXmenBranchHooks && !requiresXmenCompatibility)
     {
-        if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+        constexpr uint32_t kFastCheckpointBatchCycles = 128u;
+        g_xmenPendingFastCheckpointCycles += EeScheduler::kGuestDispatchCycles;
+        bool fastCheckpointDue = false;
+        if (m_eeScheduler && g_xmenPendingFastCheckpointCycles >= kFastCheckpointBatchCycles)
         {
+            fastCheckpointDue = m_eeScheduler->checkpointDue(g_xmenPendingFastCheckpointCycles);
+            g_xmenPendingFastCheckpointCycles = 0u;
+        }
+        static const bool traceXmenFastReturnEnabled =
+            std::getenv("PS2X_TRACE_XMEN_FAST_RETURN") != nullptr;
+        const bool traceXmenFastCheckpoint = traceXmenFastReturnEnabled &&
+            (sourcePc == 0x003DF42Cu || sourcePc == 0x003DF44Cu);
+        if (traceXmenFastCheckpoint)
+        {
+            std::cerr << "[xmen-fast-return] phase=branch-checkpoint"
+                      << " source=0x" << std::hex << sourcePc
+                      << " target=0x" << targetPc
+                      << " fallthrough=0x" << fallthroughPc
+                      << " ctxPc=0x" << ctx->pc
+                      << " checkpointDue=" << std::dec << (fastCheckpointDue ? 1 : 0)
+                      << " generation=" << g_guestDispatchYieldGeneration
+                      << std::endl;
+        }
+        if (fastCheckpointDue)
+        {
+            if (xmenPacingProfileEnabled())
+            {
+                ++g_xmenPacingProfile.checkpointYields;
+            }
             ++g_guestDispatchYieldGeneration;
             return false;
         }
 
         if (!isCall)
         {
+            if (xmenPacingProfileEnabled())
+            {
+                ++g_xmenPacingProfile.fastUnwinds;
+            }
             if (kind == GuestBranchKind::Return && s_guestReturnDepth > 0u &&
                 !hasFunction(targetPc))
             {
@@ -2200,7 +2628,13 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             return true;
         }
 
-        if (!hasFunction(targetPc))
+        uint32_t targetSlot = 0u;
+        RecompiledFunction targetFn = nullptr;
+        if (generatedFunctionTableSlot(targetPc, targetSlot))
+        {
+            targetFn = g_ps2RecompiledFunctionTable[targetSlot];
+        }
+        if (targetFn == nullptr)
         {
             reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
             const MissingFunctionPolicy policy = missingFunctionPolicy();
@@ -2217,9 +2651,23 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             return false;
         }
 
-        static thread_local uint32_t fastDispatchDepth = 0u;
-        if (fastDispatchDepth >= 32u)
+        static const uint32_t fastDispatchDepthLimit = []
         {
+            const char *value = std::getenv("PS2X_XMEN_FAST_DISPATCH_DEPTH");
+            if (value == nullptr || *value == '\0')
+            {
+                return 32u;
+            }
+            const unsigned long parsed = std::strtoul(value, nullptr, 10);
+            return static_cast<uint32_t>(std::clamp(parsed, 8ul, 256ul));
+        }();
+        static thread_local uint32_t fastDispatchDepth = 0u;
+        if (fastDispatchDepth >= fastDispatchDepthLimit)
+        {
+            if (xmenPacingProfileEnabled())
+            {
+                ++g_xmenPacingProfile.depthYields;
+            }
             ++g_guestDispatchYieldGeneration;
             ctx->pc = targetPc;
             return false;
@@ -2230,11 +2678,31 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             ~FastDispatchDepthGuard() { --depth; }
         };
         ++fastDispatchDepth;
+        if (xmenPacingProfileEnabled())
+        {
+            ++g_xmenPacingProfile.fastCalls;
+        }
         FastDispatchDepthGuard fastDispatchDepthGuard{fastDispatchDepth};
 
-        RecompiledFunction targetFn = lookupFunction(targetPc);
+        if (conservativeXmenCompatibility)
+        {
+            pushDispatchPc(targetPc);
+        }
         const uint32_t entryPc = ctx->pc;
         const uint64_t yieldGeneration = g_guestDispatchYieldGeneration;
+        const bool traceXmenFastReturn =
+            traceXmenFastReturnEnabled && sourcePc == 0x003DF42Cu;
+        if (traceXmenFastReturn)
+        {
+            std::cerr << "[xmen-fast-return] phase=before-call"
+                      << " source=0x" << std::hex << sourcePc
+                      << " target=0x" << targetPc
+                      << " fallthrough=0x" << fallthroughPc
+                      << " ctxPc=0x" << ctx->pc
+                      << " generation=" << std::dec << yieldGeneration
+                      << " depth=" << fastDispatchDepth
+                      << std::endl;
+        }
         const bool pushedGuestReturn =
             fallthroughPc != 0u && s_guestReturnDepth < s_guestReturnTargets.size();
         if (pushedGuestReturn)
@@ -2257,6 +2725,19 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         };
         FastGuestReturnDepthGuard guestReturnDepthGuard{pushedGuestReturn, s_guestReturnDepth};
         targetFn(rdram, ctx, this);
+        if (traceXmenFastReturn)
+        {
+            std::cerr << "[xmen-fast-return] phase=after-call"
+                      << " source=0x" << std::hex << sourcePc
+                      << " target=0x" << targetPc
+                      << " fallthrough=0x" << fallthroughPc
+                      << " ctxPc=0x" << ctx->pc
+                      << " generationBefore=" << std::dec << yieldGeneration
+                      << " generationAfter=" << g_guestDispatchYieldGeneration
+                      << " stop=" << (isStopRequested() ? 1 : 0)
+                      << " returnDepth=" << s_guestReturnDepth
+                      << std::endl;
+        }
         if (isStopRequested() || ctx->pc == 0u)
         {
             return false;
@@ -2271,6 +2752,12 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
         return ctx->pc == fallthroughPc;
     }
+    if (xmenPacingProfileEnabled())
+    {
+        ++g_xmenPacingProfile.compatibilityCalls;
+    }
+    const uint64_t xmenBranchTick =
+        m_memory.gs().vsyncTick.load(std::memory_order_relaxed);
     constexpr uint32_t kXmenDispatchTable = 0x006AC600u;
     constexpr std::array<uint32_t, 14> kXmenExpectedDispatchTable = {
         0x002F3400u, 0x002F3400u, 0x002F3400u, 0x002F313Cu,
@@ -2303,6 +2790,138 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     static thread_local uint32_t s_xmenTextureReservationAddress = 0u;
     static thread_local bool s_xmenTextureReloadTraceActive = false;
     static thread_local uint32_t s_xmenTextureReloadTexture = 0u;
+    static thread_local uint32_t s_xmenSceneRenderKind = 0u;
+    static thread_local uint32_t s_xmenSceneRenderQueue = 0u;
+    static thread_local uint32_t s_xmenSceneRenderStart = 0u;
+    static thread_local uint32_t s_xmenGameplayRenderStart = 0u;
+    static thread_local bool s_xmenGameplayRenderPending = false;
+    const auto xmenQueueWrite = [&](uint32_t queue)
+    {
+        return queue != 0u ? readRdramProbeU32(rdram, queue + 0x30u) : 0u;
+    };
+    const auto xmenQueueBytes = [](uint32_t start, uint32_t end)
+    {
+        constexpr uint32_t addressMask = 0x0FFFFFFFu;
+        return ((end & addressMask) - (start & addressMask)) & addressMask;
+    };
+
+    if (rdram && isCall && sourcePc == 0x0031F598u)
+    {
+        const uint32_t owner = GPR_U32(ctx, 4);
+        const uint32_t active = readRdramProbeU32(rdram, owner + 0xC08u);
+        const uint32_t vtable = active != 0u
+            ? readRdramProbeU32(rdram, active + 0xEC8u)
+            : 0u;
+        const uint32_t render = vtable != 0u
+            ? readRdramProbeU32(rdram, vtable + 0x38u)
+            : 0u;
+        g_xmenFrameRenderGateCalls.fetch_add(1u, std::memory_order_relaxed);
+        g_xmenFrameRenderGateLastTick.store(
+            m_eeScheduler->currentVSyncTick(), std::memory_order_relaxed);
+        g_xmenFrameRenderGateLastTarget.store(targetPc, std::memory_order_relaxed);
+        g_xmenFrameRenderGateLastOwner.store(owner, std::memory_order_relaxed);
+        g_xmenFrameRenderGateLastActive.store(active, std::memory_order_relaxed);
+        g_xmenFrameRenderGateLastVtable.store(vtable, std::memory_order_relaxed);
+        g_xmenFrameRenderGateLastRender.store(render, std::memory_order_relaxed);
+    }
+
+    if (rdram && isCall &&
+        (targetPc == 0x005C1AA0u || targetPc == 0x0034AB00u))
+    {
+        const size_t renderKind = targetPc == 0x005C1AA0u ? 0u : 1u;
+        const uint32_t owner = GPR_U32(ctx, 4);
+        const uint32_t queue = readRdramProbeU32(rdram, 0x00750774u);
+        const uint32_t start = xmenQueueWrite(queue);
+        g_xmenSceneRenderEntryCounts[renderKind].fetch_add(
+            1u, std::memory_order_relaxed);
+        g_xmenSceneRenderLastTicks[renderKind].store(
+            m_eeScheduler->currentVSyncTick(), std::memory_order_relaxed);
+        g_xmenSceneRenderLastOwners[renderKind].store(owner, std::memory_order_relaxed);
+        g_xmenSceneRenderLastQueues[renderKind].store(queue, std::memory_order_relaxed);
+        g_xmenSceneRenderLastStarts[renderKind].store(start, std::memory_order_relaxed);
+        s_xmenSceneRenderKind = static_cast<uint32_t>(renderKind + 1u);
+        s_xmenSceneRenderQueue = queue;
+        s_xmenSceneRenderStart = start;
+        if (renderKind == 1u)
+        {
+            const uint32_t collection = owner + 0x290u;
+            g_xmenGameplayLastCollection.store(collection, std::memory_order_relaxed);
+            g_xmenGameplayLastCollectionRoot.store(
+                readRdramProbeU32(rdram, collection), std::memory_order_relaxed);
+        }
+    }
+
+    if (rdram && isCall && sourcePc == 0x0034AB38u && targetPc == 0x0034A190u)
+    {
+        g_xmenGameplayIteratorStarts.fetch_add(1u, std::memory_order_relaxed);
+        g_xmenGameplayLastIterator.store(GPR_U32(ctx, 2), std::memory_order_relaxed);
+        g_xmenGameplayLastCollection.store(GPR_U32(ctx, 5), std::memory_order_relaxed);
+    }
+
+    if (rdram && isCall && sourcePc == 0x0034AB8Cu)
+    {
+        g_xmenGameplayIterations.fetch_add(1u, std::memory_order_relaxed);
+        g_xmenGameplayCullCalls.fetch_add(1u, std::memory_order_relaxed);
+        g_xmenGameplayLastCullTarget.store(targetPc, std::memory_order_relaxed);
+        g_xmenGameplayLastCullObject.store(GPR_U32(ctx, 4), std::memory_order_relaxed);
+        s_xmenGameplayRenderPending = false;
+    }
+
+    if (rdram && isCall && sourcePc == 0x0034ABCCu)
+    {
+        g_xmenGameplayRenderCalls.fetch_add(1u, std::memory_order_relaxed);
+        g_xmenGameplayLastRenderTarget.store(targetPc, std::memory_order_relaxed);
+        g_xmenGameplayLastRenderObject.store(GPR_U32(ctx, 4), std::memory_order_relaxed);
+        g_xmenGameplayLastRenderFlags.store(
+            (readRdramProbeU32(rdram, GPR_U32(ctx, 4) + 0x34u) >> 16u) & 0xFFFFu,
+            std::memory_order_relaxed);
+        s_xmenGameplayRenderStart = xmenQueueWrite(s_xmenSceneRenderQueue);
+        s_xmenGameplayRenderPending = true;
+        for (size_t i = 0u; i < kXmenGameplayRenderMethodCount; ++i)
+        {
+            uint32_t method = g_xmenGameplayRenderMethods[i].load(std::memory_order_relaxed);
+            if (method == targetPc ||
+                (method == 0u && g_xmenGameplayRenderMethods[i].compare_exchange_strong(
+                    method, targetPc, std::memory_order_relaxed)))
+            {
+                g_xmenGameplayRenderMethodCounts[i].fetch_add(
+                    1u, std::memory_order_relaxed);
+                break;
+            }
+        }
+    }
+
+    if (rdram && isCall && sourcePc == 0x0034ABDCu && targetPc == 0x0034A170u)
+    {
+        if (s_xmenGameplayRenderPending)
+        {
+            const uint32_t end = xmenQueueWrite(s_xmenSceneRenderQueue);
+            g_xmenGameplayRenderReturns.fetch_add(1u, std::memory_order_relaxed);
+            g_xmenGameplayLastRenderResult.store(GPR_U32(ctx, 2), std::memory_order_relaxed);
+            g_xmenGameplayLastRenderBytes.store(
+                xmenQueueBytes(s_xmenGameplayRenderStart, end),
+                std::memory_order_relaxed);
+        }
+        else
+        {
+            g_xmenGameplayCullSkips.fetch_add(1u, std::memory_order_relaxed);
+        }
+        s_xmenGameplayRenderPending = false;
+    }
+
+    if (rdram && isCall && sourcePc == 0x00274B44u && targetPc == 0x002F6130u &&
+        s_xmenSceneRenderKind != 0u)
+    {
+        const size_t renderKind = static_cast<size_t>(s_xmenSceneRenderKind - 1u);
+        const uint32_t end = xmenQueueWrite(s_xmenSceneRenderQueue);
+        g_xmenSceneRenderCompleteCounts[renderKind].fetch_add(
+            1u, std::memory_order_relaxed);
+        g_xmenSceneRenderLastEnds[renderKind].store(end, std::memory_order_relaxed);
+        g_xmenSceneRenderLastBytes[renderKind].store(
+            xmenQueueBytes(s_xmenSceneRenderStart, end),
+            std::memory_order_relaxed);
+        s_xmenSceneRenderKind = 0u;
+    }
     const bool isXmenRendererDiagnosticBranch =
         kind == GuestBranchKind::IndirectCall ||
         kind == GuestBranchKind::IndirectJump ||
@@ -3117,12 +3736,126 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
         g_xmenLiveChainLastObserved = observed;
     }
-    const uint64_t xmenBranchTick = m_memory.gs().vsyncTick.load(std::memory_order_relaxed);
+    if (rdram && isCall && traceXmenPlayerPlacement && targetPc == 0x00378710u)
+    {
+        static std::atomic<uint32_t> s_xmenActorConstructorTraceCount{0u};
+        const uint32_t count =
+            s_xmenActorConstructorTraceCount.fetch_add(1u, std::memory_order_relaxed);
+        if (count < 64u)
+        {
+            std::cerr << "[xmen-actor-construct] index=" << std::dec << count
+                      << " tick=" << xmenBranchTick
+                      << " source=0x" << std::hex << sourcePc
+                      << " object=0x" << GPR_U32(ctx, 4)
+                      << " definition=0x" << GPR_U32(ctx, 5)
+                      << " a2=0x" << GPR_U32(ctx, 6)
+                      << " a2Text=\""
+                      << readGuestPrintableString(rdram, GPR_U32(ctx, 6), 96u)
+                      << "\""
+                      << " a3=0x" << GPR_U32(ctx, 7)
+                      << " a3Text=\""
+                      << readGuestPrintableString(rdram, GPR_U32(ctx, 7), 96u)
+                      << "\""
+                      << " s0=0x" << GPR_U32(ctx, 16)
+                      << " s1=0x" << GPR_U32(ctx, 17)
+                      << std::dec << std::endl;
+        }
+    }
+    if (rdram && isCall && traceXmenPlayerPlacement && targetPc == 0x005C9C80u)
+    {
+        static std::atomic<uint32_t> s_xmenCameraConstructorTraceCount{0u};
+        const uint32_t count =
+            s_xmenCameraConstructorTraceCount.fetch_add(1u, std::memory_order_relaxed);
+        if (count < 16u)
+        {
+            std::cerr << "[xmen-camera-construct] index=" << std::dec << count
+                      << " tick=" << xmenBranchTick
+                      << " source=0x" << std::hex << sourcePc
+                      << " object=0x" << GPR_U32(ctx, 4)
+                      << " a1=0x" << GPR_U32(ctx, 5)
+                      << std::dec << std::endl;
+        }
+    }
+    const char *xmenControlObjectTraceTickValue =
+        std::getenv("PS2X_TRACE_XMEN_CONTROL_OBJECTS_AT_TICK");
+    if (rdram && xmenControlObjectTraceTickValue != nullptr)
+    {
+        const uint64_t traceStartTick =
+            std::strtoull(xmenControlObjectTraceTickValue, nullptr, 0);
+        const uint32_t player =
+            s_xmenControlledPlayer.load(std::memory_order_relaxed);
+        const uint32_t camera =
+            s_xmenGameplayCamera.load(std::memory_order_relaxed);
+        static thread_local uint64_t s_xmenLastControlObjectTraceTick =
+            std::numeric_limits<uint64_t>::max();
+        static thread_local uint32_t s_xmenControlObjectPlayer = 0u;
+        static thread_local uint32_t s_xmenControlObjectCamera = 0u;
+        static thread_local bool s_xmenPlayerSnapshotInitialized = false;
+        static thread_local bool s_xmenCameraSnapshotInitialized = false;
+        static thread_local std::array<uint32_t, 0x200> s_xmenPlayerSnapshot{};
+        static thread_local std::array<uint32_t, 0x200> s_xmenCameraSnapshot{};
+        if (player != s_xmenControlObjectPlayer || camera != s_xmenControlObjectCamera)
+        {
+            s_xmenControlObjectPlayer = player;
+            s_xmenControlObjectCamera = camera;
+            s_xmenPlayerSnapshotInitialized = false;
+            s_xmenCameraSnapshotInitialized = false;
+            s_xmenLastControlObjectTraceTick = std::numeric_limits<uint64_t>::max();
+        }
+        if (player != 0u && camera != 0u && xmenBranchTick >= traceStartTick &&
+            (s_xmenLastControlObjectTraceTick == std::numeric_limits<uint64_t>::max() ||
+             xmenBranchTick >= s_xmenLastControlObjectTraceTick + 16u))
+        {
+            const auto traceObjectChanges = [&](const char *name, const uint32_t object,
+                                                const size_t wordCount,
+                                                std::array<uint32_t, 0x200> &snapshot,
+                                                bool &initialized)
+            {
+                uint32_t changed = 0u;
+                uint32_t printed = 0u;
+                for (size_t word = 0u; word < wordCount; ++word)
+                {
+                    const uint32_t value = readRdramProbeU32(
+                        rdram, object + static_cast<uint32_t>(word * sizeof(uint32_t)));
+                    if (initialized && value != snapshot[word])
+                    {
+                        if (printed < 48u)
+                        {
+                            std::cerr << "[xmen-control-object-diff] tick=" << std::dec
+                                      << xmenBranchTick << " object=" << name
+                                      << " address=0x" << std::hex << object
+                                      << " offset=0x" << word * sizeof(uint32_t)
+                                      << " before=0x" << snapshot[word]
+                                      << " after=0x" << value
+                                      << std::dec << std::endl;
+                            ++printed;
+                        }
+                        ++changed;
+                    }
+                    snapshot[word] = value;
+                }
+                std::cerr << "[xmen-control-object-snapshot] tick=" << std::dec
+                          << xmenBranchTick << " object=" << name
+                          << " address=0x" << std::hex << object
+                          << " vtable0=0x" << readRdramProbeU32(rdram, object)
+                          << " vtable6c=0x" << readRdramProbeU32(rdram, object + 0x6Cu)
+                          << std::dec << " initialized=" << (initialized ? 1 : 0)
+                          << " changed=" << changed << std::endl;
+                initialized = true;
+            };
+            traceObjectChanges("player", player, 0x200u,
+                               s_xmenPlayerSnapshot, s_xmenPlayerSnapshotInitialized);
+            traceObjectChanges("camera", camera, 0x140u,
+                               s_xmenCameraSnapshot, s_xmenCameraSnapshotInitialized);
+            s_xmenLastControlObjectTraceTick = xmenBranchTick;
+        }
+    }
     if (targetPc == 0x001FD030u || targetPc == 0x001FD740u)
     {
         const uint32_t path = GPR_U32(ctx, 5);
         const std::string pathText = readGuestPrintableString(rdram, path, 128u);
-        if (pathText.find("maps/menu/main_back.igb") != std::string::npos)
+        if (xmenRuntimeDiagnosticsEnabled() &&
+            pathText.find("maps/menu/main_back.igb") != std::string::npos)
         {
             static std::atomic<uint32_t> s_xmenMainBackLoaderEntryCount{0u};
             const uint32_t traceIndex =
@@ -3758,7 +4491,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             ctx->pc = replacementTarget;
         }
     }
-    if (xmenBranchTick >= 1800u &&
+    if (xmenRuntimeDiagnosticsEnabled() && xmenBranchTick >= 1800u &&
         (sourcePc == 0x002BCF78u || sourcePc == 0x002BCFE8u))
     {
         static std::atomic<uint32_t> s_xmenTitleObjectListLookupCount{0u};
@@ -3960,9 +4693,10 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             std::cerr << std::dec << std::endl;
         }
     }
-    if ((sourcePc == 0x00521460u && targetPc == 0x00325AE0u) ||
-        sourcePc == 0x00325890u || sourcePc == 0x003258F8u ||
-        targetPc == 0x00158300u)
+    if (xmenRuntimeDiagnosticsEnabled() &&
+        ((sourcePc == 0x00521460u && targetPc == 0x00325AE0u) ||
+         sourcePc == 0x00325890u || sourcePc == 0x003258F8u ||
+         targetPc == 0x00158300u))
     {
         static std::atomic<uint32_t> s_xmenLayerHandoffTraceCount{0u};
         const uint32_t count = s_xmenLayerHandoffTraceCount.fetch_add(1u, std::memory_order_relaxed);
@@ -4268,8 +5002,10 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             : traceStart;
         const bool traceDestination = traceStartValue &&
             destination >= traceStart && destination <= traceEnd;
-        const bool traceUpload = index < 64u || chunkRows == 0u ||
-            destination == 0x2D84u || destination == 0x2D88u || traceDestination;
+        const bool traceUpload = traceDestination ||
+            (xmenRuntimeDiagnosticsEnabled() &&
+             (index < 64u || chunkRows == 0u ||
+              destination == 0x2D84u || destination == 0x2D88u));
         const bool traceResidency =
             std::getenv("PS2X_TRACE_XMEN_TEXTURE_RESIDENCY") != nullptr;
         const uint32_t data = readRdramProbeU32(rdram, descriptor + 0x30u);
@@ -4385,8 +5121,10 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             : traceStart;
         const bool traceDestination = traceStartValue &&
             destination >= traceStart && destination <= traceEnd;
-        if (index < 256u || (chunk == 0u && zeroIndex < 32u) || traceDestination ||
-            destination == 0x2D84u || destination == 0x2D88u)
+        if (traceDestination ||
+            (xmenRuntimeDiagnosticsEnabled() &&
+             (index < 256u || (chunk == 0u && zeroIndex < 32u) ||
+              destination == 0x2D84u || destination == 0x2D88u)))
         {
             const uint32_t manager = readRdramProbeU32(rdram, 0x00750778u);
             const uint32_t width = readRdramProbeU16(rdram, descriptor + 0x3Cu);
@@ -5849,7 +6587,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                       << std::dec << std::endl;
         }
     }
-    if (isCall && sourcePc == 0x002DE1E8u)
+    if (xmenRuntimeDiagnosticsEnabled() && isCall && sourcePc == 0x002DE1E8u)
     {
         static std::atomic<uint32_t> s_xmenGifIrqCallbackTraceCount{0u};
         const uint32_t count = s_xmenGifIrqCallbackTraceCount.fetch_add(1u, std::memory_order_relaxed);
@@ -5867,7 +6605,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                       << std::dec << std::endl;
         }
     }
-    if (isCall && sourcePc == 0x002F6AB0u && targetPc == 0x0010AF50u)
+    if (xmenRuntimeDiagnosticsEnabled() &&
+        isCall && sourcePc == 0x002F6AB0u && targetPc == 0x0010AF50u)
     {
         static std::atomic<uint32_t> s_xmenFrameSemaSignalTraceCount{0u};
         const uint32_t count = s_xmenFrameSemaSignalTraceCount.fetch_add(1u, std::memory_order_relaxed);
@@ -6338,23 +7077,175 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         const uint32_t count = s_xmenControllerUpdateTraceCount.fetch_add(1u, std::memory_order_relaxed);
         if (count < 2048u && (count % 128u) == 0u)
         {
+            const uint32_t controller = GPR_U32(ctx, 4);
+            const uint32_t controllerVtable = readRdramProbeU32(rdram, controller);
             const uint32_t listener = GPR_U32(ctx, 5);
+            const uint32_t listenerVtable = readRdramProbeU32(rdram, listener);
             std::cerr << "[xmen-controller-update] index=" << std::dec << count
                       << " tick=" << xmenBranchTick
                       << " source=0x" << std::hex << sourcePc
-                      << " controller=0x" << GPR_U32(ctx, 4)
-                      << " listener=0x" << listener
-                      << " listenerVtable=0x" << readRdramProbeU32(rdram, listener)
-                      << " callback0c=0x" << readRdramProbeU32(rdram, listener + 0x0Cu)
-                      << " callback10=0x" << readRdramProbeU32(rdram, listener + 0x10u)
-                      << " callback14=0x" << readRdramProbeU32(rdram, listener + 0x14u)
-                      << " callback18=0x" << readRdramProbeU32(rdram, listener + 0x18u)
-                      << " callback1c=0x" << readRdramProbeU32(rdram, listener + 0x1Cu)
-                      << " callback20=0x" << readRdramProbeU32(rdram, listener + 0x20u)
-                      << " callback24=0x" << readRdramProbeU32(rdram, listener + 0x24u)
-                      << " callback28=0x" << readRdramProbeU32(rdram, listener + 0x28u)
-                      << " callback2c=0x" << readRdramProbeU32(rdram, listener + 0x2Cu)
-                      << " callback30=0x" << readRdramProbeU32(rdram, listener + 0x30u)
+                      << " controller=0x" << controller
+                       << " controllerVtable=0x" << controllerVtable
+                       << " leftX=0x" << readRdramProbeU32(rdram, controller + 0x24u)
+                       << " leftY=0x" << readRdramProbeU32(rdram, controller + 0x2Cu)
+                       << " axisMethod=0x" << readRdramProbeU32(rdram, controllerVtable + 0x7Cu)
+                       << " listener=0x" << listener
+                       << " listenerVtable=0x" << listenerVtable
+                       << " forwardLeft=0x" << readRdramProbeU32(rdram, listener + 0x24u)
+                       << " method80=0x" << readRdramProbeU32(rdram, listenerVtable + 0x80u)
+                      << " method84=0x" << readRdramProbeU32(rdram, listenerVtable + 0x84u)
+                      << " method88=0x" << readRdramProbeU32(rdram, listenerVtable + 0x88u)
+                      << " method90=0x" << readRdramProbeU32(rdram, listenerVtable + 0x90u)
+                      << " method94=0x" << readRdramProbeU32(rdram, listenerVtable + 0x94u)
+                      << std::dec << std::endl;
+        }
+    }
+    if (xmenRuntimeDiagnosticsEnabled() && isCall && targetPc == 0x0024B8C0u)
+    {
+        const uint32_t controller = GPR_U32(ctx, 4);
+        const uint32_t leftX = readRdramProbeU32(rdram, controller + 0x24u);
+        const uint32_t leftY = readRdramProbeU32(rdram, controller + 0x2Cu);
+        const bool leftStickMoved = ((leftX & 0x7FFFFFFFu) != 0u) ||
+                                    ((leftY & 0x7FFFFFFFu) != 0u);
+        if (xmenBranchTick >= 430u && leftStickMoved)
+        {
+            static std::atomic<uint32_t> s_xmenControllerAxisReadTraceCount{0u};
+            const uint32_t count = s_xmenControllerAxisReadTraceCount.fetch_add(1u, std::memory_order_relaxed);
+            if (count < 256u)
+            {
+                std::cerr << "[xmen-controller-axis-read] index=" << std::dec << count
+                          << " tick=" << xmenBranchTick
+                          << " source=0x" << std::hex << sourcePc
+                          << " controller=0x" << controller
+                          << " axisIndex=0x" << GPR_U32(ctx, 5)
+                          << " outputX=0x" << GPR_U32(ctx, 6)
+                          << " outputY=0x" << GPR_U32(ctx, 7)
+                          << " leftX=0x" << leftX
+                          << " leftY=0x" << leftY
+                          << std::dec << std::endl;
+            }
+        }
+    }
+    if (xmenRuntimeDiagnosticsEnabled() &&
+        isCall && targetPc == 0x00300F70u && xmenBranchTick >= 430u)
+    {
+        const uint32_t inputState = GPR_U32(ctx, 4);
+        const uint32_t actionIndex = GPR_U32(ctx, 5);
+        const uint32_t valueBits = readRdramProbeU32(rdram, inputState + 0x2FCu + actionIndex * 4u);
+        if ((valueBits & 0x7FFFFFFFu) != 0u)
+        {
+            static std::atomic<uint32_t> s_xmenMappedInputTraceCount{0u};
+            const uint32_t count = s_xmenMappedInputTraceCount.fetch_add(1u, std::memory_order_relaxed);
+            if (count < 256u)
+            {
+                std::cerr << "[xmen-mapped-input] index=" << std::dec << count
+                          << " tick=" << xmenBranchTick
+                          << " source=0x" << std::hex << sourcePc
+                          << " inputState=0x" << inputState
+                          << " action=0x" << actionIndex
+                          << " value=0x" << valueBits
+                          << std::dec << std::endl;
+            }
+        }
+    }
+    if (xmenRuntimeDiagnosticsEnabled() &&
+        isCall && targetPc == 0x002FE810u && xmenBranchTick >= 430u)
+    {
+        const uint32_t inputState = GPR_U32(ctx, 4);
+        const uint32_t actionIndex = GPR_U32(ctx, 5);
+        const uint32_t valueBits = readRdramProbeU32(rdram, inputState + 0x2FCu + actionIndex * 4u);
+        if ((valueBits & 0x7FFFFFFFu) != 0u)
+        {
+            static std::atomic<uint32_t> s_xmenGameplayInputReadTraceCount{0u};
+            const uint32_t count = s_xmenGameplayInputReadTraceCount.fetch_add(1u, std::memory_order_relaxed);
+            if (count < 256u)
+            {
+                std::cerr << "[xmen-gameplay-input-read] index=" << std::dec << count
+                          << " tick=" << xmenBranchTick
+                          << " source=0x" << std::hex << sourcePc
+                          << " inputState=0x" << inputState
+                          << " action=0x" << actionIndex
+                          << " value=0x" << valueBits
+                          << std::dec << std::endl;
+            }
+        }
+    }
+    const bool traceXmenInputManager =
+        std::getenv("PS2X_TRACE_XMEN_INPUT_MANAGER") != nullptr;
+    if (isCall && traceXmenInputManager &&
+        targetPc == 0x002FD7B0u && xmenBranchTick >= 980u)
+    {
+        static std::atomic<uint32_t> s_xmenInputManagerGetterTraceCount{0u};
+        const uint32_t count = s_xmenInputManagerGetterTraceCount.fetch_add(1u, std::memory_order_relaxed);
+        if (count < 512u)
+        {
+            std::cerr << "[xmen-input-manager-get] index=" << std::dec << count
+                      << " tick=" << xmenBranchTick
+                      << " source=0x" << std::hex << sourcePc
+                      << " a0=0x" << GPR_U32(ctx, 4)
+                      << " a1=0x" << GPR_U32(ctx, 5)
+                      << std::dec << std::endl;
+        }
+    }
+    const bool isXmenInputManagerMethod =
+        targetPc == 0x002FF8D0u || targetPc == 0x002FFA00u ||
+        targetPc == 0x00301010u || targetPc == 0x00301060u ||
+        targetPc == 0x00301140u || targetPc == 0x003013B0u ||
+        targetPc == 0x00301430u || targetPc == 0x00301440u ||
+        targetPc == 0x00301450u || targetPc == 0x003014E0u ||
+        targetPc == 0x00301510u || targetPc == 0x00301520u ||
+        targetPc == 0x00301650u || targetPc == 0x00301670u ||
+        targetPc == 0x00301680u || targetPc == 0x003016C0u ||
+        targetPc == 0x002FFA10u || targetPc == 0x00301860u ||
+        targetPc == 0x00301910u || targetPc == 0x003019A0u ||
+        targetPc == 0x003019F0u;
+    if (isCall && traceXmenInputManager &&
+        isXmenInputManagerMethod && xmenBranchTick >= 980u)
+    {
+        static std::atomic<uint32_t> s_xmenInputManagerMethodTraceCount{0u};
+        const uint32_t count = s_xmenInputManagerMethodTraceCount.fetch_add(1u, std::memory_order_relaxed);
+        if (count < 1024u)
+        {
+            const uint32_t manager = GPR_U32(ctx, 4);
+            std::cerr << "[xmen-input-manager-call] index=" << std::dec << count
+                      << " tick=" << xmenBranchTick
+                      << " source=0x" << std::hex << sourcePc
+                      << " target=0x" << targetPc
+                      << " manager=0x" << manager
+                      << " vtable=0x" << readRdramProbeU32(rdram, manager)
+                      << " a1=0x" << GPR_U32(ctx, 5)
+                      << " a2=0x" << GPR_U32(ctx, 6)
+                      << " a3=0x" << GPR_U32(ctx, 7)
+                      << std::dec << std::endl;
+        }
+    }
+    if (isCall && sourcePc == 0x0024B4CCu)
+    {
+        static std::atomic<uint32_t> s_xmenLeftStickForwardTraceCount{0u};
+        const uint32_t count = s_xmenLeftStickForwardTraceCount.fetch_add(1u, std::memory_order_relaxed);
+        if (count < 64u)
+        {
+            std::cerr << "[xmen-left-stick-forward] index=" << std::dec << count
+                      << " tick=" << xmenBranchTick
+                      << " target=0x" << std::hex << targetPc
+                      << " payload=0x" << GPR_U32(ctx, 4)
+                      << " controller=0x" << GPR_U32(ctx, 5)
+                      << " extra=0x" << GPR_U32(ctx, 6)
+                      << std::dec << std::endl;
+        }
+    }
+    if (isCall && targetPc == 0x00422430u)
+    {
+        static std::atomic<uint32_t> s_xmenNewGameHandlerTraceCount{0u};
+        const uint32_t count = s_xmenNewGameHandlerTraceCount.fetch_add(1u, std::memory_order_relaxed);
+        if (count < 16u)
+        {
+            std::cerr << "[xmen-new-game-handler] index=" << std::dec << count
+                      << " tick=" << xmenBranchTick
+                      << " source=0x" << std::hex << sourcePc
+                      << " return=0x" << fallthroughPc
+                      << " a0=0x" << GPR_U32(ctx, 4)
+                      << " a1=0x" << GPR_U32(ctx, 5)
                       << std::dec << std::endl;
         }
     }
@@ -6386,11 +7277,16 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                       << std::dec << std::endl;
         }
     }
-    if (isCall && sourcePc == 0x0024C104u)
+    if (isCall && (sourcePc == 0x0024C06Cu || sourcePc == 0x0024C104u))
     {
         const uint32_t packet = GPR_U32(ctx, 22);
         const uint16_t buttons = static_cast<uint16_t>(readRdramProbeU32(rdram, packet + 2u));
-        if (buttons != 0xFFFFu)
+        const uint32_t analog = readRdramProbeU32(rdram, packet + 4u);
+        const uint8_t rx = static_cast<uint8_t>(analog);
+        const uint8_t ry = static_cast<uint8_t>(analog >> 8u);
+        const uint8_t lx = static_cast<uint8_t>(analog >> 16u);
+        const uint8_t ly = static_cast<uint8_t>(analog >> 24u);
+        if (buttons != 0xFFFFu || rx != 0x80u || ry != 0x80u || lx != 0x80u || ly != 0x80u)
         {
             static std::atomic<uint32_t> s_xmenControllerPacketTraceCount{0u};
             const uint32_t count = s_xmenControllerPacketTraceCount.fetch_add(1u, std::memory_order_relaxed);
@@ -6398,8 +7294,13 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             {
                 std::cerr << "[xmen-controller-packet] index=" << std::dec << count
                           << " tick=" << xmenBranchTick
+                          << " kind=" << (sourcePc == 0x0024C06Cu ? "left-stick" : "right-stick")
                           << " packet=0x" << std::hex << packet
                           << " buttons=0x" << buttons
+                          << " lx=0x" << static_cast<uint32_t>(lx)
+                          << " ly=0x" << static_cast<uint32_t>(ly)
+                          << " rx=0x" << static_cast<uint32_t>(rx)
+                          << " ry=0x" << static_cast<uint32_t>(ry)
                           << " controller=0x" << GPR_U32(ctx, 17)
                           << " listener=0x" << GPR_U32(ctx, 16)
                           << " callback=0x" << targetPc
@@ -6485,7 +7386,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         targetPc == 0x0014BE90u || targetPc == 0x0014BFA0u ||
         targetPc == 0x0014BFB0u || targetPc == 0x0014AD80u ||
         targetPc == 0x0014AD90u;
-    if (isCall && isApplicationCallback)
+    if (xmenRuntimeDiagnosticsEnabled() && isCall && isApplicationCallback)
     {
         static std::atomic<uint32_t> s_xmenApplicationCallbackTraceCount{0u};
         const uint32_t count = s_xmenApplicationCallbackTraceCount.fetch_add(1u, std::memory_order_relaxed);
@@ -6502,7 +7403,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                       << std::dec << std::endl;
         }
     }
-    if (isCall && isPackageCallback)
+    if (xmenRuntimeDiagnosticsEnabled() && isCall && isPackageCallback)
     {
         static std::atomic<uint32_t> s_xmenPackageCallbackTraceCount{0u};
         const uint32_t count = s_xmenPackageCallbackTraceCount.fetch_add(1u, std::memory_order_relaxed);
@@ -6519,7 +7420,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                       << std::dec << std::endl;
         }
     }
-    if (isCall)
+    if (xmenRuntimeDiagnosticsEnabled() && isCall)
     {
         uint32_t remaining = s_xmenPostLegalInflateTraceBudget.load(std::memory_order_relaxed);
         while (remaining != 0u &&
@@ -6566,9 +7467,10 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                       << std::dec << std::endl;
         }
     }
-    if (isCall && ((sourcePc >= 0x004B8190u && sourcePc < 0x004B8600u) ||
-                   sourcePc == 0x0031E928u || targetPc == 0x004B8140u ||
-                   targetPc == 0x00613720u || targetPc == 0x004F71B0u))
+    if (xmenRuntimeDiagnosticsEnabled() && isCall &&
+        ((sourcePc >= 0x004B8190u && sourcePc < 0x004B8600u) ||
+         sourcePc == 0x0031E928u || targetPc == 0x004B8140u ||
+         targetPc == 0x00613720u || targetPc == 0x004F71B0u))
     {
         static std::atomic<uint32_t> s_xmenPackageMountTraceCount{0u};
         const uint32_t count = s_xmenPackageMountTraceCount.fetch_add(1u, std::memory_order_relaxed);
@@ -6669,9 +7571,10 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                   << " a2=0x" << GPR_U32(ctx, 6)
                   << std::dec << std::endl;
     }
-    if (isCall && (sourcePc == 0x004B7C3Cu || sourcePc == 0x003B16D0u ||
-                   sourcePc == 0x003B1710u || sourcePc == 0x004B7C78u ||
-                   sourcePc == 0x004B7D38u || sourcePc == 0x006128F8u))
+    if (xmenRuntimeDiagnosticsEnabled() && isCall &&
+        (sourcePc == 0x004B7C3Cu || sourcePc == 0x003B16D0u ||
+         sourcePc == 0x003B1710u || sourcePc == 0x004B7C78u ||
+         sourcePc == 0x004B7D38u || sourcePc == 0x006128F8u))
     {
         static std::atomic<uint32_t> s_xmenPackageStreamTraceCount{0u};
         const uint32_t count = s_xmenPackageStreamTraceCount.fetch_add(1u, std::memory_order_relaxed);
@@ -6822,8 +7725,11 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         writeRdramProbeU32(rdram, freeCountAddress, nodeCount);
         writeRdramProbeU32(rdram, blockCountAddress,
                            readRdramProbeU32(rdram, blockCountAddress) + nodeCount);
-        std::cerr << "[" << tag << ":grow] block=0x" << std::hex << block
-                  << " head=0x" << freeHead << std::dec << std::endl;
+        if (xmenRuntimeDiagnosticsEnabled())
+        {
+            std::cerr << "[" << tag << ":grow] block=0x" << std::hex << block
+                      << " head=0x" << freeHead << std::dec << std::endl;
+        }
         return true;
     };
 
@@ -6870,7 +7776,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         ctx->pc = fallthroughPc;
         return true;
     }
-    if (isCall && sourcePc == 0x0030D54Cu && targetPc == 0x00405510u)
+    if (xmenRuntimeDiagnosticsEnabled() &&
+        isCall && sourcePc == 0x0030D54Cu && targetPc == 0x00405510u)
     {
         static std::atomic<uint32_t> s_xmenFontListTraceCount{0u};
         const uint32_t traceIndex = s_xmenFontListTraceCount.fetch_add(1u, std::memory_order_relaxed);
@@ -6893,7 +7800,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                       << std::dec << std::endl;
         }
     }
-    if (isCall && targetPc == 0x0030B080u)
+    if (xmenRuntimeDiagnosticsEnabled() && isCall && targetPc == 0x0030B080u)
     {
         static std::atomic<uint32_t> s_xmenFontChildLookupEnterCount{0u};
         const uint32_t traceIndex = s_xmenFontChildLookupEnterCount.fetch_add(1u, std::memory_order_relaxed);
@@ -6915,7 +7822,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                       << "]" << std::dec << std::endl;
         }
     }
-    if (kind == GuestBranchKind::Return && sourcePc == 0x0030B0ECu)
+    if (xmenRuntimeDiagnosticsEnabled() &&
+        kind == GuestBranchKind::Return && sourcePc == 0x0030B0ECu)
     {
         static std::atomic<uint32_t> s_xmenFontChildLookupReturnCount{0u};
         const uint32_t traceIndex = s_xmenFontChildLookupReturnCount.fetch_add(1u, std::memory_order_relaxed);
@@ -7003,7 +7911,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                   << std::dec << std::endl;
         return true;
     }
-    if (isXmenFrameTimingCall)
+    if (xmenRuntimeDiagnosticsEnabled() && isXmenFrameTimingCall)
     {
         static std::atomic<uint32_t> s_xmenFrameTimingEnterCount{0u};
         const uint32_t count = s_xmenFrameTimingEnterCount.fetch_add(1u, std::memory_order_relaxed);
@@ -7620,7 +8528,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                           << std::dec << std::endl;
             }
         }
-        if (pathText.find("maps/menu/main_back.igb") != std::string::npos)
+        if (xmenRuntimeDiagnosticsEnabled() &&
+            pathText.find("maps/menu/main_back.igb") != std::string::npos)
         {
             const uint32_t package = GPR_U32(ctx, 18);
             g_xmenMainBackIgbPackage.store(package, std::memory_order_relaxed);
@@ -7657,7 +8566,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         {
             static std::atomic<uint32_t> s_xmenIgbLoadTraceCount{0u};
             const uint32_t count = s_xmenIgbLoadTraceCount.fetch_add(1u, std::memory_order_relaxed);
-            if (count < 128u)
+            if (xmenRuntimeDiagnosticsEnabled() && count < 128u)
             {
                 const uint32_t a0 = GPR_U32(ctx, 4);
                 const uint32_t package = GPR_U32(ctx, 18);
@@ -7735,7 +8644,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             }
         }
     }
-    if (isCall && targetPc == 0x001EB930u)
+    if (xmenRuntimeDiagnosticsEnabled() && isCall && targetPc == 0x001EB930u)
     {
         const uint32_t table = GPR_U32(ctx, 4);
         const uint32_t index = GPR_U32(ctx, 5);
@@ -7807,7 +8716,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                       << std::dec << std::endl;
         }
     }
-    if (isCall && xmenBranchTick >= 120u && xmenBranchTick <= 180u)
+    if (xmenRuntimeDiagnosticsEnabled() && isCall &&
+        xmenBranchTick >= 120u && xmenBranchTick <= 180u)
     {
         constexpr std::array<uint32_t, 9> imageIndices = {
             129u, 167u, 183u, 233u, 301u, 336u, 366u, 367u, 385u,
@@ -8201,7 +9111,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                   << " ra=0x" << GPR_U32(ctx, 31)
                   << std::dec << std::endl;
     }
-    if (isCall && targetPc == 0x00215260u)
+    if (xmenRuntimeDiagnosticsEnabled() && isCall && targetPc == 0x00215260u)
     {
         const uint32_t object = GPR_U32(ctx, 4);
         const uint32_t typeWord = readRdramProbeU32(rdram, object + 4u);
@@ -8250,7 +9160,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                   << " selected=0x" << readRdramProbeU32(rdram, items + index * 4u)
                   << std::dec << std::endl;
     }
-    if (isCall && targetPc == 0x00211C10u &&
+    if (xmenRuntimeDiagnosticsEnabled() && isCall && targetPc == 0x00211C10u &&
         (sourcePc == 0x001CDF6Cu || sourcePc == 0x00217714u))
     {
         const uint32_t type = GPR_U32(ctx, 4);
@@ -8492,7 +9402,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                 writeRdramProbeU64(rdram, guestStream + 0x38u, state.stream.adler);
 
                 static std::atomic<uint32_t> xmenHostInflateLogCount{0u};
-                if (xmenHostInflateLogCount.fetch_add(1u, std::memory_order_relaxed) < 64u)
+                if (xmenRuntimeDiagnosticsEnabled() &&
+                    xmenHostInflateLogCount.fetch_add(1u, std::memory_order_relaxed) < 64u)
                 {
                     std::cerr << "[xmen-host-inflate] input=" << consumed << "/" << availIn
                               << " output=" << produced << "/" << availOut
@@ -8508,7 +9419,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                               << std::dec << std::endl;
                 }
 
-                if (touchesSavedReturn)
+                if (xmenRuntimeDiagnosticsEnabled() && touchesSavedReturn)
                 {
                     const GuestThread *owner = m_eeScheduler ? m_eeScheduler->currentThread() : nullptr;
                     const R5900Context *active = owner ? &owner->activeContext() : nullptr;
@@ -8589,7 +9500,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                   << " trace=" << formatDispatchHistory()
                   << std::dec << std::endl;
     }
-    if (isCall && targetPc == 0x00244EA0u && GPR_U32(ctx, 6) == 0x2u)
+    if (xmenRuntimeDiagnosticsEnabled() &&
+        isCall && targetPc == 0x00244EA0u && GPR_U32(ctx, 6) == 0x2u)
     {
         std::cerr << "[xmen-file-open-call] source=0x" << std::hex << sourcePc
                   << " return=0x" << fallthroughPc
@@ -8600,7 +9512,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                   << " trace=" << formatDispatchHistory()
                   << std::dec << std::endl;
     }
-    if ((kind == GuestBranchKind::IndirectCall || kind == GuestBranchKind::IndirectJump) &&
+    if (xmenRuntimeDiagnosticsEnabled() &&
+        (kind == GuestBranchKind::IndirectCall || kind == GuestBranchKind::IndirectJump) &&
         targetPc >= 0x0026CA00u && targetPc < 0x00274000u)
     {
         static std::atomic<uint32_t> xmenPlatformIndirectLogCount{0u};
@@ -8807,7 +9720,7 @@ xmen_component_attach_trace_done:
         }
     }
 
-    if (sourcePc == 0x002122FCu)
+    if (xmenRuntimeDiagnosticsEnabled() && sourcePc == 0x002122FCu)
     {
         static std::atomic<uint32_t> s_xmenClassLookupTraceCount{0u};
         const uint32_t count = s_xmenClassLookupTraceCount.fetch_add(1u, std::memory_order_relaxed);
@@ -8862,7 +9775,7 @@ xmen_component_attach_trace_done:
 
             static std::atomic<uint32_t> s_xmenAllocationSizeLogCount{0u};
             const uint32_t count = s_xmenAllocationSizeLogCount.fetch_add(1u, std::memory_order_relaxed);
-            if (count < 128u)
+            if (xmenRuntimeDiagnosticsEnabled() && count < 128u)
             {
                 std::cerr << "[xmen-alloc-compat:usable-size] source=0x" << std::hex << sourcePc
                           << " address=0x" << address
@@ -8906,7 +9819,7 @@ xmen_component_attach_trace_done:
             static std::atomic<uint32_t> s_xmenOuterReallocationLogCount{0u};
             const uint32_t count =
                 s_xmenOuterReallocationLogCount.fetch_add(1u, std::memory_order_relaxed);
-            if (count < 128u || result == 0u)
+            if (xmenRuntimeDiagnosticsEnabled() && (count < 128u || result == 0u))
             {
                 std::cerr << "[xmen-alloc-compat:outer-realloc] source=0x" << std::hex << sourcePc
                           << " old=0x" << oldAddress
@@ -8922,7 +9835,7 @@ xmen_component_attach_trace_done:
         }
     }
 
-    if (isCall && sourcePc == 0x00200EECu)
+    if (xmenRuntimeDiagnosticsEnabled() && isCall && sourcePc == 0x00200EECu)
     {
         const uint32_t allocator = GPR_U32(ctx, 4);
         const uint32_t vtable = readRdramProbeU32(rdram, allocator);
@@ -8954,7 +9867,7 @@ xmen_component_attach_trace_done:
         const uint32_t result = ps2xGuestBumpAlloc(rdram, size, alignment);
         SET_GPR_U32(ctx, 2, result);
 
-        if (sourcePc == 0x00211CCCu &&
+        if (xmenRuntimeDiagnosticsEnabled() && sourcePc == 0x00211CCCu &&
             result >= 0x00B6FF00u && result < 0x00B70100u)
         {
             const uint32_t classInfo = GPR_U32(ctx, 16);
@@ -8976,7 +9889,7 @@ xmen_component_attach_trace_done:
 
         static std::atomic<uint32_t> s_xmenAllocationWrapperLogCount{0u};
         const uint32_t count = s_xmenAllocationWrapperLogCount.fetch_add(1u, std::memory_order_relaxed);
-        if (count < 128u)
+        if (xmenRuntimeDiagnosticsEnabled() && count < 128u)
         {
             std::cerr << "[xmen-alloc-compat:alchemy-wrapper] source=0x" << std::hex << sourcePc
                       << " allocator=0x" << allocator
@@ -9016,7 +9929,7 @@ xmen_component_attach_trace_done:
 
         static std::atomic<uint32_t> s_xmenAlignedAllocationWrapperLogCount{0u};
         const uint32_t count = s_xmenAlignedAllocationWrapperLogCount.fetch_add(1u, std::memory_order_relaxed);
-        if (count < 64u)
+        if (xmenRuntimeDiagnosticsEnabled() && count < 64u)
         {
             std::cerr << "[xmen-alloc-compat:alchemy-aligned-wrapper] source=0x" << std::hex << sourcePc
                       << " allocator=0x" << allocator
@@ -9064,8 +9977,9 @@ xmen_component_attach_trace_done:
 
         static std::atomic<uint32_t> s_xmenArrayAllocationWrapperLogCount{0u};
         const uint32_t count = s_xmenArrayAllocationWrapperLogCount.fetch_add(1u, std::memory_order_relaxed);
-        if (count < 128u || totalSize == 0x40u ||
-            (result >= 0x0094AA00u && result < 0x0094AC00u))
+        if (xmenRuntimeDiagnosticsEnabled() &&
+            (count < 128u || totalSize == 0x40u ||
+             (result >= 0x0094AA00u && result < 0x0094AC00u)))
         {
             std::cerr << "[xmen-alloc-compat:alchemy-array-wrapper] source=0x" << std::hex << sourcePc
                       << " allocator=0x" << allocator
@@ -9094,7 +10008,7 @@ xmen_component_attach_trace_done:
             static std::atomic<uint32_t> s_xmenOuterCompatibilityFreeLogCount{0u};
             const uint32_t count =
                 s_xmenOuterCompatibilityFreeLogCount.fetch_add(1u, std::memory_order_relaxed);
-            if (count < 128u)
+            if (xmenRuntimeDiagnosticsEnabled() && count < 128u)
             {
                 std::cerr << "[xmen-alloc-compat:outer-free] source=0x" << std::hex << sourcePc
                           << " address=0x" << address
@@ -9146,7 +10060,7 @@ xmen_component_attach_trace_done:
 
         static std::atomic<uint32_t> s_xmenReallocationLogCount{0u};
         const uint32_t count = s_xmenReallocationLogCount.fetch_add(1u, std::memory_order_relaxed);
-        if (count < 64u)
+        if (xmenRuntimeDiagnosticsEnabled() && count < 64u)
         {
             std::cerr << "[xmen-alloc-compat:realloc-wrapper] source=0x" << std::hex << sourcePc
                       << " old=0x" << oldAddress
@@ -9160,7 +10074,7 @@ xmen_component_attach_trace_done:
         return true;
     }
 
-    if (isCall && targetPc == 0x00245D20u)
+    if (xmenRuntimeDiagnosticsEnabled() && isCall && targetPc == 0x00245D20u)
     {
         static std::atomic<uint32_t> s_xmenFileCloseTraceCount{0u};
         const uint32_t count = s_xmenFileCloseTraceCount.fetch_add(1u, std::memory_order_relaxed);
@@ -9199,6 +10113,8 @@ xmen_component_attach_trace_done:
                   << std::dec << std::endl;
     }
 
+    if (xmenRuntimeDiagnosticsEnabled())
+    {
     static std::atomic<uint32_t> s_xmenFramePrepareSequence{0u};
     if (isCall && (sourcePc == 0x00274B20u || sourcePc == 0x00274B3Cu))
     {
@@ -9520,6 +10436,7 @@ xmen_component_attach_trace_done:
                   << " mode=0x" << std::hex << GPR_U32(ctx, 4)
                   << std::dec << std::endl;
     }
+    }
 
     if (isCall && sourcePc == 0x00274B4Cu && targetPc == 0x002F62D0u)
     {
@@ -9554,7 +10471,8 @@ xmen_component_attach_trace_done:
         }
         const uint32_t completed = readRdramProbeU32(rdram, 0x007537E0u);
         const uint32_t submitted = readRdramProbeU32(rdram, 0x007537E8u);
-        if (probeIndex < 128u || submitted >= 0x50u)
+        if (xmenRuntimeDiagnosticsEnabled() &&
+            (probeIndex < 128u || submitted >= 0x50u))
         {
             const uint32_t renderer = GPR_U32(ctx, 16);
             std::cerr << "[xmen-frame-entry] index=" << probeIndex
@@ -10475,7 +11393,7 @@ xmen_component_attach_trace_done:
                   << " ra=0x" << GPR_U32(ctx, 31)
                   << std::dec << std::endl;
     }
-    if (isXmenFrameTimingCall)
+    if (xmenRuntimeDiagnosticsEnabled() && isXmenFrameTimingCall)
     {
         static std::atomic<uint32_t> s_xmenFrameTimingExitCount{0u};
         const uint32_t count = s_xmenFrameTimingExitCount.fetch_add(1u, std::memory_order_relaxed);
@@ -11311,6 +12229,70 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
                       << std::dec << std::endl;
         }
     }
+    if (ctx && (vaddr & 0x1FFFFFFFu) == 0x10009000u && (value & 0x100u) != 0u)
+    {
+        size_t site = kXmenVif1GuestStartSiteCount;
+        switch (ctx->pc)
+        {
+        case 0x002DF134u: site = 0u; break;
+        case 0x002DF9ACu: site = 1u; break;
+        case 0x002DF9ECu: site = 2u; break;
+        case 0x002DFA2Cu: site = 3u; break;
+        default: break;
+        }
+
+        if (site < kXmenVif1GuestStartSiteCount)
+        {
+            const uint32_t sp = GPR_U32(ctx, 29);
+            const uint32_t savedRaOffset = site == 0u ? 0x10u : 0x60u;
+            const uint32_t caller =
+                readRdramProbeU32(rdram, (sp + savedRaOffset) & PS2_RAM_MASK);
+            const uint32_t descriptor =
+                site == 0u ? GPR_U32(ctx, 16) : GPR_U32(ctx, 21);
+            const uint32_t aux =
+                site == 0u
+                    ? readRdramProbeU32(rdram, (descriptor + 0x20u) & PS2_RAM_MASK)
+                    : GPR_U32(ctx, 20);
+            const uint64_t guestTick =
+                m_memory.gs().vsyncTick.load(std::memory_order_relaxed);
+            const uint32_t tadr = m_memory.read32(0x10009030u);
+            const uint32_t madr = m_memory.read32(0x10009010u);
+            const uint32_t qwc = m_memory.read32(0x10009020u);
+
+            g_xmenVif1GuestStartCounts[site].fetch_add(1u, std::memory_order_relaxed);
+            g_xmenVif1GuestStartTicks[site].store(guestTick, std::memory_order_relaxed);
+            g_xmenVif1GuestStartCallers[site].store(caller, std::memory_order_relaxed);
+            g_xmenVif1GuestStartDescriptors[site].store(descriptor, std::memory_order_relaxed);
+            g_xmenVif1GuestStartAux[site].store(aux, std::memory_order_relaxed);
+            g_xmenVif1GuestStartTadr[site].store(tadr, std::memory_order_relaxed);
+            g_xmenVif1GuestStartMadr[site].store(madr, std::memory_order_relaxed);
+            g_xmenVif1GuestStartQwc[site].store(qwc, std::memory_order_relaxed);
+            g_xmenVif1GuestStartChcr[site].store(value, std::memory_order_relaxed);
+
+            if (site == 0u)
+            {
+                for (size_t slot = 0u; slot < kXmenVif1GuestSlotCount; ++slot)
+                {
+                    const uint32_t slotDescriptor = readRdramProbeU32(
+                        rdram, 0x007507D0u + static_cast<uint32_t>(slot * 4u));
+                    if (slotDescriptor != descriptor)
+                        continue;
+
+                    g_xmenVif1GuestSlotCounts[slot].fetch_add(
+                        1u, std::memory_order_relaxed);
+                    g_xmenVif1GuestSlotTicks[slot].store(
+                        guestTick, std::memory_order_relaxed);
+                    g_xmenVif1GuestSlotCallers[slot].store(
+                        caller, std::memory_order_relaxed);
+                    g_xmenVif1GuestSlotDescriptors[slot].store(
+                        descriptor, std::memory_order_relaxed);
+                    g_xmenVif1GuestSlotTadr[slot].store(
+                        tadr, std::memory_order_relaxed);
+                    break;
+                }
+            }
+        }
+    }
     try
     {
         m_memory.write32(vaddr, value);
@@ -11583,6 +12565,899 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
     raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
 }
 
+namespace
+{
+constexpr size_t kXmenWorldTraversalStageCount = 15u;
+constexpr size_t kXmenRendererDispatchStageCount = 5u;
+constexpr size_t kXmenWorldVisitorStageCount = 10u;
+constexpr size_t kXmenWorldNodeStageCount = 8u;
+constexpr size_t kXmenProcGeometryStageCount = 7u;
+constexpr size_t kXmenRenderWorkStageCount = 7u;
+constexpr size_t kXmenRenderDrainStageCount = 40u;
+constexpr size_t kXmenRenderQueueTrackCount = 8u;
+constexpr size_t kXmenGifPrimitiveTypeCount = 7u;
+constexpr size_t kXmenXgkickTopProgramCount = 8u;
+constexpr size_t kXmenVif1ProgramCount = 4u;
+
+struct XmenWorldTraversalDebugCounters
+{
+    std::array<uint64_t, kXmenWorldTraversalStageCount> stageCounts{};
+    std::array<uint32_t, kXmenWorldTraversalStageCount> stageTargets{};
+    uint64_t lastTick = 0u;
+    uint32_t lastStage = 0u;
+    uint32_t lastState = 0u;
+    uint32_t lastScene = 0u;
+    uint32_t lastCount = 0u;
+    uint32_t lastLimit = 0u;
+    uint32_t lastRenderer = 0u;
+    uint32_t lastTimer = 0u;
+    uint32_t lastObject = 0u;
+};
+
+std::array<std::atomic<uint64_t>, kXmenWorldTraversalStageCount> s_xmenWorldStageCounts{};
+std::array<std::atomic<uint32_t>, kXmenWorldTraversalStageCount> s_xmenWorldStageTargets{};
+std::atomic<uint64_t> s_xmenWorldLastTick{0u};
+std::atomic<uint32_t> s_xmenWorldLastStage{0u};
+std::atomic<uint32_t> s_xmenWorldLastState{0u};
+std::atomic<uint32_t> s_xmenWorldLastScene{0u};
+std::atomic<uint32_t> s_xmenWorldLastCount{0u};
+std::atomic<uint32_t> s_xmenWorldLastLimit{0u};
+std::atomic<uint32_t> s_xmenWorldLastRenderer{0u};
+std::atomic<uint32_t> s_xmenWorldLastTimer{0u};
+std::atomic<uint32_t> s_xmenWorldLastObject{0u};
+
+struct XmenRendererDispatchDebugCounters
+{
+    std::array<uint64_t, kXmenRendererDispatchStageCount> stageCounts{};
+    std::array<uint32_t, kXmenRendererDispatchStageCount> stageTargets{};
+    uint64_t lastTick = 0u;
+    uint32_t lastFlag = 0u;
+    uint32_t lastObject = 0u;
+    uint32_t lastArgument = 0u;
+    uint32_t lastVtable = 0u;
+    uint32_t lastMethod5c = 0u;
+    uint32_t lastMethod60 = 0u;
+};
+
+std::array<std::atomic<uint64_t>, kXmenRendererDispatchStageCount> s_xmenRendererStageCounts{};
+std::array<std::atomic<uint32_t>, kXmenRendererDispatchStageCount> s_xmenRendererStageTargets{};
+std::atomic<uint64_t> s_xmenRendererLastTick{0u};
+std::atomic<uint32_t> s_xmenRendererLastFlag{0u};
+std::atomic<uint32_t> s_xmenRendererLastObject{0u};
+std::atomic<uint32_t> s_xmenRendererLastArgument{0u};
+std::atomic<uint32_t> s_xmenRendererLastVtable{0u};
+std::atomic<uint32_t> s_xmenRendererLastMethod5c{0u};
+std::atomic<uint32_t> s_xmenRendererLastMethod60{0u};
+
+struct XmenWorldVisitorDebugCounters
+{
+    std::array<uint64_t, kXmenWorldVisitorStageCount> stageCounts{};
+    std::array<uint64_t, 4> predicateResults{};
+    uint64_t lastTick = 0u;
+    uint32_t lastRenderer = 0u;
+    uint32_t lastScene = 0u;
+    uint32_t lastTarget = 0u;
+    uint32_t lastResult = 0u;
+    uint32_t lastEnabled = 0u;
+    uint32_t lastPredicate = 0u;
+    uint32_t lastSceneIndex = 0u;
+};
+
+std::array<std::atomic<uint64_t>, kXmenWorldVisitorStageCount> s_xmenVisitorStageCounts{};
+std::array<std::atomic<uint64_t>, 4> s_xmenVisitorPredicateResults{};
+std::atomic<uint64_t> s_xmenVisitorLastTick{0u};
+std::atomic<uint32_t> s_xmenVisitorLastRenderer{0u};
+std::atomic<uint32_t> s_xmenVisitorLastScene{0u};
+std::atomic<uint32_t> s_xmenVisitorLastTarget{0u};
+std::atomic<uint32_t> s_xmenVisitorLastResult{0u};
+std::atomic<uint32_t> s_xmenVisitorLastEnabled{0u};
+std::atomic<uint32_t> s_xmenVisitorLastPredicate{0u};
+std::atomic<uint32_t> s_xmenVisitorLastSceneIndex{0u};
+
+struct XmenWorldNodeDebugCounters
+{
+    std::array<uint64_t, kXmenWorldNodeStageCount> stageCounts{};
+    uint64_t lastTick = 0u;
+    uint32_t lastRenderer = 0u;
+    uint32_t lastScene = 0u;
+    uint32_t lastTarget = 0u;
+    uint32_t lastResult = 0u;
+    uint32_t lastFlags = 0u;
+    uint32_t lastWork = 0u;
+    uint32_t lastSceneIndex = 0u;
+    uint32_t lastChild = 0u;
+};
+
+std::array<std::atomic<uint64_t>, kXmenWorldNodeStageCount> s_xmenNodeStageCounts{};
+std::atomic<uint64_t> s_xmenNodeLastTick{0u};
+std::atomic<uint32_t> s_xmenNodeLastRenderer{0u};
+std::atomic<uint32_t> s_xmenNodeLastScene{0u};
+std::atomic<uint32_t> s_xmenNodeLastTarget{0u};
+std::atomic<uint32_t> s_xmenNodeLastResult{0u};
+std::atomic<uint32_t> s_xmenNodeLastFlags{0u};
+std::atomic<uint32_t> s_xmenNodeLastWork{0u};
+std::atomic<uint32_t> s_xmenNodeLastSceneIndex{0u};
+std::atomic<uint32_t> s_xmenNodeLastChild{0u};
+
+struct XmenProcGeometryDebugCounters
+{
+    std::array<uint64_t, kXmenProcGeometryStageCount> stageCounts{};
+    std::array<uint64_t, kXmenProcGeometryStageCount> targetStageCounts{};
+    uint64_t lastTick = 0u;
+    uint32_t lastRenderer = 0u;
+    uint32_t lastGeometry = 0u;
+    uint32_t lastGeometryVtable = 0u;
+    uint32_t lastFlags04 = 0u;
+    uint32_t lastFlags14 = 0u;
+    uint32_t lastActive24 = 0u;
+    uint32_t lastState34 = 0u;
+    uint32_t lastWork44 = 0u;
+    uint32_t lastRender48 = 0u;
+    uint32_t lastRender58 = 0u;
+    uint32_t lastRender5c = 0u;
+    uint32_t lastRenderf8 = 0u;
+    uint32_t lastResult = 0u;
+};
+
+std::array<std::atomic<uint64_t>, kXmenProcGeometryStageCount> s_xmenProcGeometryStageCounts{};
+std::array<std::atomic<uint64_t>, kXmenProcGeometryStageCount> s_xmenProcGeometryTargetStageCounts{};
+std::atomic<uint64_t> s_xmenProcGeometryLastTick{0u};
+std::atomic<uint32_t> s_xmenProcGeometryLastRenderer{0u};
+std::atomic<uint32_t> s_xmenProcGeometryLastGeometry{0u};
+std::atomic<uint32_t> s_xmenProcGeometryLastGeometryVtable{0u};
+std::atomic<uint32_t> s_xmenProcGeometryLastFlags04{0u};
+std::atomic<uint32_t> s_xmenProcGeometryLastFlags14{0u};
+std::atomic<uint32_t> s_xmenProcGeometryLastActive24{0u};
+std::atomic<uint32_t> s_xmenProcGeometryLastState34{0u};
+std::atomic<uint32_t> s_xmenProcGeometryLastWork44{0u};
+std::atomic<uint32_t> s_xmenProcGeometryLastRender48{0u};
+std::atomic<uint32_t> s_xmenProcGeometryLastRender58{0u};
+std::atomic<uint32_t> s_xmenProcGeometryLastRender5c{0u};
+std::atomic<uint32_t> s_xmenProcGeometryLastRenderf8{0u};
+std::atomic<uint32_t> s_xmenProcGeometryLastResult{0u};
+
+struct XmenRenderWorkDebugCounters
+{
+    std::array<uint64_t, kXmenRenderWorkStageCount> stageCounts{};
+    std::array<uint64_t, kXmenRenderWorkStageCount> targetStageCounts{};
+    uint64_t lastTick = 0u;
+    uint32_t lastWork = 0u;
+    uint32_t lastGeometry = 0u;
+    uint32_t lastGeometryVtable = 0u;
+    uint32_t lastFlags0c = 0u;
+    uint32_t lastMode70 = 0u;
+    uint32_t lastMode81 = 0u;
+    uint32_t lastMode82 = 0u;
+    uint32_t lastRecord = 0u;
+    uint32_t last7c = 0u;
+    uint32_t lastPool10 = 0u;
+    uint32_t lastQueue18 = 0u;
+    uint32_t lastQueue1c = 0u;
+    uint32_t lastRoute74 = 0u;
+    uint32_t lastRouteQueue = 0u;
+    uint32_t lastResult = 0u;
+};
+
+std::array<std::atomic<uint64_t>, kXmenRenderWorkStageCount> s_xmenRenderWorkStageCounts{};
+std::array<std::atomic<uint64_t>, kXmenRenderWorkStageCount> s_xmenRenderWorkTargetStageCounts{};
+std::atomic<uint64_t> s_xmenRenderWorkLastTick{0u};
+std::atomic<uint32_t> s_xmenRenderWorkLastWork{0u};
+std::atomic<uint32_t> s_xmenRenderWorkLastGeometry{0u};
+std::atomic<uint32_t> s_xmenRenderWorkLastGeometryVtable{0u};
+std::atomic<uint32_t> s_xmenRenderWorkLastFlags0c{0u};
+std::atomic<uint32_t> s_xmenRenderWorkLastMode70{0u};
+std::atomic<uint32_t> s_xmenRenderWorkLastMode81{0u};
+std::atomic<uint32_t> s_xmenRenderWorkLastMode82{0u};
+std::atomic<uint32_t> s_xmenRenderWorkLastRecord{0u};
+std::atomic<uint32_t> s_xmenRenderWorkLast7c{0u};
+std::atomic<uint32_t> s_xmenRenderWorkLastPool10{0u};
+std::atomic<uint32_t> s_xmenRenderWorkLastQueue18{0u};
+std::atomic<uint32_t> s_xmenRenderWorkLastQueue1c{0u};
+std::atomic<uint32_t> s_xmenRenderWorkLastRoute74{0u};
+std::atomic<uint32_t> s_xmenRenderWorkLastRouteQueue{0u};
+std::atomic<uint32_t> s_xmenRenderWorkLastResult{0u};
+
+std::array<std::atomic<uint32_t>, kXmenRenderQueueTrackCount> s_xmenRenderQueueAddresses{};
+std::array<std::atomic<uint64_t>, kXmenRenderQueueTrackCount> s_xmenRenderQueueProducerCounts{};
+std::array<std::atomic<uint64_t>, kXmenRenderQueueTrackCount> s_xmenRenderQueueProducerTicks{};
+std::array<std::atomic<uint64_t>, kXmenRenderQueueTrackCount> s_xmenRenderQueueDrainCounts{};
+std::array<std::atomic<uint64_t>, kXmenRenderQueueTrackCount> s_xmenRenderQueueDrainTicks{};
+std::array<std::atomic<uint32_t>, kXmenRenderQueueTrackCount> s_xmenRenderQueueDrainStages{};
+std::array<std::atomic<uint32_t>, kXmenRenderQueueTrackCount> s_xmenRenderQueueDrainRenderers{};
+std::array<std::atomic<uint32_t>, kXmenRenderQueueTrackCount> s_xmenRenderQueueDrainItemCounts{};
+std::array<std::atomic<uint32_t>, kXmenRenderQueueTrackCount> s_xmenRenderQueueDrainCallbacks{};
+
+size_t xmenRenderQueueSlot(uint32_t queue, bool create)
+{
+    if (queue == 0u)
+        return kXmenRenderQueueTrackCount;
+
+    for (size_t i = 0u; i < kXmenRenderQueueTrackCount; ++i)
+    {
+        if (s_xmenRenderQueueAddresses[i].load(std::memory_order_relaxed) == queue)
+            return i;
+    }
+
+    if (!create)
+        return kXmenRenderQueueTrackCount;
+
+    for (size_t i = 0u; i < kXmenRenderQueueTrackCount; ++i)
+    {
+        uint32_t expected = 0u;
+        if (s_xmenRenderQueueAddresses[i].compare_exchange_strong(
+                expected, queue, std::memory_order_relaxed))
+            return i;
+        if (expected == queue)
+            return i;
+    }
+
+    return kXmenRenderQueueTrackCount;
+}
+
+struct XmenRenderDrainDebugCounters
+{
+    std::array<uint64_t, kXmenRenderDrainStageCount> stageCounts{};
+    std::array<uint32_t, kXmenRenderDrainStageCount> stageTargets{};
+    uint64_t lastTick = 0u;
+    uint32_t lastRenderer = 0u;
+    uint32_t lastArgument = 0u;
+    uint32_t lastBucket = 0u;
+    uint32_t lastIndex = 0u;
+    uint32_t lastCount = 0u;
+    uint32_t lastCapacity = 0u;
+    uint32_t lastItems = 0u;
+    uint32_t lastCallback = 0u;
+    uint32_t lastItem = 0u;
+    uint32_t lastRenderer34 = 0u;
+    uint32_t lastRenderer150 = 0u;
+    uint32_t lastState18 = 0u;
+};
+
+std::array<std::atomic<uint64_t>, kXmenRenderDrainStageCount> s_xmenRenderDrainStageCounts{};
+std::array<std::atomic<uint32_t>, kXmenRenderDrainStageCount> s_xmenRenderDrainStageTargets{};
+std::atomic<uint64_t> s_xmenRenderDrainLastTick{0u};
+std::atomic<uint32_t> s_xmenRenderDrainLastRenderer{0u};
+std::atomic<uint32_t> s_xmenRenderDrainLastArgument{0u};
+std::atomic<uint32_t> s_xmenRenderDrainLastBucket{0u};
+std::atomic<uint32_t> s_xmenRenderDrainLastIndex{0u};
+std::atomic<uint32_t> s_xmenRenderDrainLastCount{0u};
+std::atomic<uint32_t> s_xmenRenderDrainLastCapacity{0u};
+std::atomic<uint32_t> s_xmenRenderDrainLastItems{0u};
+std::atomic<uint32_t> s_xmenRenderDrainLastCallback{0u};
+std::atomic<uint32_t> s_xmenRenderDrainLastItem{0u};
+std::atomic<uint32_t> s_xmenRenderDrainLastRenderer34{0u};
+std::atomic<uint32_t> s_xmenRenderDrainLastRenderer150{0u};
+std::atomic<uint32_t> s_xmenRenderDrainLastState18{0u};
+
+struct XmenGifPrimitiveDebugCounters
+{
+    std::array<uint64_t, kXmenGifPrimitiveTypeCount> counts{};
+    std::array<uint64_t, kXmenGifPrimitiveTypeCount> tags{};
+    std::array<uint64_t, kXmenGifPrimitiveTypeCount> ticks{};
+    std::array<uint32_t, kXmenGifPrimitiveTypeCount> presents{};
+    std::array<uint32_t, kXmenGifPrimitiveTypeCount> flags{};
+    std::array<uint32_t, kXmenGifPrimitiveTypeCount> fbps{};
+};
+
+struct XmenXgkickProgramDebugCounters
+{
+    std::array<uint32_t, kXmenXgkickTopProgramCount> programs{};
+    std::array<uint64_t, kXmenXgkickTopProgramCount> counts{};
+    std::array<uint64_t, kXmenXgkickTopProgramCount> ticks{};
+    std::array<uint64_t, kXmenXgkickTopProgramCount> executions{};
+    std::array<uint64_t, kXmenXgkickTopProgramCount> tagLo{};
+    std::array<uint64_t, kXmenXgkickTopProgramCount> tagHi{};
+    std::array<uint32_t, kXmenXgkickTopProgramCount> issuePcs{};
+    std::array<uint32_t, kXmenXgkickTopProgramCount> sources{};
+    std::array<uint32_t, kXmenXgkickTopProgramCount> bytes{};
+};
+
+struct XmenVif1DebugCounters
+{
+    std::array<uint32_t, kXmenVif1ProgramCount> programs{};
+    std::array<uint64_t, kXmenVif1ProgramCount> counts{};
+    std::array<uint64_t, kXmenVif1ProgramCount> ticks{};
+    std::array<uint32_t, kXmenVif1ProgramCount> transfers{};
+    std::array<uint32_t, kXmenVif1ProgramCount> sources{};
+    std::array<uint32_t, kXmenVif1ProgramCount> tags{};
+    std::array<uint32_t, kXmenVif1ProgramCount> offsets{};
+    uint64_t chainCount = 0u;
+    uint64_t chainTick = 0u;
+    uint32_t chainStart = 0u;
+    uint32_t chainEnd = 0u;
+    uint32_t chainTags = 0u;
+    uint32_t chainBytes = 0u;
+    uint32_t chainChcr = 0u;
+    uint32_t chainEnded = 0u;
+};
+
+struct XmenVif1GuestStartDebugCounters
+{
+    std::array<uint64_t, kXmenVif1GuestStartSiteCount> counts{};
+    std::array<uint64_t, kXmenVif1GuestStartSiteCount> ticks{};
+    std::array<uint32_t, kXmenVif1GuestStartSiteCount> callers{};
+    std::array<uint32_t, kXmenVif1GuestStartSiteCount> descriptors{};
+    std::array<uint32_t, kXmenVif1GuestStartSiteCount> aux{};
+    std::array<uint32_t, kXmenVif1GuestStartSiteCount> tadr{};
+    std::array<uint32_t, kXmenVif1GuestStartSiteCount> madr{};
+    std::array<uint32_t, kXmenVif1GuestStartSiteCount> qwc{};
+    std::array<uint32_t, kXmenVif1GuestStartSiteCount> chcr{};
+    std::array<uint64_t, kXmenVif1GuestSlotCount> slotCounts{};
+    std::array<uint64_t, kXmenVif1GuestSlotCount> slotTicks{};
+    std::array<uint32_t, kXmenVif1GuestSlotCount> slotCallers{};
+    std::array<uint32_t, kXmenVif1GuestSlotCount> slotDescriptors{};
+    std::array<uint32_t, kXmenVif1GuestSlotCount> slotTadr{};
+};
+
+struct XmenSceneRenderDebugCounters
+{
+    std::array<uint64_t, kXmenSceneRenderKindCount> entryCounts{};
+    std::array<uint64_t, kXmenSceneRenderKindCount> completeCounts{};
+    std::array<uint64_t, kXmenSceneRenderKindCount> lastTicks{};
+    std::array<uint32_t, kXmenSceneRenderKindCount> lastOwners{};
+    std::array<uint32_t, kXmenSceneRenderKindCount> lastQueues{};
+    std::array<uint32_t, kXmenSceneRenderKindCount> lastStarts{};
+    std::array<uint32_t, kXmenSceneRenderKindCount> lastEnds{};
+    std::array<uint32_t, kXmenSceneRenderKindCount> lastBytes{};
+    uint64_t iteratorStarts = 0u;
+    uint64_t iterations = 0u;
+    uint64_t cullCalls = 0u;
+    uint64_t cullSkips = 0u;
+    uint64_t renderCalls = 0u;
+    uint64_t renderReturns = 0u;
+    uint32_t lastCollection = 0u;
+    uint32_t lastCollectionRoot = 0u;
+    uint32_t lastIterator = 0u;
+    uint32_t lastCullTarget = 0u;
+    uint32_t lastCullObject = 0u;
+    uint32_t lastRenderTarget = 0u;
+    uint32_t lastRenderObject = 0u;
+    uint32_t lastRenderFlags = 0u;
+    uint32_t lastRenderResult = 0u;
+    uint32_t lastRenderBytes = 0u;
+    std::array<uint32_t, kXmenGameplayRenderMethodCount> renderMethods{};
+    std::array<uint64_t, kXmenGameplayRenderMethodCount> renderMethodCounts{};
+    uint64_t frameGateCalls = 0u;
+    uint64_t frameGateReturns = 0u;
+    uint64_t frameGateTrue = 0u;
+    uint64_t frameGateFalse = 0u;
+    uint64_t frameGateLastTick = 0u;
+    uint32_t frameGateLastTarget = 0u;
+    uint32_t frameGateLastOwner = 0u;
+    uint32_t frameGateLastActive = 0u;
+    uint32_t frameGateLastVtable = 0u;
+    uint32_t frameGateLastRender = 0u;
+    uint32_t frameGateLastResult = 0u;
+};
+
+XmenWorldTraversalDebugCounters xmenWorldTraversalDebugCounters()
+{
+    XmenWorldTraversalDebugCounters counters{};
+    for (size_t i = 0u; i < kXmenWorldTraversalStageCount; ++i)
+    {
+        counters.stageCounts[i] = s_xmenWorldStageCounts[i].load(std::memory_order_relaxed);
+        counters.stageTargets[i] = s_xmenWorldStageTargets[i].load(std::memory_order_relaxed);
+    }
+    counters.lastTick = s_xmenWorldLastTick.load(std::memory_order_relaxed);
+    counters.lastStage = s_xmenWorldLastStage.load(std::memory_order_relaxed);
+    counters.lastState = s_xmenWorldLastState.load(std::memory_order_relaxed);
+    counters.lastScene = s_xmenWorldLastScene.load(std::memory_order_relaxed);
+    counters.lastCount = s_xmenWorldLastCount.load(std::memory_order_relaxed);
+    counters.lastLimit = s_xmenWorldLastLimit.load(std::memory_order_relaxed);
+    counters.lastRenderer = s_xmenWorldLastRenderer.load(std::memory_order_relaxed);
+    counters.lastTimer = s_xmenWorldLastTimer.load(std::memory_order_relaxed);
+    counters.lastObject = s_xmenWorldLastObject.load(std::memory_order_relaxed);
+    return counters;
+}
+
+XmenRendererDispatchDebugCounters xmenRendererDispatchDebugCounters()
+{
+    XmenRendererDispatchDebugCounters counters{};
+    for (size_t i = 0u; i < kXmenRendererDispatchStageCount; ++i)
+    {
+        counters.stageCounts[i] = s_xmenRendererStageCounts[i].load(std::memory_order_relaxed);
+        counters.stageTargets[i] = s_xmenRendererStageTargets[i].load(std::memory_order_relaxed);
+    }
+    counters.lastTick = s_xmenRendererLastTick.load(std::memory_order_relaxed);
+    counters.lastFlag = s_xmenRendererLastFlag.load(std::memory_order_relaxed);
+    counters.lastObject = s_xmenRendererLastObject.load(std::memory_order_relaxed);
+    counters.lastArgument = s_xmenRendererLastArgument.load(std::memory_order_relaxed);
+    counters.lastVtable = s_xmenRendererLastVtable.load(std::memory_order_relaxed);
+    counters.lastMethod5c = s_xmenRendererLastMethod5c.load(std::memory_order_relaxed);
+    counters.lastMethod60 = s_xmenRendererLastMethod60.load(std::memory_order_relaxed);
+    return counters;
+}
+
+XmenWorldVisitorDebugCounters xmenWorldVisitorDebugCounters()
+{
+    XmenWorldVisitorDebugCounters counters{};
+    for (size_t i = 0u; i < kXmenWorldVisitorStageCount; ++i)
+        counters.stageCounts[i] = s_xmenVisitorStageCounts[i].load(std::memory_order_relaxed);
+    for (size_t i = 0u; i < counters.predicateResults.size(); ++i)
+        counters.predicateResults[i] = s_xmenVisitorPredicateResults[i].load(std::memory_order_relaxed);
+    counters.lastTick = s_xmenVisitorLastTick.load(std::memory_order_relaxed);
+    counters.lastRenderer = s_xmenVisitorLastRenderer.load(std::memory_order_relaxed);
+    counters.lastScene = s_xmenVisitorLastScene.load(std::memory_order_relaxed);
+    counters.lastTarget = s_xmenVisitorLastTarget.load(std::memory_order_relaxed);
+    counters.lastResult = s_xmenVisitorLastResult.load(std::memory_order_relaxed);
+    counters.lastEnabled = s_xmenVisitorLastEnabled.load(std::memory_order_relaxed);
+    counters.lastPredicate = s_xmenVisitorLastPredicate.load(std::memory_order_relaxed);
+    counters.lastSceneIndex = s_xmenVisitorLastSceneIndex.load(std::memory_order_relaxed);
+    return counters;
+}
+
+XmenWorldNodeDebugCounters xmenWorldNodeDebugCounters()
+{
+    XmenWorldNodeDebugCounters counters{};
+    for (size_t i = 0u; i < kXmenWorldNodeStageCount; ++i)
+        counters.stageCounts[i] = s_xmenNodeStageCounts[i].load(std::memory_order_relaxed);
+    counters.lastTick = s_xmenNodeLastTick.load(std::memory_order_relaxed);
+    counters.lastRenderer = s_xmenNodeLastRenderer.load(std::memory_order_relaxed);
+    counters.lastScene = s_xmenNodeLastScene.load(std::memory_order_relaxed);
+    counters.lastTarget = s_xmenNodeLastTarget.load(std::memory_order_relaxed);
+    counters.lastResult = s_xmenNodeLastResult.load(std::memory_order_relaxed);
+    counters.lastFlags = s_xmenNodeLastFlags.load(std::memory_order_relaxed);
+    counters.lastWork = s_xmenNodeLastWork.load(std::memory_order_relaxed);
+    counters.lastSceneIndex = s_xmenNodeLastSceneIndex.load(std::memory_order_relaxed);
+    counters.lastChild = s_xmenNodeLastChild.load(std::memory_order_relaxed);
+    return counters;
+}
+
+XmenProcGeometryDebugCounters xmenProcGeometryDebugCounters()
+{
+    XmenProcGeometryDebugCounters counters{};
+    for (size_t i = 0u; i < kXmenProcGeometryStageCount; ++i)
+    {
+        counters.stageCounts[i] = s_xmenProcGeometryStageCounts[i].load(std::memory_order_relaxed);
+        counters.targetStageCounts[i] = s_xmenProcGeometryTargetStageCounts[i].load(std::memory_order_relaxed);
+    }
+    counters.lastTick = s_xmenProcGeometryLastTick.load(std::memory_order_relaxed);
+    counters.lastRenderer = s_xmenProcGeometryLastRenderer.load(std::memory_order_relaxed);
+    counters.lastGeometry = s_xmenProcGeometryLastGeometry.load(std::memory_order_relaxed);
+    counters.lastGeometryVtable = s_xmenProcGeometryLastGeometryVtable.load(std::memory_order_relaxed);
+    counters.lastFlags04 = s_xmenProcGeometryLastFlags04.load(std::memory_order_relaxed);
+    counters.lastFlags14 = s_xmenProcGeometryLastFlags14.load(std::memory_order_relaxed);
+    counters.lastActive24 = s_xmenProcGeometryLastActive24.load(std::memory_order_relaxed);
+    counters.lastState34 = s_xmenProcGeometryLastState34.load(std::memory_order_relaxed);
+    counters.lastWork44 = s_xmenProcGeometryLastWork44.load(std::memory_order_relaxed);
+    counters.lastRender48 = s_xmenProcGeometryLastRender48.load(std::memory_order_relaxed);
+    counters.lastRender58 = s_xmenProcGeometryLastRender58.load(std::memory_order_relaxed);
+    counters.lastRender5c = s_xmenProcGeometryLastRender5c.load(std::memory_order_relaxed);
+    counters.lastRenderf8 = s_xmenProcGeometryLastRenderf8.load(std::memory_order_relaxed);
+    counters.lastResult = s_xmenProcGeometryLastResult.load(std::memory_order_relaxed);
+    return counters;
+}
+
+XmenRenderWorkDebugCounters xmenRenderWorkDebugCounters()
+{
+    XmenRenderWorkDebugCounters counters{};
+    for (size_t i = 0u; i < kXmenRenderWorkStageCount; ++i)
+    {
+        counters.stageCounts[i] = s_xmenRenderWorkStageCounts[i].load(std::memory_order_relaxed);
+        counters.targetStageCounts[i] = s_xmenRenderWorkTargetStageCounts[i].load(std::memory_order_relaxed);
+    }
+    counters.lastTick = s_xmenRenderWorkLastTick.load(std::memory_order_relaxed);
+    counters.lastWork = s_xmenRenderWorkLastWork.load(std::memory_order_relaxed);
+    counters.lastGeometry = s_xmenRenderWorkLastGeometry.load(std::memory_order_relaxed);
+    counters.lastGeometryVtable = s_xmenRenderWorkLastGeometryVtable.load(std::memory_order_relaxed);
+    counters.lastFlags0c = s_xmenRenderWorkLastFlags0c.load(std::memory_order_relaxed);
+    counters.lastMode70 = s_xmenRenderWorkLastMode70.load(std::memory_order_relaxed);
+    counters.lastMode81 = s_xmenRenderWorkLastMode81.load(std::memory_order_relaxed);
+    counters.lastMode82 = s_xmenRenderWorkLastMode82.load(std::memory_order_relaxed);
+    counters.lastRecord = s_xmenRenderWorkLastRecord.load(std::memory_order_relaxed);
+    counters.last7c = s_xmenRenderWorkLast7c.load(std::memory_order_relaxed);
+    counters.lastPool10 = s_xmenRenderWorkLastPool10.load(std::memory_order_relaxed);
+    counters.lastQueue18 = s_xmenRenderWorkLastQueue18.load(std::memory_order_relaxed);
+    counters.lastQueue1c = s_xmenRenderWorkLastQueue1c.load(std::memory_order_relaxed);
+    counters.lastRoute74 = s_xmenRenderWorkLastRoute74.load(std::memory_order_relaxed);
+    counters.lastRouteQueue = s_xmenRenderWorkLastRouteQueue.load(std::memory_order_relaxed);
+    counters.lastResult = s_xmenRenderWorkLastResult.load(std::memory_order_relaxed);
+    return counters;
+}
+
+XmenRenderDrainDebugCounters xmenRenderDrainDebugCounters()
+{
+    XmenRenderDrainDebugCounters counters{};
+    for (size_t i = 0u; i < kXmenRenderDrainStageCount; ++i)
+    {
+        counters.stageCounts[i] = s_xmenRenderDrainStageCounts[i].load(std::memory_order_relaxed);
+        counters.stageTargets[i] = s_xmenRenderDrainStageTargets[i].load(std::memory_order_relaxed);
+    }
+    counters.lastTick = s_xmenRenderDrainLastTick.load(std::memory_order_relaxed);
+    counters.lastRenderer = s_xmenRenderDrainLastRenderer.load(std::memory_order_relaxed);
+    counters.lastArgument = s_xmenRenderDrainLastArgument.load(std::memory_order_relaxed);
+    counters.lastBucket = s_xmenRenderDrainLastBucket.load(std::memory_order_relaxed);
+    counters.lastIndex = s_xmenRenderDrainLastIndex.load(std::memory_order_relaxed);
+    counters.lastCount = s_xmenRenderDrainLastCount.load(std::memory_order_relaxed);
+    counters.lastCapacity = s_xmenRenderDrainLastCapacity.load(std::memory_order_relaxed);
+    counters.lastItems = s_xmenRenderDrainLastItems.load(std::memory_order_relaxed);
+    counters.lastCallback = s_xmenRenderDrainLastCallback.load(std::memory_order_relaxed);
+    counters.lastItem = s_xmenRenderDrainLastItem.load(std::memory_order_relaxed);
+    counters.lastRenderer34 = s_xmenRenderDrainLastRenderer34.load(std::memory_order_relaxed);
+    counters.lastRenderer150 = s_xmenRenderDrainLastRenderer150.load(std::memory_order_relaxed);
+    counters.lastState18 = s_xmenRenderDrainLastState18.load(std::memory_order_relaxed);
+    return counters;
+}
+
+XmenGifPrimitiveDebugCounters xmenGifPrimitiveDebugCounters()
+{
+    XmenGifPrimitiveDebugCounters counters{};
+    ps2xGetXmenGifPrimitiveDebug(
+        counters.counts.data(), counters.tags.data(), counters.ticks.data(),
+        counters.presents.data(), counters.flags.data(), counters.fbps.data());
+    return counters;
+}
+
+XmenXgkickProgramDebugCounters xmenXgkickProgramDebugCounters()
+{
+    XmenXgkickProgramDebugCounters counters{};
+    ps2xGetXmenXgkickProgramDebug(
+        static_cast<uint32_t>(counters.programs.size()),
+        counters.programs.data(), counters.counts.data(), counters.ticks.data(),
+        counters.executions.data(), counters.tagLo.data(), counters.tagHi.data(),
+        counters.issuePcs.data(), counters.sources.data(), counters.bytes.data());
+    return counters;
+}
+
+XmenVif1DebugCounters xmenVif1DebugCounters()
+{
+    XmenVif1DebugCounters counters{};
+    ps2xGetXmenVif1Debug(
+        static_cast<uint32_t>(counters.programs.size()),
+        counters.programs.data(), counters.counts.data(), counters.ticks.data(),
+        counters.transfers.data(), counters.sources.data(), counters.tags.data(),
+        counters.offsets.data(), &counters.chainCount, &counters.chainTick,
+        &counters.chainStart, &counters.chainEnd, &counters.chainTags,
+        &counters.chainBytes, &counters.chainChcr, &counters.chainEnded);
+    return counters;
+}
+
+XmenVif1GuestStartDebugCounters xmenVif1GuestStartDebugCounters()
+{
+    XmenVif1GuestStartDebugCounters counters{};
+    for (size_t i = 0u; i < kXmenVif1GuestStartSiteCount; ++i)
+    {
+        counters.counts[i] =
+            g_xmenVif1GuestStartCounts[i].load(std::memory_order_relaxed);
+        counters.ticks[i] =
+            g_xmenVif1GuestStartTicks[i].load(std::memory_order_relaxed);
+        counters.callers[i] =
+            g_xmenVif1GuestStartCallers[i].load(std::memory_order_relaxed);
+        counters.descriptors[i] =
+            g_xmenVif1GuestStartDescriptors[i].load(std::memory_order_relaxed);
+        counters.aux[i] =
+            g_xmenVif1GuestStartAux[i].load(std::memory_order_relaxed);
+        counters.tadr[i] =
+            g_xmenVif1GuestStartTadr[i].load(std::memory_order_relaxed);
+        counters.madr[i] =
+            g_xmenVif1GuestStartMadr[i].load(std::memory_order_relaxed);
+        counters.qwc[i] =
+            g_xmenVif1GuestStartQwc[i].load(std::memory_order_relaxed);
+        counters.chcr[i] =
+            g_xmenVif1GuestStartChcr[i].load(std::memory_order_relaxed);
+    }
+    for (size_t i = 0u; i < kXmenVif1GuestSlotCount; ++i)
+    {
+        counters.slotCounts[i] =
+            g_xmenVif1GuestSlotCounts[i].load(std::memory_order_relaxed);
+        counters.slotTicks[i] =
+            g_xmenVif1GuestSlotTicks[i].load(std::memory_order_relaxed);
+        counters.slotCallers[i] =
+            g_xmenVif1GuestSlotCallers[i].load(std::memory_order_relaxed);
+        counters.slotDescriptors[i] =
+            g_xmenVif1GuestSlotDescriptors[i].load(std::memory_order_relaxed);
+        counters.slotTadr[i] =
+            g_xmenVif1GuestSlotTadr[i].load(std::memory_order_relaxed);
+    }
+    return counters;
+}
+
+XmenSceneRenderDebugCounters xmenSceneRenderDebugCounters()
+{
+    XmenSceneRenderDebugCounters counters{};
+    for (size_t i = 0u; i < kXmenSceneRenderKindCount; ++i)
+    {
+        counters.entryCounts[i] =
+            g_xmenSceneRenderEntryCounts[i].load(std::memory_order_relaxed);
+        counters.completeCounts[i] =
+            g_xmenSceneRenderCompleteCounts[i].load(std::memory_order_relaxed);
+        counters.lastTicks[i] =
+            g_xmenSceneRenderLastTicks[i].load(std::memory_order_relaxed);
+        counters.lastOwners[i] =
+            g_xmenSceneRenderLastOwners[i].load(std::memory_order_relaxed);
+        counters.lastQueues[i] =
+            g_xmenSceneRenderLastQueues[i].load(std::memory_order_relaxed);
+        counters.lastStarts[i] =
+            g_xmenSceneRenderLastStarts[i].load(std::memory_order_relaxed);
+        counters.lastEnds[i] =
+            g_xmenSceneRenderLastEnds[i].load(std::memory_order_relaxed);
+        counters.lastBytes[i] =
+            g_xmenSceneRenderLastBytes[i].load(std::memory_order_relaxed);
+    }
+    counters.iteratorStarts =
+        g_xmenGameplayIteratorStarts.load(std::memory_order_relaxed);
+    counters.iterations = g_xmenGameplayIterations.load(std::memory_order_relaxed);
+    counters.cullCalls = g_xmenGameplayCullCalls.load(std::memory_order_relaxed);
+    counters.cullSkips = g_xmenGameplayCullSkips.load(std::memory_order_relaxed);
+    counters.renderCalls = g_xmenGameplayRenderCalls.load(std::memory_order_relaxed);
+    counters.renderReturns = g_xmenGameplayRenderReturns.load(std::memory_order_relaxed);
+    counters.lastCollection =
+        g_xmenGameplayLastCollection.load(std::memory_order_relaxed);
+    counters.lastCollectionRoot =
+        g_xmenGameplayLastCollectionRoot.load(std::memory_order_relaxed);
+    counters.lastIterator = g_xmenGameplayLastIterator.load(std::memory_order_relaxed);
+    counters.lastCullTarget =
+        g_xmenGameplayLastCullTarget.load(std::memory_order_relaxed);
+    counters.lastCullObject =
+        g_xmenGameplayLastCullObject.load(std::memory_order_relaxed);
+    counters.lastRenderTarget =
+        g_xmenGameplayLastRenderTarget.load(std::memory_order_relaxed);
+    counters.lastRenderObject =
+        g_xmenGameplayLastRenderObject.load(std::memory_order_relaxed);
+    counters.lastRenderFlags =
+        g_xmenGameplayLastRenderFlags.load(std::memory_order_relaxed);
+    counters.lastRenderResult =
+        g_xmenGameplayLastRenderResult.load(std::memory_order_relaxed);
+    counters.lastRenderBytes =
+        g_xmenGameplayLastRenderBytes.load(std::memory_order_relaxed);
+    for (size_t i = 0u; i < kXmenGameplayRenderMethodCount; ++i)
+    {
+        counters.renderMethods[i] =
+            g_xmenGameplayRenderMethods[i].load(std::memory_order_relaxed);
+        counters.renderMethodCounts[i] =
+            g_xmenGameplayRenderMethodCounts[i].load(std::memory_order_relaxed);
+    }
+    counters.frameGateCalls = g_xmenFrameRenderGateCalls.load(std::memory_order_relaxed);
+    counters.frameGateReturns = g_xmenFrameRenderGateReturns.load(std::memory_order_relaxed);
+    counters.frameGateTrue = g_xmenFrameRenderGateTrue.load(std::memory_order_relaxed);
+    counters.frameGateFalse = g_xmenFrameRenderGateFalse.load(std::memory_order_relaxed);
+    counters.frameGateLastTick =
+        g_xmenFrameRenderGateLastTick.load(std::memory_order_relaxed);
+    counters.frameGateLastTarget =
+        g_xmenFrameRenderGateLastTarget.load(std::memory_order_relaxed);
+    counters.frameGateLastOwner =
+        g_xmenFrameRenderGateLastOwner.load(std::memory_order_relaxed);
+    counters.frameGateLastActive =
+        g_xmenFrameRenderGateLastActive.load(std::memory_order_relaxed);
+    counters.frameGateLastVtable =
+        g_xmenFrameRenderGateLastVtable.load(std::memory_order_relaxed);
+    counters.frameGateLastRender =
+        g_xmenFrameRenderGateLastRender.load(std::memory_order_relaxed);
+    counters.frameGateLastResult =
+        g_xmenFrameRenderGateLastResult.load(std::memory_order_relaxed);
+    return counters;
+}
+}
+
+extern "C" void ps2xRecordXmenWorldTraversal(
+    uint32_t stage, uint64_t tick, uint32_t state, uint32_t scene,
+    uint32_t count, uint32_t limit, uint32_t renderer, uint32_t timer,
+    uint32_t target, uint32_t object)
+{
+    if (stage >= kXmenWorldTraversalStageCount)
+        return;
+
+    s_xmenWorldStageCounts[stage].fetch_add(1u, std::memory_order_relaxed);
+    s_xmenWorldStageTargets[stage].store(target, std::memory_order_relaxed);
+    s_xmenWorldLastTick.store(tick, std::memory_order_relaxed);
+    s_xmenWorldLastStage.store(stage, std::memory_order_relaxed);
+    s_xmenWorldLastState.store(state, std::memory_order_relaxed);
+    s_xmenWorldLastScene.store(scene, std::memory_order_relaxed);
+    s_xmenWorldLastCount.store(count, std::memory_order_relaxed);
+    s_xmenWorldLastLimit.store(limit, std::memory_order_relaxed);
+    s_xmenWorldLastRenderer.store(renderer, std::memory_order_relaxed);
+    s_xmenWorldLastTimer.store(timer, std::memory_order_relaxed);
+    s_xmenWorldLastObject.store(object, std::memory_order_relaxed);
+}
+
+extern "C" void ps2xRecordXmenRendererDispatch(
+    uint32_t stage, uint64_t tick, uint32_t flag, uint32_t object,
+    uint32_t argument, uint32_t vtable, uint32_t method5c,
+    uint32_t method60, uint32_t target)
+{
+    if (stage >= kXmenRendererDispatchStageCount)
+        return;
+
+    s_xmenRendererStageCounts[stage].fetch_add(1u, std::memory_order_relaxed);
+    s_xmenRendererStageTargets[stage].store(target, std::memory_order_relaxed);
+    s_xmenRendererLastTick.store(tick, std::memory_order_relaxed);
+    s_xmenRendererLastFlag.store(flag, std::memory_order_relaxed);
+    s_xmenRendererLastObject.store(object, std::memory_order_relaxed);
+    s_xmenRendererLastArgument.store(argument, std::memory_order_relaxed);
+    s_xmenRendererLastVtable.store(vtable, std::memory_order_relaxed);
+    s_xmenRendererLastMethod5c.store(method5c, std::memory_order_relaxed);
+    s_xmenRendererLastMethod60.store(method60, std::memory_order_relaxed);
+}
+
+extern "C" void ps2xRecordXmenWorldVisitor(
+    uint32_t stage, uint64_t tick, uint32_t renderer, uint32_t scene,
+    uint32_t target, uint32_t result, uint32_t enabled,
+    uint32_t predicate, uint32_t sceneIndex)
+{
+    if (stage >= kXmenWorldVisitorStageCount)
+        return;
+
+    s_xmenVisitorStageCounts[stage].fetch_add(1u, std::memory_order_relaxed);
+    if (stage == 2u)
+    {
+        const size_t resultBucket = result < 3u ? result : 3u;
+        s_xmenVisitorPredicateResults[resultBucket].fetch_add(1u, std::memory_order_relaxed);
+    }
+    s_xmenVisitorLastTick.store(tick, std::memory_order_relaxed);
+    s_xmenVisitorLastRenderer.store(renderer, std::memory_order_relaxed);
+    s_xmenVisitorLastScene.store(scene, std::memory_order_relaxed);
+    if (target != 0u)
+        s_xmenVisitorLastTarget.store(target, std::memory_order_relaxed);
+    s_xmenVisitorLastResult.store(result, std::memory_order_relaxed);
+    s_xmenVisitorLastEnabled.store(enabled, std::memory_order_relaxed);
+    s_xmenVisitorLastPredicate.store(predicate, std::memory_order_relaxed);
+    s_xmenVisitorLastSceneIndex.store(sceneIndex, std::memory_order_relaxed);
+}
+
+extern "C" void ps2xRecordXmenWorldNode(
+    uint32_t stage, uint64_t tick, uint32_t renderer, uint32_t scene,
+    uint32_t target, uint32_t result, uint32_t flags, uint32_t work,
+    uint32_t sceneIndex, uint32_t child)
+{
+    if (stage >= kXmenWorldNodeStageCount)
+        return;
+
+    s_xmenNodeStageCounts[stage].fetch_add(1u, std::memory_order_relaxed);
+    s_xmenNodeLastTick.store(tick, std::memory_order_relaxed);
+    s_xmenNodeLastRenderer.store(renderer, std::memory_order_relaxed);
+    s_xmenNodeLastScene.store(scene, std::memory_order_relaxed);
+    if (target != 0u)
+        s_xmenNodeLastTarget.store(target, std::memory_order_relaxed);
+    s_xmenNodeLastResult.store(result, std::memory_order_relaxed);
+    s_xmenNodeLastFlags.store(flags, std::memory_order_relaxed);
+    s_xmenNodeLastWork.store(work, std::memory_order_relaxed);
+    s_xmenNodeLastSceneIndex.store(sceneIndex, std::memory_order_relaxed);
+    s_xmenNodeLastChild.store(child, std::memory_order_relaxed);
+}
+
+extern "C" void ps2xRecordXmenProcGeometry(
+    uint32_t stage, uint64_t tick, uint32_t renderer, uint32_t geometry,
+    uint32_t geometryVtable, uint32_t flags04, uint32_t flags14,
+    uint32_t active24, uint32_t state34, uint32_t work44,
+    uint32_t render48, uint32_t render58, uint32_t render5c,
+    uint32_t renderf8, uint32_t result)
+{
+    if (stage >= kXmenProcGeometryStageCount)
+        return;
+
+    s_xmenProcGeometryStageCounts[stage].fetch_add(1u, std::memory_order_relaxed);
+    if (geometryVtable == 0x0070B600u)
+        s_xmenProcGeometryTargetStageCounts[stage].fetch_add(1u, std::memory_order_relaxed);
+    s_xmenProcGeometryLastTick.store(tick, std::memory_order_relaxed);
+    s_xmenProcGeometryLastRenderer.store(renderer, std::memory_order_relaxed);
+    s_xmenProcGeometryLastGeometry.store(geometry, std::memory_order_relaxed);
+    s_xmenProcGeometryLastGeometryVtable.store(geometryVtable, std::memory_order_relaxed);
+    s_xmenProcGeometryLastFlags04.store(flags04, std::memory_order_relaxed);
+    s_xmenProcGeometryLastFlags14.store(flags14, std::memory_order_relaxed);
+    s_xmenProcGeometryLastActive24.store(active24, std::memory_order_relaxed);
+    s_xmenProcGeometryLastState34.store(state34, std::memory_order_relaxed);
+    s_xmenProcGeometryLastWork44.store(work44, std::memory_order_relaxed);
+    s_xmenProcGeometryLastRender48.store(render48, std::memory_order_relaxed);
+    s_xmenProcGeometryLastRender58.store(render58, std::memory_order_relaxed);
+    s_xmenProcGeometryLastRender5c.store(render5c, std::memory_order_relaxed);
+    s_xmenProcGeometryLastRenderf8.store(renderf8, std::memory_order_relaxed);
+    s_xmenProcGeometryLastResult.store(result, std::memory_order_relaxed);
+}
+
+extern "C" void ps2xRecordXmenRenderWork(
+    uint32_t stage, uint64_t tick, uint32_t work, uint32_t geometry,
+    uint32_t geometryVtable, uint32_t flags0c, uint32_t mode70,
+    uint32_t mode81, uint32_t mode82, uint32_t record, uint32_t last7c,
+    uint32_t pool10, uint32_t queue18, uint32_t queue1c,
+    uint32_t route74, uint32_t routeQueue, uint32_t result)
+{
+    if (stage >= kXmenRenderWorkStageCount)
+        return;
+
+    s_xmenRenderWorkStageCounts[stage].fetch_add(1u, std::memory_order_relaxed);
+    if (geometryVtable == 0x0070B600u)
+        s_xmenRenderWorkTargetStageCounts[stage].fetch_add(1u, std::memory_order_relaxed);
+    s_xmenRenderWorkLastTick.store(tick, std::memory_order_relaxed);
+    s_xmenRenderWorkLastWork.store(work, std::memory_order_relaxed);
+    s_xmenRenderWorkLastGeometry.store(geometry, std::memory_order_relaxed);
+    s_xmenRenderWorkLastGeometryVtable.store(geometryVtable, std::memory_order_relaxed);
+    s_xmenRenderWorkLastFlags0c.store(flags0c, std::memory_order_relaxed);
+    s_xmenRenderWorkLastMode70.store(mode70, std::memory_order_relaxed);
+    s_xmenRenderWorkLastMode81.store(mode81, std::memory_order_relaxed);
+    s_xmenRenderWorkLastMode82.store(mode82, std::memory_order_relaxed);
+    s_xmenRenderWorkLastRecord.store(record, std::memory_order_relaxed);
+    s_xmenRenderWorkLast7c.store(last7c, std::memory_order_relaxed);
+    s_xmenRenderWorkLastPool10.store(pool10, std::memory_order_relaxed);
+    s_xmenRenderWorkLastQueue18.store(queue18, std::memory_order_relaxed);
+    s_xmenRenderWorkLastQueue1c.store(queue1c, std::memory_order_relaxed);
+    s_xmenRenderWorkLastRoute74.store(route74, std::memory_order_relaxed);
+    s_xmenRenderWorkLastRouteQueue.store(routeQueue, std::memory_order_relaxed);
+    s_xmenRenderWorkLastResult.store(result, std::memory_order_relaxed);
+
+    if (stage == 6u && geometryVtable == 0x0070B600u)
+    {
+        const size_t slot = xmenRenderQueueSlot(queue18, true);
+        if (slot < kXmenRenderQueueTrackCount)
+        {
+            s_xmenRenderQueueProducerCounts[slot].fetch_add(1u, std::memory_order_relaxed);
+            s_xmenRenderQueueProducerTicks[slot].store(tick, std::memory_order_relaxed);
+        }
+    }
+}
+
+extern "C" void ps2xRecordXmenRenderDrain(
+    uint32_t stage, uint64_t tick, uint32_t renderer, uint32_t argument,
+    uint32_t bucket, uint32_t index, uint32_t count, uint32_t capacity,
+    uint32_t items, uint32_t callback, uint32_t item, uint32_t renderer34,
+    uint32_t renderer150, uint32_t state18, uint32_t target)
+{
+    if (stage >= kXmenRenderDrainStageCount)
+        return;
+
+    s_xmenRenderDrainStageCounts[stage].fetch_add(1u, std::memory_order_relaxed);
+    s_xmenRenderDrainStageTargets[stage].store(target, std::memory_order_relaxed);
+    s_xmenRenderDrainLastTick.store(tick, std::memory_order_relaxed);
+    s_xmenRenderDrainLastRenderer.store(renderer, std::memory_order_relaxed);
+    s_xmenRenderDrainLastArgument.store(argument, std::memory_order_relaxed);
+    s_xmenRenderDrainLastBucket.store(bucket, std::memory_order_relaxed);
+    s_xmenRenderDrainLastIndex.store(index, std::memory_order_relaxed);
+    s_xmenRenderDrainLastCount.store(count, std::memory_order_relaxed);
+    s_xmenRenderDrainLastCapacity.store(capacity, std::memory_order_relaxed);
+    s_xmenRenderDrainLastItems.store(items, std::memory_order_relaxed);
+    s_xmenRenderDrainLastCallback.store(callback, std::memory_order_relaxed);
+    s_xmenRenderDrainLastItem.store(item, std::memory_order_relaxed);
+    s_xmenRenderDrainLastRenderer34.store(renderer34, std::memory_order_relaxed);
+    s_xmenRenderDrainLastRenderer150.store(renderer150, std::memory_order_relaxed);
+    s_xmenRenderDrainLastState18.store(state18, std::memory_order_relaxed);
+
+    const size_t slot = xmenRenderQueueSlot(bucket, false);
+    if (slot < kXmenRenderQueueTrackCount)
+    {
+        s_xmenRenderQueueDrainCounts[slot].fetch_add(1u, std::memory_order_relaxed);
+        s_xmenRenderQueueDrainTicks[slot].store(tick, std::memory_order_relaxed);
+        s_xmenRenderQueueDrainStages[slot].store(stage, std::memory_order_relaxed);
+        s_xmenRenderQueueDrainRenderers[slot].store(renderer, std::memory_order_relaxed);
+        s_xmenRenderQueueDrainItemCounts[slot].store(count, std::memory_order_relaxed);
+        s_xmenRenderQueueDrainCallbacks[slot].store(callback, std::memory_order_relaxed);
+    }
+
+    const bool trackedLevelRecord =
+        item == 0x00F92030u || item == 0x0100F470u ||
+        item == 0x01035D50u || item == 0x00F921D0u ||
+        item == 0x0100F490u || item == 0x01035D70u;
+    if (trackedLevelRecord)
+    {
+        static std::atomic<uint32_t> traceCount{0u};
+        const uint32_t traceIndex =
+            traceCount.fetch_add(1u, std::memory_order_relaxed);
+        if (traceIndex < 256u)
+        {
+            std::cerr << "[xmen-level-record-drain] index=" << std::dec
+                      << traceIndex << " tick=" << tick
+                      << " stage=" << stage << " renderer=0x" << std::hex
+                      << renderer << " bucket=0x" << bucket
+                      << " bucketIndex=0x" << index << " count=" << std::dec
+                      << count << " callback=0x" << std::hex << callback
+                      << " item=0x" << item << " target=0x" << target
+                      << std::dec << std::endl;
+        }
+    }
+}
+
+extern "C" void ps2xRecordXmenMaterializedQueue(
+    uint64_t tick, uint32_t work, uint32_t sourceQueue, uint32_t outputQueue)
+{
+    if (work != 0x00C07270u || sourceQueue != 0x00C07300u || outputQueue == 0u)
+        return;
+
+    const size_t slot = xmenRenderQueueSlot(outputQueue, true);
+    if (slot >= kXmenRenderQueueTrackCount)
+        return;
+
+    s_xmenRenderQueueProducerCounts[slot].fetch_add(1u, std::memory_order_relaxed);
+    s_xmenRenderQueueProducerTicks[slot].store(tick, std::memory_order_relaxed);
+}
+
 void PS2Runtime::run()
 {
     auto logXmenRunProbe = [this](const char *tag)
@@ -11678,6 +13553,18 @@ void PS2Runtime::run()
             const auto vu1Counters = m_vu1.debugCounters();
             const auto gifArbiterCounters = m_gifArbiter.debugCounters();
             const auto rasterCounters = m_gs.rasterDebugCounters();
+            const auto worldCounters = xmenWorldTraversalDebugCounters();
+            const auto rendererCounters = xmenRendererDispatchDebugCounters();
+            const auto visitorCounters = xmenWorldVisitorDebugCounters();
+            const auto nodeCounters = xmenWorldNodeDebugCounters();
+            const auto procGeometryCounters = xmenProcGeometryDebugCounters();
+            const auto renderWorkCounters = xmenRenderWorkDebugCounters();
+            const auto renderDrainCounters = xmenRenderDrainDebugCounters();
+            const auto gifPrimitiveCounters = xmenGifPrimitiveDebugCounters();
+            const auto xgkickProgramCounters = xmenXgkickProgramDebugCounters();
+            const auto vif1DebugCounters = xmenVif1DebugCounters();
+            const auto vif1GuestStartCounters = xmenVif1GuestStartDebugCounters();
+            const auto sceneRenderCounters = xmenSceneRenderDebugCounters();
             xmenProgressTrace << "[run:tick] tick=" << tick
                               << " pc=0x" << std::hex << m_debugPc.load(std::memory_order_relaxed)
                               << " ra=0x" << m_debugRa.load(std::memory_order_relaxed)
@@ -11716,7 +13603,287 @@ void PS2Runtime::run()
                               << ',' << rasterCounters.frame0Submits
                               << ',' << rasterCounters.frame140Submits
                               << ',' << rasterCounters.otherFrameSubmits
-                              << ',' << rasterCounters.viewportVertices << "]"
+                              << ',' << rasterCounters.viewportVertices
+                              << ',' << rasterCounters.wireframeEdges
+                              << ',' << rasterCounters.wireframeVerifiedEdges
+                              << ',' << rasterCounters.presents
+                              << ',' << rasterCounters.lastPresentNonblackPixels
+                              << ',' << rasterCounters.lastDisplayFbp
+                              << ',' << rasterCounters.lastSourceFbp << "]"
+                              << " rasterPrim=[";
+            for (const uint64_t count : rasterCounters.primitiveSubmits)
+                xmenProgressTrace << count << ',';
+            xmenProgressTrace << "]"
+                              << " rasterSprite=[" << rasterCounters.fullViewportSprites
+                              << ',' << rasterCounters.blackFullViewportSprites
+                              << ',' << rasterCounters.lastWireframeSubmit
+                              << ',' << rasterCounters.lastFullViewportSpriteSubmit
+                              << ',' << rasterCounters.lastFullViewportSpriteFbp
+                              << ',' << rasterCounters.lastFullViewportSpriteRgba
+                              << ',' << rasterCounters.lastFullViewportSpriteFlags << "]"
+                              << " world=[" << worldCounters.lastTick
+                              << ',' << worldCounters.lastStage
+                              << ",0x" << std::hex << worldCounters.lastState
+                              << ",0x" << worldCounters.lastScene
+                              << std::dec << ',' << worldCounters.lastCount
+                              << ',' << worldCounters.lastLimit
+                              << ",0x" << std::hex << worldCounters.lastRenderer
+                              << ",0x" << worldCounters.lastTimer
+                              << ",0x" << worldCounters.lastObject << std::dec << "]"
+                              << " worldStages=[";
+            for (const uint64_t count : worldCounters.stageCounts)
+                xmenProgressTrace << count << ',';
+            xmenProgressTrace << "] worldTargets=[";
+            for (const uint32_t target : worldCounters.stageTargets)
+                xmenProgressTrace << "0x" << std::hex << target << ',';
+            xmenProgressTrace << std::dec << "] rendererDispatch=[";
+            for (const uint64_t count : rendererCounters.stageCounts)
+                xmenProgressTrace << count << ',';
+            xmenProgressTrace << rendererCounters.lastTick
+                              << ',' << rendererCounters.lastFlag
+                              << ",0x" << std::hex << rendererCounters.lastObject
+                              << ",0x" << rendererCounters.lastArgument
+                              << ",0x" << rendererCounters.lastVtable
+                              << ",0x" << rendererCounters.lastMethod5c
+                              << ",0x" << rendererCounters.lastMethod60 << std::dec << "]"
+                              << " rendererTargets=[";
+            for (const uint32_t target : rendererCounters.stageTargets)
+                xmenProgressTrace << "0x" << std::hex << target << ',';
+            xmenProgressTrace << std::dec << "] visitor=[";
+            for (const uint64_t count : visitorCounters.stageCounts)
+                xmenProgressTrace << count << ',';
+            xmenProgressTrace << visitorCounters.lastTick
+                              << ',' << visitorCounters.lastEnabled
+                              << ',' << visitorCounters.lastResult
+                              << ",0x" << std::hex << visitorCounters.lastRenderer
+                              << ",0x" << visitorCounters.lastScene
+                              << ",0x" << visitorCounters.lastPredicate
+                              << std::dec << ',' << visitorCounters.lastSceneIndex
+                              << ",0x" << std::hex << visitorCounters.lastTarget << std::dec << "]"
+                              << " visitorResults=[";
+            for (const uint64_t count : visitorCounters.predicateResults)
+                xmenProgressTrace << count << ',';
+            xmenProgressTrace << "] node=[";
+            for (const uint64_t count : nodeCounters.stageCounts)
+                xmenProgressTrace << count << ',';
+            xmenProgressTrace << nodeCounters.lastTick
+                              << ",0x" << std::hex << nodeCounters.lastRenderer
+                              << ",0x" << nodeCounters.lastScene
+                              << ",0x" << nodeCounters.lastTarget
+                              << ",0x" << nodeCounters.lastResult
+                              << ",0x" << nodeCounters.lastFlags
+                              << ",0x" << nodeCounters.lastWork
+                              << std::dec << ',' << nodeCounters.lastSceneIndex
+                              << ",0x" << std::hex << nodeCounters.lastChild << std::dec << "]"
+                              << " procGeom=[";
+            for (const uint64_t count : procGeometryCounters.stageCounts)
+                xmenProgressTrace << count << ',';
+            xmenProgressTrace << procGeometryCounters.lastTick
+                              << ",0x" << std::hex << procGeometryCounters.lastRenderer
+                              << ",0x" << procGeometryCounters.lastGeometry
+                              << ",0x" << procGeometryCounters.lastGeometryVtable
+                              << ",0x" << procGeometryCounters.lastFlags04
+                              << ",0x" << procGeometryCounters.lastFlags14
+                              << std::dec << ',' << procGeometryCounters.lastActive24
+                              << ",0x" << std::hex << procGeometryCounters.lastState34
+                              << ",0x" << procGeometryCounters.lastWork44
+                              << ",0x" << procGeometryCounters.lastRender48
+                              << ",0x" << procGeometryCounters.lastRender58
+                              << ",0x" << procGeometryCounters.lastRender5c
+                              << ",0x" << procGeometryCounters.lastRenderf8
+                              << ",0x" << procGeometryCounters.lastResult << std::dec << "]"
+                              << " procGeomTarget=[";
+            for (const uint64_t count : procGeometryCounters.targetStageCounts)
+                xmenProgressTrace << count << ',';
+            xmenProgressTrace << "] renderWork=[";
+            for (const uint64_t count : renderWorkCounters.stageCounts)
+                xmenProgressTrace << count << ',';
+            xmenProgressTrace << renderWorkCounters.lastTick
+                              << ",0x" << std::hex << renderWorkCounters.lastWork
+                              << ",0x" << renderWorkCounters.lastGeometry
+                              << ",0x" << renderWorkCounters.lastGeometryVtable
+                              << ",0x" << renderWorkCounters.lastFlags0c
+                              << std::dec << ',' << renderWorkCounters.lastMode70
+                              << ',' << renderWorkCounters.lastMode81
+                              << ',' << renderWorkCounters.lastMode82
+                              << ",0x" << std::hex << renderWorkCounters.lastRecord
+                              << ",0x" << renderWorkCounters.last7c
+                              << ",0x" << renderWorkCounters.lastPool10
+                              << ",0x" << renderWorkCounters.lastQueue18
+                              << ",0x" << renderWorkCounters.lastQueue1c
+                              << ",0x" << renderWorkCounters.lastRoute74
+                              << ",0x" << renderWorkCounters.lastRouteQueue
+                              << ",0x" << renderWorkCounters.lastResult << std::dec << "]"
+                              << " renderWorkTarget=[";
+            for (const uint64_t count : renderWorkCounters.targetStageCounts)
+                xmenProgressTrace << count << ',';
+            xmenProgressTrace << "] renderQueueMatch=[";
+            for (size_t i = 0u; i < kXmenRenderQueueTrackCount; ++i)
+            {
+                const uint32_t queue =
+                    s_xmenRenderQueueAddresses[i].load(std::memory_order_relaxed);
+                if (queue == 0u)
+                    continue;
+                xmenProgressTrace
+                    << "0x" << std::hex << queue << std::dec << ':'
+                    << s_xmenRenderQueueProducerCounts[i].load(std::memory_order_relaxed) << ':'
+                    << s_xmenRenderQueueProducerTicks[i].load(std::memory_order_relaxed) << ':'
+                    << s_xmenRenderQueueDrainCounts[i].load(std::memory_order_relaxed) << ':'
+                    << s_xmenRenderQueueDrainTicks[i].load(std::memory_order_relaxed) << ':'
+                    << s_xmenRenderQueueDrainStages[i].load(std::memory_order_relaxed)
+                    << ":0x" << std::hex
+                    << s_xmenRenderQueueDrainRenderers[i].load(std::memory_order_relaxed)
+                    << std::dec << ':'
+                    << s_xmenRenderQueueDrainItemCounts[i].load(std::memory_order_relaxed)
+                    << ":0x" << std::hex
+                    << s_xmenRenderQueueDrainCallbacks[i].load(std::memory_order_relaxed)
+                    << std::dec << ',';
+            }
+            xmenProgressTrace << "] renderDrain=[";
+            for (const uint64_t count : renderDrainCounters.stageCounts)
+                xmenProgressTrace << count << ',';
+            xmenProgressTrace << renderDrainCounters.lastTick
+                              << ",0x" << std::hex << renderDrainCounters.lastRenderer
+                              << ",0x" << renderDrainCounters.lastArgument
+                              << ",0x" << renderDrainCounters.lastBucket
+                              << std::dec << ',' << renderDrainCounters.lastIndex
+                              << ',' << renderDrainCounters.lastCount
+                              << ',' << renderDrainCounters.lastCapacity
+                              << ",0x" << std::hex << renderDrainCounters.lastItems
+                              << ",0x" << renderDrainCounters.lastCallback
+                              << ",0x" << renderDrainCounters.lastItem
+                              << ",0x" << renderDrainCounters.lastRenderer34
+                              << ",0x" << renderDrainCounters.lastRenderer150
+                              << std::dec << ',' << renderDrainCounters.lastState18 << "]"
+                              << " renderDrainTargets=[";
+            for (const uint32_t target : renderDrainCounters.stageTargets)
+                xmenProgressTrace << "0x" << std::hex << target << ',';
+            xmenProgressTrace << std::dec << "] sceneRender=[";
+            for (size_t i = 0u; i < kXmenSceneRenderKindCount; ++i)
+            {
+                xmenProgressTrace << i << ':'
+                                  << sceneRenderCounters.entryCounts[i] << ':'
+                                  << sceneRenderCounters.completeCounts[i] << ':'
+                                  << sceneRenderCounters.lastTicks[i]
+                                  << ":0x" << std::hex << sceneRenderCounters.lastOwners[i]
+                                  << ":0x" << sceneRenderCounters.lastQueues[i]
+                                  << ":0x" << sceneRenderCounters.lastStarts[i]
+                                  << ":0x" << sceneRenderCounters.lastEnds[i]
+                                  << std::dec << ':' << sceneRenderCounters.lastBytes[i]
+                                  << ',';
+            }
+            xmenProgressTrace << "] gameplayRender=["
+                              << sceneRenderCounters.iteratorStarts << ','
+                              << sceneRenderCounters.iterations << ','
+                              << sceneRenderCounters.cullCalls << ','
+                              << sceneRenderCounters.cullSkips << ','
+                              << sceneRenderCounters.renderCalls << ','
+                              << sceneRenderCounters.renderReturns
+                              << ",0x" << std::hex << sceneRenderCounters.lastCollection
+                              << ",0x" << sceneRenderCounters.lastCollectionRoot
+                              << ",0x" << sceneRenderCounters.lastIterator
+                              << ",0x" << sceneRenderCounters.lastCullTarget
+                              << ",0x" << sceneRenderCounters.lastCullObject
+                              << ",0x" << sceneRenderCounters.lastRenderTarget
+                              << ",0x" << sceneRenderCounters.lastRenderObject
+                              << ",0x" << sceneRenderCounters.lastRenderFlags
+                              << ",0x" << sceneRenderCounters.lastRenderResult
+                              << std::dec << ',' << sceneRenderCounters.lastRenderBytes
+                              << "] gameplayMethods=[";
+            for (size_t i = 0u; i < kXmenGameplayRenderMethodCount; ++i)
+            {
+                if (sceneRenderCounters.renderMethods[i] == 0u)
+                    continue;
+                xmenProgressTrace << "0x" << std::hex
+                                  << sceneRenderCounters.renderMethods[i]
+                                  << std::dec << ':'
+                                  << sceneRenderCounters.renderMethodCounts[i] << ',';
+            }
+            xmenProgressTrace << "] frameRenderGate=["
+                              << std::dec << sceneRenderCounters.frameGateCalls << ','
+                              << sceneRenderCounters.frameGateReturns << ','
+                              << sceneRenderCounters.frameGateTrue << ','
+                              << sceneRenderCounters.frameGateFalse << ','
+                              << sceneRenderCounters.frameGateLastTick
+                              << ",0x" << std::hex << sceneRenderCounters.frameGateLastTarget
+                              << ",0x" << sceneRenderCounters.frameGateLastOwner
+                              << ",0x" << sceneRenderCounters.frameGateLastActive
+                              << ",0x" << sceneRenderCounters.frameGateLastVtable
+                              << ",0x" << sceneRenderCounters.frameGateLastRender
+                              << ",0x" << sceneRenderCounters.frameGateLastResult
+                              << "] gifPrim=[";
+            for (size_t i = 0u; i < gifPrimitiveCounters.counts.size(); ++i)
+            {
+                xmenProgressTrace << i << ':' << gifPrimitiveCounters.counts[i]
+                                  << ":0x" << std::hex << gifPrimitiveCounters.tags[i]
+                                  << std::dec << ':' << gifPrimitiveCounters.ticks[i]
+                                  << ':' << gifPrimitiveCounters.presents[i]
+                                  << ":0x" << std::hex << gifPrimitiveCounters.flags[i]
+                                  << std::dec << ':' << gifPrimitiveCounters.fbps[i] << ',';
+            }
+            xmenProgressTrace << "] xgkickPrograms=[";
+            for (size_t i = 0u; i < xgkickProgramCounters.programs.size(); ++i)
+            {
+                xmenProgressTrace << "0x" << std::hex << xgkickProgramCounters.programs[i]
+                                  << std::dec << ':' << xgkickProgramCounters.counts[i]
+                                  << ':' << xgkickProgramCounters.ticks[i]
+                                  << ':' << xgkickProgramCounters.executions[i]
+                                  << ":0x" << std::hex << xgkickProgramCounters.tagLo[i]
+                                  << ":0x" << xgkickProgramCounters.tagHi[i]
+                                  << ":0x" << xgkickProgramCounters.issuePcs[i]
+                                  << ":0x" << xgkickProgramCounters.sources[i]
+                                  << std::dec << ':' << xgkickProgramCounters.bytes[i] << ',';
+            }
+            xmenProgressTrace << "] vifMscal=[";
+            for (size_t i = 0u; i < vif1DebugCounters.programs.size(); ++i)
+            {
+                xmenProgressTrace << "0x" << std::hex << vif1DebugCounters.programs[i]
+                                  << std::dec << ':' << vif1DebugCounters.counts[i]
+                                  << ':' << vif1DebugCounters.ticks[i]
+                                  << ':' << vif1DebugCounters.transfers[i]
+                                  << ":0x" << std::hex << vif1DebugCounters.sources[i]
+                                  << ":0x" << vif1DebugCounters.tags[i]
+                                  << ":0x" << vif1DebugCounters.offsets[i]
+                                  << std::dec << ',';
+            }
+            xmenProgressTrace << "] vifChain=[" << vif1DebugCounters.chainCount
+                              << ',' << vif1DebugCounters.chainTick
+                              << ",0x" << std::hex << vif1DebugCounters.chainStart
+                              << ",0x" << vif1DebugCounters.chainEnd
+                              << std::dec << ',' << vif1DebugCounters.chainTags
+                              << ',' << vif1DebugCounters.chainBytes
+                              << ",0x" << std::hex << vif1DebugCounters.chainChcr
+                              << std::dec << ',' << vif1DebugCounters.chainEnded << ']'
+                              << " vifGuestStart=[";
+            for (size_t i = 0u; i < kXmenVif1GuestStartSiteCount; ++i)
+            {
+                xmenProgressTrace << i << ':'
+                                  << vif1GuestStartCounters.counts[i] << ':'
+                                  << vif1GuestStartCounters.ticks[i]
+                                  << ":0x" << std::hex << vif1GuestStartCounters.callers[i]
+                                  << ":0x" << vif1GuestStartCounters.descriptors[i]
+                                  << ":0x" << vif1GuestStartCounters.aux[i]
+                                  << ":0x" << vif1GuestStartCounters.tadr[i]
+                                  << ":0x" << vif1GuestStartCounters.madr[i]
+                                  << std::dec << ':' << vif1GuestStartCounters.qwc[i]
+                                  << ":0x" << std::hex << vif1GuestStartCounters.chcr[i]
+                                  << std::dec << ',';
+            }
+            xmenProgressTrace << ']'
+                              << " vifGuestSlots=[";
+            for (size_t i = 0u; i < kXmenVif1GuestSlotCount; ++i)
+            {
+                if (vif1GuestStartCounters.slotCounts[i] == 0u)
+                    continue;
+                xmenProgressTrace << i << ':'
+                                  << vif1GuestStartCounters.slotCounts[i] << ':'
+                                  << vif1GuestStartCounters.slotTicks[i]
+                                  << ":0x" << std::hex << vif1GuestStartCounters.slotCallers[i]
+                                  << ":0x" << vif1GuestStartCounters.slotDescriptors[i]
+                                  << ":0x" << vif1GuestStartCounters.slotTadr[i]
+                                  << std::dec << ',';
+            }
+            xmenProgressTrace << ']'
                               << " threads=[";
             for (const auto &thread : eeSnapshot.threads)
             {

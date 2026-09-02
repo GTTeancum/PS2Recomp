@@ -595,21 +595,19 @@ endif()
 # inherits it -- that code is where most of the SSE4.1 intrinsics actually are.
 EnableX86SimdBaseline(ps2_runtime)
 
-if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
-    EnableFastReleaseMode(ps2_runtime)
-    EnableFastReleaseMode(ps2EntryRunner)
+EnableFastReleaseMode(ps2_runtime)
+EnableFastReleaseMode(ps2EntryRunner)
 
-    if(WIN32 AND NOT PS2X_SHOW_WINDOWS_CONSOLE)
-        if(MSVC)
-            target_link_options(ps2EntryRunner PRIVATE
-                $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/SUBSYSTEM:WINDOWS>
-                $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/ENTRY:mainCRTStartup>
-            )
-        elseif(MINGW)
-            target_link_options(ps2EntryRunner PRIVATE
-                $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:-mwindows>
-            )
-        endif()
+if(WIN32 AND NOT PS2X_SHOW_WINDOWS_CONSOLE)
+    if(MSVC)
+        target_link_options(ps2EntryRunner PRIVATE
+            $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/SUBSYSTEM:WINDOWS>
+            $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/ENTRY:mainCRTStartup>
+        )
+    elseif(MINGW)
+        target_link_options(ps2EntryRunner PRIVATE
+            $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:-mwindows>
+        )
     endif()
 endif()
 

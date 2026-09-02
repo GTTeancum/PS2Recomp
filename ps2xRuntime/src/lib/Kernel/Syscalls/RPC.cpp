@@ -2,12 +2,20 @@
 #include "RPC.h"
 #include "../../ps2_iop_transport.h"
 
+#include <cstdlib>
+
 void ps2xArmXmenTitleBranchTrace();
 
 namespace ps2_syscalls
 {
     namespace
     {
+        bool xmenDiagnosticsEnabled()
+        {
+            static const bool enabled = std::getenv("PS2X_XMEN_DIAGNOSTICS") != nullptr;
+            return enabled;
+        }
+
         SifRpcDebugEvent makeRpcDebugEvent(const char *op, R5900Context *ctx, PS2Runtime *runtime)
         {
             SifRpcDebugEvent event{};
@@ -429,17 +437,20 @@ namespace ps2_syscalls
             result.resultAddress = receiveBuffer;
             result.serverDispatchPolicy = ps2x::iop::ServerDispatchPolicy::Suppress;
 
-            std::cerr << "[xmen-igfileio-rpc] op=" << operation
-                      << " rpc=0x" << std::hex << rpcNum
-                      << " result=" << std::dec << operationResult
-                      << " " << detail << std::endl;
-            if (operation == "open" || operation == "close" || vsyncTick >= 1900u)
+            if (xmenDiagnosticsEnabled())
             {
-                std::cout << "[xmen-igfileio-focus] tick=" << vsyncTick
-                          << " op=" << operation
+                std::cerr << "[xmen-igfileio-rpc] op=" << operation
                           << " rpc=0x" << std::hex << rpcNum
                           << " result=" << std::dec << operationResult
                           << " " << detail << std::endl;
+                if (operation == "open" || operation == "close" || vsyncTick >= 1900u)
+                {
+                    std::cout << "[xmen-igfileio-focus] tick=" << vsyncTick
+                              << " op=" << operation
+                              << " rpc=0x" << std::hex << rpcNum
+                              << " result=" << std::dec << operationResult
+                              << " " << detail << std::endl;
+                }
             }
             return true;
         }

@@ -34,7 +34,30 @@ enum VIFCmd : uint8_t
 
 namespace
 {
+    bool xmenDiagnosticsEnabled()
+    {
+        static const bool enabled = std::getenv("PS2X_XMEN_DIAGNOSTICS") != nullptr;
+        return enabled;
+    }
+
     constexpr uint8_t kGifFmtImage = 2u;
+    constexpr size_t kXmenVif1ProgramCount = 4u;
+    constexpr std::array<uint32_t, kXmenVif1ProgramCount> kXmenVif1Programs{
+        0x000u, 0x080u, 0x1D0u, 0x230u};
+    std::array<std::atomic<uint64_t>, kXmenVif1ProgramCount> xmenVif1ProgramCounts{};
+    std::array<std::atomic<uint64_t>, kXmenVif1ProgramCount> xmenVif1ProgramTicks{};
+    std::array<std::atomic<uint32_t>, kXmenVif1ProgramCount> xmenVif1ProgramTransfers{};
+    std::array<std::atomic<uint32_t>, kXmenVif1ProgramCount> xmenVif1ProgramSources{};
+    std::array<std::atomic<uint32_t>, kXmenVif1ProgramCount> xmenVif1ProgramTags{};
+    std::array<std::atomic<uint32_t>, kXmenVif1ProgramCount> xmenVif1ProgramOffsets{};
+    std::atomic<uint64_t> xmenVif1ChainCount{0u};
+    std::atomic<uint64_t> xmenVif1ChainTick{0u};
+    std::atomic<uint32_t> xmenVif1ChainStart{0u};
+    std::atomic<uint32_t> xmenVif1ChainEnd{0u};
+    std::atomic<uint32_t> xmenVif1ChainTags{0u};
+    std::atomic<uint32_t> xmenVif1ChainBytes{0u};
+    std::atomic<uint32_t> xmenVif1ChainChcr{0u};
+    std::atomic<uint32_t> xmenVif1ChainEnded{0u};
     thread_local std::unordered_map<
         const uint8_t *, std::vector<Vif1TraceProvenance>> vif1TraceProvenance;
     thread_local const std::vector<Vif1TraceProvenance> *currentVif1TraceProvenance = nullptr;
@@ -161,6 +184,48 @@ namespace
 
         return static_cast<uint32_t>(tagLo & 0x7FFFu);
     }
+}
+
+extern "C" void ps2xRecordXmenVif1Chain(
+    uint64_t tick, uint32_t start, uint32_t end, uint32_t tags,
+    uint32_t bytes, uint32_t chcr, uint32_t ended)
+{
+    xmenVif1ChainCount.fetch_add(1u, std::memory_order_relaxed);
+    xmenVif1ChainTick.store(tick, std::memory_order_relaxed);
+    xmenVif1ChainStart.store(start, std::memory_order_relaxed);
+    xmenVif1ChainEnd.store(end, std::memory_order_relaxed);
+    xmenVif1ChainTags.store(tags, std::memory_order_relaxed);
+    xmenVif1ChainBytes.store(bytes, std::memory_order_relaxed);
+    xmenVif1ChainChcr.store(chcr, std::memory_order_relaxed);
+    xmenVif1ChainEnded.store(ended, std::memory_order_relaxed);
+}
+
+extern "C" void ps2xGetXmenVif1Debug(
+    uint32_t capacity, uint32_t *programs, uint64_t *counts, uint64_t *ticks,
+    uint32_t *transfers, uint32_t *sources, uint32_t *tags, uint32_t *offsets,
+    uint64_t *chainCount, uint64_t *chainTick, uint32_t *chainStart,
+    uint32_t *chainEnd, uint32_t *chainTags, uint32_t *chainBytes,
+    uint32_t *chainChcr, uint32_t *chainEnded)
+{
+    const uint32_t count = std::min<uint32_t>(capacity, kXmenVif1ProgramCount);
+    for (uint32_t i = 0u; i < count; ++i)
+    {
+        programs[i] = kXmenVif1Programs[i];
+        counts[i] = xmenVif1ProgramCounts[i].load(std::memory_order_relaxed);
+        ticks[i] = xmenVif1ProgramTicks[i].load(std::memory_order_relaxed);
+        transfers[i] = xmenVif1ProgramTransfers[i].load(std::memory_order_relaxed);
+        sources[i] = xmenVif1ProgramSources[i].load(std::memory_order_relaxed);
+        tags[i] = xmenVif1ProgramTags[i].load(std::memory_order_relaxed);
+        offsets[i] = xmenVif1ProgramOffsets[i].load(std::memory_order_relaxed);
+    }
+    *chainCount = xmenVif1ChainCount.load(std::memory_order_relaxed);
+    *chainTick = xmenVif1ChainTick.load(std::memory_order_relaxed);
+    *chainStart = xmenVif1ChainStart.load(std::memory_order_relaxed);
+    *chainEnd = xmenVif1ChainEnd.load(std::memory_order_relaxed);
+    *chainTags = xmenVif1ChainTags.load(std::memory_order_relaxed);
+    *chainBytes = xmenVif1ChainBytes.load(std::memory_order_relaxed);
+    *chainChcr = xmenVif1ChainChcr.load(std::memory_order_relaxed);
+    *chainEnded = xmenVif1ChainEnded.load(std::memory_order_relaxed);
 }
 
 void registerVif1TraceProvenance(
@@ -452,7 +517,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
     static std::atomic<uint32_t> vif1TransferTraceCount{0u};
     const uint32_t transferIndex = vif1TransferTraceCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
-    if (transferIndex <= 12u || (transferIndex & (transferIndex - 1u)) == 0u)
+    if (xmenDiagnosticsEnabled() &&
+        (transferIndex <= 12u || (transferIndex & (transferIndex - 1u)) == 0u))
     {
         std::fprintf(stderr, "[vif1:transfer] index=%u bytes=%u head=", transferIndex, sizeBytes);
         const uint32_t headBytes = std::min<uint32_t>(sizeBytes, 32u);
@@ -494,7 +560,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
         static std::atomic<uint32_t> vif1CommandTraceCount{0u};
         const uint32_t commandIndex = vif1CommandTraceCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
-        if (commandIndex <= 160u)
+        if (xmenDiagnosticsEnabled() && commandIndex <= 160u)
         {
             std::fprintf(stderr,
                          "[vif1:command] index=%u transfer=%u pos=%u raw=0x%08x opcode=0x%02x num=%u imm=0x%04x\n",
@@ -581,6 +647,23 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 continue;
             }
             uint32_t startPC = (uint32_t)imm * 8u;
+            uint32_t sourceAddr = 0u;
+            uint32_t tagAddr = 0u;
+            resolveVif1TraceProvenance(pos - sizeof(uint32_t), sourceAddr, tagAddr);
+            for (size_t i = 0u; i < kXmenVif1Programs.size(); ++i)
+            {
+                if (kXmenVif1Programs[i] != startPC)
+                    continue;
+                xmenVif1ProgramCounts[i].fetch_add(1u, std::memory_order_relaxed);
+                xmenVif1ProgramTicks[i].store(
+                    gs().vsyncTick.load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
+                xmenVif1ProgramTransfers[i].store(transferIndex, std::memory_order_relaxed);
+                xmenVif1ProgramSources[i].store(sourceAddr, std::memory_order_relaxed);
+                xmenVif1ProgramTags[i].store(tagAddr, std::memory_order_relaxed);
+                xmenVif1ProgramOffsets[i].store(pos - sizeof(uint32_t), std::memory_order_relaxed);
+                break;
+            }
 
             // Values visible to the VU program for this MSCAL.
             // DobieStation semantics: ITOP = ITOPS; TOP = current TOPS;
@@ -592,7 +675,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             static std::atomic<uint32_t> vif1MscalTraceCount{0u};
             const uint32_t mscalTraceIndex = vif1MscalTraceCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
-            const bool traceMscal = mscalTraceIndex <= 96u;
+            const bool traceMscal = xmenDiagnosticsEnabled() && mscalTraceIndex <= 96u;
             if (traceMscal)
             {
                 std::fprintf(stderr,
@@ -831,7 +914,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             static std::atomic<uint32_t> vif1UnpackTraceCount{0u};
             const uint32_t unpackTraceIndex = vif1UnpackTraceCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
             const bool topRelative = (imm & 0x8000u) != 0u;
-            const bool traceUnpack = unpackTraceIndex <= 192u;
+            const bool traceUnpack = xmenDiagnosticsEnabled() && unpackTraceIndex <= 192u;
 
             if (traceUnpack)
             {

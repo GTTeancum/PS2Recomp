@@ -2,10 +2,17 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace
 {
+bool xmenDiagnosticsEnabled()
+{
+    static const bool enabled = std::getenv("PS2X_XMEN_DIAGNOSTICS") != nullptr;
+    return enabled;
+}
+
 bool targetsXmenConsoleTexture(const uint8_t *data, uint32_t sizeBytes, uint32_t &dbpOut, uint32_t &offsetOut)
 {
     for (uint32_t offset = 8u; offset + 8u <= sizeBytes; offset += 8u)
@@ -95,7 +102,7 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     std::memcpy(&tagHi, data + sizeof(tagLo), sizeof(tagHi));
     static std::atomic<uint32_t> submitTraceCount{0u};
     const uint32_t submitTraceIndex = submitTraceCount.fetch_add(1u, std::memory_order_relaxed);
-    if (submitTraceIndex < 128u)
+    if (xmenDiagnosticsEnabled() && submitTraceIndex < 128u)
     {
         std::fprintf(stderr,
                      "[gif-arbiter-submit] idx=%u queueBefore=%zu path=%u directHl=%u image=%u bytes=%u tagLo=0x%016llx tagHi=0x%016llx\n",
@@ -109,13 +116,14 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
                      static_cast<unsigned long long>(tagHi));
     }
 
-    traceXmenConsoleTexturePacket("submit", pathId, path2DirectHl, data, sizeBytes);
+    if (xmenDiagnosticsEnabled())
+        traceXmenConsoleTexturePacket("submit", pathId, path2DirectHl, data, sizeBytes);
     m_debugSubmitted[static_cast<size_t>(pathId) - 1u].fetch_add(
         1u, std::memory_order_relaxed);
 
     static bool loggedXmenClutPacket = false;
     for (uint32_t offset = 8u;
-         !loggedXmenClutPacket && offset + 8u <= sizeBytes;
+         xmenDiagnosticsEnabled() && !loggedXmenClutPacket && offset + 8u <= sizeBytes;
          offset += 8u)
     {
         uint64_t value = 0u;
@@ -153,7 +161,7 @@ void GifArbiter::drain()
 
     static std::atomic<uint32_t> drainTraceCount{0u};
     const uint32_t drainTraceIndex = drainTraceCount.fetch_add(1u, std::memory_order_relaxed);
-    if (drainTraceIndex < 128u)
+    if (xmenDiagnosticsEnabled() && drainTraceIndex < 128u)
     {
         std::fprintf(stderr,
                      "[gif-arbiter-drain] idx=%u queue=%zu processFn=%u\n",
@@ -183,11 +191,12 @@ void GifArbiter::drain()
         {
             m_debugProcessed[static_cast<size_t>(pkt.pathId) - 1u].fetch_add(
                 1u, std::memory_order_relaxed);
-            traceXmenConsoleTexturePacket("process", pkt.pathId, pkt.path2DirectHl,
-                                          pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+            if (xmenDiagnosticsEnabled())
+                traceXmenConsoleTexturePacket("process", pkt.pathId, pkt.path2DirectHl,
+                                              pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
             static std::atomic<uint32_t> processTraceCount{0u};
             const uint32_t processTraceIndex = processTraceCount.fetch_add(1u, std::memory_order_relaxed);
-            if (processTraceIndex < 128u)
+            if (xmenDiagnosticsEnabled() && processTraceIndex < 128u)
             {
                 uint64_t tagLo = 0u;
                 uint64_t tagHi = 0u;

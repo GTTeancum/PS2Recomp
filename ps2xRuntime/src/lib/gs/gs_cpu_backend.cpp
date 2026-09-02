@@ -102,8 +102,6 @@ namespace
     std::atomic<uint32_t> s_debugPixelCount{0};
     std::atomic<uint32_t> s_debugContext1PrimitiveCount{0};
     std::atomic<uint32_t> s_debugFbp150PixelCount{0};
-    std::atomic<uint64_t> s_profileSubmitCount{0};
-    std::atomic<uint64_t> s_profileRasterNanoseconds{0};
     std::atomic<uint32_t> s_submitProbeCount{0};
     std::atomic<uint32_t> s_presentSourceProbeCount{0};
     std::atomic<uint32_t> s_xmenLastDrawPresent{UINT32_MAX};
@@ -111,6 +109,13 @@ namespace
     std::atomic<uint32_t> s_xmenVramDrawTraceCount{0u};
     std::atomic<uint32_t> s_xmenLocalTransferTraceCount{0u};
     std::atomic<uint32_t> s_xmenHostUploadTraceCount{0u};
+    constexpr size_t kXmenGifPrimitiveTypeCount = 7u;
+    std::array<std::atomic<uint64_t>, kXmenGifPrimitiveTypeCount> s_xmenGifPrimitiveCounts{};
+    std::array<std::atomic<uint64_t>, kXmenGifPrimitiveTypeCount> s_xmenGifPrimitiveLastTags{};
+    std::array<std::atomic<uint64_t>, kXmenGifPrimitiveTypeCount> s_xmenGifPrimitiveLastTicks{};
+    std::array<std::atomic<uint32_t>, kXmenGifPrimitiveTypeCount> s_xmenGifPrimitiveLastPresents{};
+    std::array<std::atomic<uint32_t>, kXmenGifPrimitiveTypeCount> s_xmenGifPrimitiveLastFlags{};
+    std::array<std::atomic<uint32_t>, kXmenGifPrimitiveTypeCount> s_xmenGifPrimitiveLastFbps{};
 
     uint64_t parseTraceU64(const char *name, uint64_t fallback)
     {
@@ -941,6 +946,24 @@ namespace
     }
 }
 
+extern "C" void ps2xGetXmenGifPrimitiveDebug(
+    uint64_t *counts, uint64_t *tags, uint64_t *ticks,
+    uint32_t *presents, uint32_t *flags, uint32_t *fbps)
+{
+    if (!counts || !tags || !ticks || !presents || !flags || !fbps)
+        return;
+
+    for (size_t i = 0u; i < kXmenGifPrimitiveTypeCount; ++i)
+    {
+        counts[i] = s_xmenGifPrimitiveCounts[i].load(std::memory_order_relaxed);
+        tags[i] = s_xmenGifPrimitiveLastTags[i].load(std::memory_order_relaxed);
+        ticks[i] = s_xmenGifPrimitiveLastTicks[i].load(std::memory_order_relaxed);
+        presents[i] = s_xmenGifPrimitiveLastPresents[i].load(std::memory_order_relaxed);
+        flags[i] = s_xmenGifPrimitiveLastFlags[i].load(std::memory_order_relaxed);
+        fbps[i] = s_xmenGifPrimitiveLastFbps[i].load(std::memory_order_relaxed);
+    }
+}
+
 GSCpuBackend::GSCpuBackend()
 {
     using namespace GSMem;
@@ -1284,25 +1307,88 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
         }
         return;
     }
-    m_debugSubmitCount.fetch_add(1u, std::memory_order_relaxed);
-    switch (batch.state.context.frame.fbp)
-    {
-    case 0u:
-        m_debugFrame0SubmitCount.fetch_add(1u, std::memory_order_relaxed);
-        break;
-    case 140u:
-        m_debugFrame140SubmitCount.fetch_add(1u, std::memory_order_relaxed);
-        break;
-    default:
-        m_debugOtherFrameSubmitCount.fetch_add(1u, std::memory_order_relaxed);
-        break;
-    }
-    const bool traceXmenLegal = batch.state.context.frame.fbp == 140u &&
-                                batch.state.prim.type != GS_PRIM_SPRITE;
-    const uint32_t submitProbeIndex = s_submitProbeCount.fetch_add(1u, std::memory_order_relaxed);
-    const bool traceSubmitProbe = submitProbeIndex < 256u ||
-                                  (submitProbeIndex < 4096u && (submitProbeIndex & 127u) == 0u);
+    static const bool xmenDiagnostics =
+        std::getenv("PS2X_XMEN_DIAGNOSTICS") != nullptr;
+    const uint64_t submitOrdinal = xmenDiagnostics
+        ? m_debugSubmitCount.fetch_add(1u, std::memory_order_relaxed) + 1u
+        : 0u;
     const GSContext &submitCtx = batch.state.context;
+    const uint32_t primitiveType = static_cast<uint32_t>(batch.state.prim.type);
+    if (xmenDiagnostics)
+    {
+        if (primitiveType < m_debugPrimitiveSubmitCounts.size())
+            m_debugPrimitiveSubmitCounts[primitiveType].fetch_add(1u, std::memory_order_relaxed);
+        if (primitiveType < kXmenGifPrimitiveTypeCount)
+        {
+            s_xmenGifPrimitiveCounts[primitiveType].fetch_add(1u, std::memory_order_relaxed);
+            s_xmenGifPrimitiveLastTags[primitiveType].store(batch.debugGifTagLo, std::memory_order_relaxed);
+            s_xmenGifPrimitiveLastTicks[primitiveType].store(batch.debugVsyncTick, std::memory_order_relaxed);
+            s_xmenGifPrimitiveLastPresents[primitiveType].store(batch.debugPresentCount, std::memory_order_relaxed);
+            s_xmenGifPrimitiveLastFlags[primitiveType].store(
+                (batch.state.prim.tme ? 1u : 0u) |
+                (batch.state.prim.abe ? 2u : 0u) |
+                (batch.state.prim.fst ? 4u : 0u) |
+                (batch.state.prim.iip ? 8u : 0u) |
+                (batch.state.prim.fge ? 16u : 0u) |
+                (static_cast<uint32_t>(batch.vertexCount) << 8u),
+                std::memory_order_relaxed);
+            s_xmenGifPrimitiveLastFbps[primitiveType].store(
+                submitCtx.frame.fbp, std::memory_order_relaxed);
+        }
+        if (batch.state.prim.type == GS_PRIM_SPRITE && batch.vertexCount >= 2u)
+        {
+            const int ofx = submitCtx.xyoffset.ofx >> 4;
+            const int ofy = submitCtx.xyoffset.ofy >> 4;
+            int x0 = static_cast<int>(batch.vertices[0].x) - ofx;
+            int y0 = static_cast<int>(batch.vertices[0].y) - ofy;
+            int x1 = static_cast<int>(batch.vertices[1].x) - ofx;
+            int y1 = static_cast<int>(batch.vertices[1].y) - ofy;
+            if (x0 > x1) std::swap(x0, x1);
+            if (y0 > y1) std::swap(y0, y1);
+            const int xEnd = x0 + std::max(1, x1 - x0) - 1;
+            const int yEnd = y0 + std::max(1, y1 - y0) - 1;
+            if (x0 <= 0 && y0 <= 0 && xEnd >= 639 && yEnd >= 447)
+            {
+                const GSVertex &colorVertex = batch.vertices[1];
+                const uint32_t rgba = static_cast<uint32_t>(colorVertex.r) |
+                    (static_cast<uint32_t>(colorVertex.g) << 8u) |
+                    (static_cast<uint32_t>(colorVertex.b) << 16u) |
+                    (static_cast<uint32_t>(colorVertex.a) << 24u);
+                m_debugFullViewportSpriteCount.fetch_add(1u, std::memory_order_relaxed);
+                if (!batch.state.prim.tme && (rgba & 0x00FFFFFFu) == 0u)
+                    m_debugBlackFullViewportSpriteCount.fetch_add(1u, std::memory_order_relaxed);
+                m_debugLastFullViewportSpriteSubmit.store(submitOrdinal, std::memory_order_relaxed);
+                m_debugLastFullViewportSpriteFbp.store(submitCtx.frame.fbp, std::memory_order_relaxed);
+                m_debugLastFullViewportSpriteRgba.store(rgba, std::memory_order_relaxed);
+                m_debugLastFullViewportSpriteFlags.store(
+                    (batch.state.prim.tme ? 1u : 0u) |
+                    (batch.state.prim.abe ? 2u : 0u) |
+                    (batch.state.prim.fst ? 4u : 0u),
+                    std::memory_order_relaxed);
+            }
+        }
+        switch (batch.state.context.frame.fbp)
+        {
+        case 0u:
+            m_debugFrame0SubmitCount.fetch_add(1u, std::memory_order_relaxed);
+            break;
+        case 140u:
+            m_debugFrame140SubmitCount.fetch_add(1u, std::memory_order_relaxed);
+            break;
+        default:
+            m_debugOtherFrameSubmitCount.fetch_add(1u, std::memory_order_relaxed);
+            break;
+        }
+    }
+    const bool traceXmenLegal = xmenDiagnostics &&
+                                batch.state.context.frame.fbp == 140u &&
+                                batch.state.prim.type != GS_PRIM_SPRITE;
+    const uint32_t submitProbeIndex = xmenDiagnostics
+        ? s_submitProbeCount.fetch_add(1u, std::memory_order_relaxed)
+        : UINT32_MAX;
+    const bool traceSubmitProbe = xmenDiagnostics &&
+        (submitProbeIndex < 256u ||
+         (submitProbeIndex < 4096u && (submitProbeIndex & 127u) == 0u));
     const int submitOfx = submitCtx.xyoffset.ofx >> 4;
     const int submitOfy = submitCtx.xyoffset.ofy >> 4;
     const uint32_t submitFrameBase = GSInternal::framePageBaseToBlock(submitCtx.frame.fbp);
@@ -1316,22 +1402,17 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
         return static_cast<int>(std::lround(batch.vertices[std::min<uint32_t>(i, batch.vertexCount - 1u)].y)) - submitOfy;
     };
     uint64_t viewportVertices = 0u;
-    for (uint32_t i = 0u; i < batch.vertexCount; ++i)
+    if (xmenDiagnostics)
     {
-        const int x = screenX(i);
-        const int y = screenY(i);
-        if (x >= 0 && x < 640 && y >= 0 && y < 448)
-            ++viewportVertices;
+        for (uint32_t i = 0u; i < batch.vertexCount; ++i)
+        {
+            const int x = screenX(i);
+            const int y = screenY(i);
+            if (x >= 0 && x < 640 && y >= 0 && y < 448)
+                ++viewportVertices;
+        }
+        m_debugViewportVertexCount.fetch_add(viewportVertices, std::memory_order_relaxed);
     }
-    m_debugViewportVertexCount.fetch_add(viewportVertices, std::memory_order_relaxed);
-    sampleX[0] = 0; sampleY[0] = 0;
-    sampleX[1] = 100; sampleY[1] = 100;
-    sampleX[2] = 320; sampleY[2] = 224;
-    sampleX[3] = 639; sampleY[3] = 447;
-    sampleX[4] = screenX(0u); sampleY[4] = screenY(0u);
-    sampleX[5] = screenX(1u); sampleY[5] = screenY(1u);
-    sampleX[6] = (screenX(0u) + screenX(1u)) / 2; sampleY[6] = (screenY(0u) + screenY(1u)) / 2;
-    sampleX[7] = screenX(2u); sampleY[7] = screenY(2u);
     const auto readSubmitSample = [&](int x, int y) -> uint32_t {
         const uint32_t sx = static_cast<uint32_t>(GSInternal::clampInt(x, 0, 1023));
         const uint32_t sy = static_cast<uint32_t>(GSInternal::clampInt(y, 0, 1023));
@@ -1340,6 +1421,15 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
     std::array<uint32_t, 8> beforeSubmitSamples{};
     if (traceSubmitProbe)
     {
+        sampleX[0] = 0; sampleY[0] = 0;
+        sampleX[1] = 100; sampleY[1] = 100;
+        sampleX[2] = 320; sampleY[2] = 224;
+        sampleX[3] = 639; sampleY[3] = 447;
+        sampleX[4] = screenX(0u); sampleY[4] = screenY(0u);
+        sampleX[5] = screenX(1u); sampleY[5] = screenY(1u);
+        sampleX[6] = (screenX(0u) + screenX(1u)) / 2;
+        sampleY[6] = (screenY(0u) + screenY(1u)) / 2;
+        sampleX[7] = screenX(2u); sampleY[7] = screenY(2u);
         for (size_t i = 0; i < beforeSubmitSamples.size(); ++i)
             beforeSubmitSamples[i] = readSubmitSample(sampleX[i], sampleY[i]);
     }
@@ -1445,7 +1535,8 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
             std::fflush(stderr);
         }
     }
-    const bool isXmenWorldStrip = batch.debugVsyncTick >= 1910u &&
+    const bool isXmenWorldStrip = xmenDiagnostics &&
+                                  batch.debugVsyncTick >= 1910u &&
                                   (xmenContext.frame.fbp == 0u || xmenContext.frame.fbp == 140u) &&
                                   batch.state.prim.type == GS_PRIM_TRISTRIP;
     const bool traceXmenUntextured = isXmenWorldStrip &&
@@ -1574,9 +1665,6 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
         s_xmenActiveRasterProbe = &xmenRasterStats;
     static const bool profileCpuRaster =
         std::getenv("PS2X_GS_CPU_PROFILE") != nullptr;
-    const auto rasterStart = profileCpuRaster
-        ? std::chrono::steady_clock::now()
-        : std::chrono::steady_clock::time_point{};
     static const bool skipCpuRaster = std::getenv("PS2X_SKIP_CPU_RASTER") != nullptr;
     static const uint32_t skipCpuRasterBeforePresent = []
     {
@@ -1590,8 +1678,81 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
             ? static_cast<uint32_t>(std::min<unsigned long>(parsed, UINT32_MAX))
             : 0u;
     }();
-    if (!skipCpuRaster && batch.debugPresentCount >= skipCpuRasterBeforePresent)
-        DrawPrimitive(batch);
+    static const bool whiteWireframe =
+        std::getenv("PS2X_DEBUG_WHITE_WIREFRAME") != nullptr;
+    static const bool suppressLateWireframeSprites =
+        std::getenv("PS2X_DEBUG_WHITE_WIREFRAME_NO_LATE_SPRITES") != nullptr;
+    const bool wireframeTriangle = whiteWireframe && batch.vertexCount >= 3u &&
+        (batch.state.prim.type == GS_PRIM_TRIANGLE ||
+         batch.state.prim.type == GS_PRIM_TRISTRIP ||
+         batch.state.prim.type == GS_PRIM_TRIFAN);
+    const bool skipLateWireframeSprite = suppressLateWireframeSprites &&
+        batch.debugPresentCount >= 100u && batch.state.prim.type == GS_PRIM_SPRITE;
+    const bool rasterEnabled =
+        !skipCpuRaster && batch.debugPresentCount >= skipCpuRasterBeforePresent;
+    struct CpuRasterFrameProfile
+    {
+        uint32_t present = UINT32_MAX;
+        uint64_t submits = 0u;
+        uint64_t nanoseconds = 0u;
+        uint64_t texturedSubmits = 0u;
+        uint64_t texturedNanoseconds = 0u;
+        std::array<uint64_t, 7> primitiveSubmits{};
+        std::array<uint64_t, 7> primitiveNanoseconds{};
+    };
+    static thread_local CpuRasterFrameProfile rasterProfile{};
+    if (profileCpuRaster && rasterProfile.present != batch.debugPresentCount)
+    {
+        if (rasterProfile.submits != 0u)
+        {
+            std::fprintf(
+                stderr,
+                "[gs:cpu-profile] present=%u submits=%llu raster-ms=%.3f "
+                "textured=%llu/%.3f p0=%llu/%.3f p1=%llu/%.3f p2=%llu/%.3f "
+                "p3=%llu/%.3f p4=%llu/%.3f p5=%llu/%.3f p6=%llu/%.3f\n",
+                rasterProfile.present,
+                static_cast<unsigned long long>(rasterProfile.submits),
+                static_cast<double>(rasterProfile.nanoseconds) / 1000000.0,
+                static_cast<unsigned long long>(rasterProfile.texturedSubmits),
+                static_cast<double>(rasterProfile.texturedNanoseconds) / 1000000.0,
+                static_cast<unsigned long long>(rasterProfile.primitiveSubmits[0]),
+                static_cast<double>(rasterProfile.primitiveNanoseconds[0]) / 1000000.0,
+                static_cast<unsigned long long>(rasterProfile.primitiveSubmits[1]),
+                static_cast<double>(rasterProfile.primitiveNanoseconds[1]) / 1000000.0,
+                static_cast<unsigned long long>(rasterProfile.primitiveSubmits[2]),
+                static_cast<double>(rasterProfile.primitiveNanoseconds[2]) / 1000000.0,
+                static_cast<unsigned long long>(rasterProfile.primitiveSubmits[3]),
+                static_cast<double>(rasterProfile.primitiveNanoseconds[3]) / 1000000.0,
+                static_cast<unsigned long long>(rasterProfile.primitiveSubmits[4]),
+                static_cast<double>(rasterProfile.primitiveNanoseconds[4]) / 1000000.0,
+                static_cast<unsigned long long>(rasterProfile.primitiveSubmits[5]),
+                static_cast<double>(rasterProfile.primitiveNanoseconds[5]) / 1000000.0,
+                static_cast<unsigned long long>(rasterProfile.primitiveSubmits[6]),
+                static_cast<double>(rasterProfile.primitiveNanoseconds[6]) / 1000000.0);
+        }
+        rasterProfile = {};
+        rasterProfile.present = batch.debugPresentCount;
+    }
+    const auto rasterStart = profileCpuRaster && rasterEnabled
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+    if (rasterEnabled)
+    {
+        if (skipLateWireframeSprite)
+        {
+            // Diagnostic A/B mode: retain world edges across the late HUD pass.
+        }
+        else if (wireframeTriangle)
+        {
+            const uint64_t edgeCountBefore =
+                m_debugWireframeEdgeCount.load(std::memory_order_relaxed);
+            DrawWhiteWireframe(batch);
+            if (m_debugWireframeEdgeCount.load(std::memory_order_relaxed) != edgeCountBefore)
+                m_debugLastWireframeSubmit.store(submitOrdinal, std::memory_order_relaxed);
+        }
+        else
+            DrawPrimitive(batch);
+    }
     const uint32_t targetPixelEvents =
         xmenRasterStats.targetCovered +
         xmenRasterStats.targetAlphaRejected +
@@ -2373,24 +2534,64 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
                      xmenRasterStats.maxStoredZ);
         std::fflush(stdout);
     }
-    if (profileCpuRaster)
+    if (profileCpuRaster && rasterEnabled)
     {
         const uint64_t rasterNanoseconds = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - rasterStart).count());
-        const uint64_t submitCount =
-            s_profileSubmitCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
-        const uint64_t totalRasterNanoseconds =
-            s_profileRasterNanoseconds.fetch_add(rasterNanoseconds, std::memory_order_relaxed) +
-            rasterNanoseconds;
-        if ((submitCount & 511u) == 0u)
+        ++rasterProfile.submits;
+        rasterProfile.nanoseconds += rasterNanoseconds;
+        if (batch.state.prim.tme)
         {
-            std::fprintf(stderr,
-                         "[gs:cpu-profile] submits=%llu raster-ms=%.3f average-us=%.3f\n",
-                         static_cast<unsigned long long>(submitCount),
-                         static_cast<double>(totalRasterNanoseconds) / 1000000.0,
-                         static_cast<double>(totalRasterNanoseconds) /
-                             static_cast<double>(submitCount) / 1000.0);
+            ++rasterProfile.texturedSubmits;
+            rasterProfile.texturedNanoseconds += rasterNanoseconds;
+        }
+        if (primitiveType < rasterProfile.primitiveSubmits.size())
+        {
+            ++rasterProfile.primitiveSubmits[primitiveType];
+            rasterProfile.primitiveNanoseconds[primitiveType] += rasterNanoseconds;
+        }
+        if (batch.state.prim.type == GS_PRIM_SPRITE && rasterNanoseconds >= 100000u)
+        {
+            const int ofx = submitCtx.xyoffset.ofx >> 4;
+            const int ofy = submitCtx.xyoffset.ofy >> 4;
+            const GSVertex &v0 = batch.vertices[0u];
+            const GSVertex &v1 = batch.vertices[1u];
+            std::fprintf(
+                stderr,
+                "[gs:cpu-profile-sprite] present=%u ms=%.3f xy=%d,%d-%d,%d "
+                "tme=%u fst=%u abe=%u iip=%u fge=%u linear=%u "
+                "frame=%u/%u/%u/%08x zbuf=%u/%u/%u tex=%u/%u/%u/%u/%u/%u "
+                "test=%016llx alpha=%016llx scanmsk=%llx dthe=%llx\n",
+                batch.debugPresentCount,
+                static_cast<double>(rasterNanoseconds) / 1000000.0,
+                static_cast<int>(v0.x) - ofx,
+                static_cast<int>(v0.y) - ofy,
+                static_cast<int>(v1.x) - ofx,
+                static_cast<int>(v1.y) - ofy,
+                batch.state.prim.tme ? 1u : 0u,
+                batch.state.prim.fst ? 1u : 0u,
+                batch.state.prim.abe ? 1u : 0u,
+                batch.state.prim.iip ? 1u : 0u,
+                batch.state.prim.fge ? 1u : 0u,
+                batch.state.linearFilter ? 1u : 0u,
+                submitCtx.frame.fbp,
+                static_cast<unsigned>(submitCtx.frame.fbw),
+                static_cast<unsigned>(submitCtx.frame.psm),
+                submitCtx.frame.fbmsk,
+                submitCtx.zbuf.zbp,
+                static_cast<unsigned>(submitCtx.zbuf.psm),
+                submitCtx.zbuf.zmask ? 1u : 0u,
+                submitCtx.tex0.tbp0,
+                static_cast<unsigned>(submitCtx.tex0.tbw),
+                static_cast<unsigned>(submitCtx.tex0.psm),
+                static_cast<unsigned>(submitCtx.tex0.tw),
+                static_cast<unsigned>(submitCtx.tex0.th),
+                static_cast<unsigned>(submitCtx.tex0.tfx),
+                static_cast<unsigned long long>(submitCtx.test),
+                static_cast<unsigned long long>(submitCtx.alpha),
+                static_cast<unsigned long long>(batch.state.scanmsk),
+                static_cast<unsigned long long>(batch.state.dthe));
         }
     }
     if (traceSubmitProbe)
@@ -2593,13 +2794,34 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
 
 GSRasterDebugCounters GSCpuBackend::GetDebugCounters() const
 {
-    return {
-        m_debugSubmitCount.load(std::memory_order_relaxed),
-        m_debugFrame0SubmitCount.load(std::memory_order_relaxed),
-        m_debugFrame140SubmitCount.load(std::memory_order_relaxed),
-        m_debugOtherFrameSubmitCount.load(std::memory_order_relaxed),
-        m_debugViewportVertexCount.load(std::memory_order_relaxed),
-    };
+    GSRasterDebugCounters counters{};
+    counters.submits = m_debugSubmitCount.load(std::memory_order_relaxed);
+    counters.frame0Submits = m_debugFrame0SubmitCount.load(std::memory_order_relaxed);
+    counters.frame140Submits = m_debugFrame140SubmitCount.load(std::memory_order_relaxed);
+    counters.otherFrameSubmits = m_debugOtherFrameSubmitCount.load(std::memory_order_relaxed);
+    counters.viewportVertices = m_debugViewportVertexCount.load(std::memory_order_relaxed);
+    for (size_t i = 0u; i < counters.primitiveSubmits.size(); ++i)
+        counters.primitiveSubmits[i] = m_debugPrimitiveSubmitCounts[i].load(std::memory_order_relaxed);
+    counters.fullViewportSprites = m_debugFullViewportSpriteCount.load(std::memory_order_relaxed);
+    counters.blackFullViewportSprites = m_debugBlackFullViewportSpriteCount.load(std::memory_order_relaxed);
+    counters.lastWireframeSubmit = m_debugLastWireframeSubmit.load(std::memory_order_relaxed);
+    counters.lastFullViewportSpriteSubmit =
+        m_debugLastFullViewportSpriteSubmit.load(std::memory_order_relaxed);
+    counters.lastFullViewportSpriteFbp =
+        m_debugLastFullViewportSpriteFbp.load(std::memory_order_relaxed);
+    counters.lastFullViewportSpriteRgba =
+        m_debugLastFullViewportSpriteRgba.load(std::memory_order_relaxed);
+    counters.lastFullViewportSpriteFlags =
+        m_debugLastFullViewportSpriteFlags.load(std::memory_order_relaxed);
+    counters.wireframeEdges = m_debugWireframeEdgeCount.load(std::memory_order_relaxed);
+    counters.wireframeVerifiedEdges =
+        m_debugWireframeVerifiedEdgeCount.load(std::memory_order_relaxed);
+    counters.presents = m_debugPresentCount.load(std::memory_order_relaxed);
+    counters.lastPresentNonblackPixels =
+        m_debugLastPresentNonblackPixelCount.load(std::memory_order_relaxed);
+    counters.lastDisplayFbp = m_debugLastDisplayFbp.load(std::memory_order_relaxed);
+    counters.lastSourceFbp = m_debugLastSourceFbp.load(std::memory_order_relaxed);
+    return counters;
 }
 
 void GSCpuBackend::Flush()
@@ -2822,6 +3044,72 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     }
     default:
         break;
+    }
+}
+
+void GSCpuBackend::DrawWhiteWireframe(const GSPrimitiveBatch &batch)
+{
+    GSPrimitiveBatch edge = batch;
+    edge.vertexCount = 2u;
+    edge.state.prim.type = GS_PRIM_LINE;
+    edge.state.prim.iip = false;
+    edge.state.prim.tme = false;
+    edge.state.prim.fge = false;
+    edge.state.prim.abe = false;
+    edge.state.pabe = false;
+    edge.state.scanmsk = 0u;
+    edge.state.dthe = 0u;
+    edge.state.context.test = 0u;
+    edge.state.context.frame.fbmsk = 0u;
+    edge.state.context.fba = 0u;
+
+    const auto &ctx = edge.state.context;
+    const int ofx = ctx.xyoffset.ofx >> 4;
+    const int ofy = ctx.xyoffset.ofy >> 4;
+    const int minX = std::max<int>(ctx.scissor.x0, 0);
+    const int maxX = std::min<int>(ctx.scissor.x1, 639);
+    const int minY = std::max<int>(ctx.scissor.y0, 0);
+    const int maxY = std::min<int>(ctx.scissor.y1, 447);
+    const auto isVisible = [&](const GSVertex &vertex)
+    {
+        const int x = static_cast<int>(std::lround(vertex.x)) - ofx;
+        const int y = static_cast<int>(std::lround(vertex.y)) - ofy;
+        return x >= minX && x <= maxX && y >= minY && y <= maxY;
+    };
+
+    constexpr std::array<std::array<uint8_t, 2>, 3> edges{{
+        {{0u, 1u}}, {{1u, 2u}}, {{2u, 0u}},
+    }};
+    for (const auto &indices : edges)
+    {
+        const GSVertex &v0 = batch.vertices[indices[0]];
+        const GSVertex &v1 = batch.vertices[indices[1]];
+        if (!isVisible(v0) || !isVisible(v1))
+            continue;
+
+        edge.vertices[0] = v0;
+        edge.vertices[1] = v1;
+        for (uint32_t i = 0u; i < edge.vertexCount; ++i)
+        {
+            edge.vertices[i].r = 255u;
+            edge.vertices[i].g = 255u;
+            edge.vertices[i].b = 255u;
+            edge.vertices[i].a = 255u;
+            edge.vertices[i].fog = 255u;
+        }
+        DrawLine(edge);
+        m_debugWireframeEdgeCount.fetch_add(1u, std::memory_order_relaxed);
+
+        const int x = static_cast<int>(std::lround(v1.x)) - ofx;
+        const int y = static_cast<int>(std::lround(v1.y)) - ofy;
+        const uint32_t stored = ReadVramUnlocked(
+            ctx.frame.psm, GSInternal::framePageBaseToBlock(ctx.frame.fbp),
+            std::max<uint32_t>(ctx.frame.fbw, 1u), x, y);
+        const uint32_t colorMask = bitsPerPixel(ctx.frame.psm) == 16
+            ? 0x7FFFu
+            : 0x00FFFFFFu;
+        if ((stored & colorMask) != 0u)
+            m_debugWireframeVerifiedEdgeCount.fetch_add(1u, std::memory_order_relaxed);
     }
 }
 
@@ -3180,7 +3468,8 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
 
         const u32 out = ReadVramUnlocked(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
         uint32_t texel = 0xFFFF00FFu;
-        s_xmenLastClutLookup = {};
+        if (traceTargetSample)
+            s_xmenLastClutLookup = {};
 
         switch (tex.psm)
         {
@@ -3315,12 +3604,54 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
     const int drawY0 = clampInt(unclippedY0, ctx.scissor.y0, ctx.scissor.y1);
     const int drawX1 = clampInt(unclippedX1, ctx.scissor.x0, ctx.scissor.x1);
     const int drawY1 = clampInt(unclippedY1, ctx.scissor.y0, ctx.scissor.y1);
+    uint8_t r = v1.r, g = v1.g, b = v1.b, a = v1.a;
+
+    const bool alphaTestDisabled = (ctx.test & 0x1ull) == 0ull;
+    const bool destinationAlphaTestDisabled = ((ctx.test >> 14u) & 0x1ull) == 0ull;
+    const bool depthTestEnabled = ((ctx.test >> 16u) & 0x1ull) != 0ull;
+    const uint32_t depthTestMethod = static_cast<uint32_t>((ctx.test >> 17u) & 0x3ull);
+    const bool depthAlwaysPasses = !depthTestEnabled || depthTestMethod == 1u;
+    const bool simpleFrameMask = ctx.frame.fbmsk == 0u || ctx.frame.fbmsk == UINT32_MAX;
+    const bool supportedDepthFormat =
+        ctx.zbuf.psm == GS_PSM_Z32 || ctx.zbuf.psm == GS_PSM_Z24 ||
+        ctx.zbuf.psm == GS_PSM_Z16 || ctx.zbuf.psm == GS_PSM_Z16S;
+
+    // Common GS clears arrive as untextured sprites. Avoid the full per-pixel
+    // test/blend path when the state proves that only plain color/depth stores remain.
+    if (!s_xmenActiveRasterProbe && m_vram && !state.prim.tme && !state.prim.fge &&
+        !state.prim.abe && state.scanmsk == 0u && state.dthe == 0u &&
+        alphaTestDisabled && destinationAlphaTestDisabled && depthAlwaysPasses &&
+        ctx.frame.psm == GS_PSM_CT32 && simpleFrameMask &&
+        (ctx.zbuf.zmask || supportedDepthFormat))
+    {
+        const bool writeFrame = ctx.frame.fbmsk == 0u;
+        const bool writeDepth = !ctx.zbuf.zmask;
+        uint8_t fastAlpha = a;
+        if ((ctx.fba & 0x1ull) != 0ull)
+            fastAlpha = static_cast<uint8_t>(fastAlpha | 0x80u);
+        const uint32_t framePixel = pack32(r, g, b, fastAlpha);
+        const uint32_t frameBase = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
+        const uint32_t depthBase = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
+        const uint32_t frameWidth = std::max<uint32_t>(ctx.frame.fbw, 1u);
+        const WriteVramFunc frameWriter = m_writeVramFuncs[GS_PSM_CT32];
+        const WriteVramFunc depthWriter = m_writeVramFuncs[ctx.zbuf.psm & 0x3Fu];
+
+        for (int y = drawY0; y <= drawY1; ++y)
+        {
+            for (int x = drawX0; x <= drawX1; ++x)
+            {
+                if (writeFrame)
+                    frameWriter(m_vram, frameBase, frameWidth, x, y, framePixel);
+                if (writeDepth)
+                    depthWriter(m_vram, depthBase, frameWidth, x, y, z1);
+            }
+        }
+        return;
+    }
 
     const uint64_t alphaReg = ctx.alpha;
     const uint8_t alphaMode = static_cast<uint8_t>(alphaReg & 0xFFu);
     const uint8_t alphaFix = static_cast<uint8_t>((alphaReg >> 32) & 0xFFu);
-
-    uint8_t r = v1.r, g = v1.g, b = v1.b, a = v1.a;
 
     if (state.prim.tme)
     {
@@ -3363,7 +3694,10 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
                 float tx = (static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
                 float texUf = u0f + (u1f - u0f) * tx;
                 uint32_t texel = 0xFFFF00FFu;
-                s_xmenTraceTextureSample = s_xmenActiveRasterProbe && isXmenTracePixel(x, y);
+                const bool traceTextureSample =
+                    s_xmenActiveRasterProbe && isXmenTracePixel(x, y);
+                if (traceTextureSample)
+                    s_xmenTraceTextureSample = true;
                 if (state.prim.fst)
                 {
                     const int fixedU = static_cast<int>((texUf * 16.0f) + 0.5f);
@@ -3376,7 +3710,8 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
                 {
                     texel = SampleTexture(state, texUf / static_cast<float>(texW), texVf / static_cast<float>(texH), 1.0f, 0u, 0u);
                 }
-                s_xmenTraceTextureSample = false;
+                if (traceTextureSample)
+                    s_xmenTraceTextureSample = false;
 
                 uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                 uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
@@ -3419,6 +3754,14 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
     int minY = static_cast<int>(std::floor(std::min({fy0, fy1, fy2})));
     int maxY = static_cast<int>(std::ceil(std::max({fy0, fy1, fy2})));
 
+    if (maxX < static_cast<int>(ctx.scissor.x0) ||
+        minX > static_cast<int>(ctx.scissor.x1) ||
+        maxY < static_cast<int>(ctx.scissor.y0) ||
+        minY > static_cast<int>(ctx.scissor.y1))
+    {
+        return;
+    }
+
     minX = clampInt(minX, ctx.scissor.x0, ctx.scissor.x1);
     maxX = clampInt(maxX, ctx.scissor.x0, ctx.scissor.x1);
     minY = clampInt(minY, ctx.scissor.y0, ctx.scissor.y1);
@@ -3430,21 +3773,29 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
 
     const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
     const float invAbsDenom = 1.0f / std::fabs(denom);
+    const float w0StepX = (fy1 - fy2) * winding * invAbsDenom;
+    const float w1StepX = (fy2 - fy0) * winding * invAbsDenom;
+    const float w2StepX = -w0StepX - w1StepX;
+    const float startPx = static_cast<float>(minX) + 0.5f;
     constexpr float kEdgeEpsilon = 1.0e-4f;
 
     for (int y = minY; y <= maxY; ++y)
     {
-        float py = static_cast<float>(y) + 0.5f;
+        const float py = static_cast<float>(y) + 0.5f;
+        float w0 = (((fy1 - fy2) * (startPx - fx2) +
+                     (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
+        float w1 = (((fy2 - fy0) * (startPx - fx2) +
+                     (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
+        float w2 = 1.0f - w0 - w1;
         for (int x = minX; x <= maxX; ++x)
         {
-            float px = static_cast<float>(x) + 0.5f;
-
-            float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
-            float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
-            float w2 = 1.0f - w0 - w1;
-
             if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
+            {
+                w0 += w0StepX;
+                w1 += w1StepX;
+                w2 += w2StepX;
                 continue;
+            }
 
             double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
 
@@ -3488,9 +3839,13 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                     iv = 0;
                 }
 
-                s_xmenTraceTextureSample = s_xmenActiveRasterProbe && isXmenTracePixel(x, y);
+                const bool traceTextureSample =
+                    s_xmenActiveRasterProbe && isXmenTracePixel(x, y);
+                if (traceTextureSample)
+                    s_xmenTraceTextureSample = true;
                 uint32_t texel = SampleTexture(state, is, it, iq, iu, iv);
-                s_xmenTraceTextureSample = false;
+                if (traceTextureSample)
+                    s_xmenTraceTextureSample = false;
 
                 uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                 uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
@@ -3520,6 +3875,9 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
 
             const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
             WritePixel(state, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
+            w0 += w0StepX;
+            w1 += w1StepX;
+            w2 += w2StepX;
         }
     }
 }
@@ -3539,6 +3897,58 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
     int x1 = static_cast<int>(v1.x) - ofx;
     int y1 = static_cast<int>(v1.y) - ofy;
 
+    const int originalX0 = x0;
+    const int originalY0 = y0;
+    const int lineDx = x1 - x0;
+    const int lineDy = y1 - y0;
+    double clipStart = 0.0;
+    double clipEnd = 1.0;
+    const auto clipLine = [&](double p, double q) -> bool
+    {
+        if (p == 0.0)
+            return q >= 0.0;
+
+        const double ratio = q / p;
+        if (p < 0.0)
+        {
+            if (ratio > clipEnd)
+                return false;
+            clipStart = std::max(clipStart, ratio);
+        }
+        else
+        {
+            if (ratio < clipStart)
+                return false;
+            clipEnd = std::min(clipEnd, ratio);
+        }
+        return true;
+    };
+
+    if (!clipLine(-static_cast<double>(lineDx),
+                  static_cast<double>(x0) - static_cast<double>(ctx.scissor.x0)) ||
+        !clipLine(static_cast<double>(lineDx),
+                  static_cast<double>(ctx.scissor.x1) - static_cast<double>(x0)) ||
+        !clipLine(-static_cast<double>(lineDy),
+                  static_cast<double>(y0) - static_cast<double>(ctx.scissor.y0)) ||
+        !clipLine(static_cast<double>(lineDy),
+                  static_cast<double>(ctx.scissor.y1) - static_cast<double>(y0)))
+    {
+        return;
+    }
+
+    x0 = clampInt(static_cast<int>(std::lround(
+                      static_cast<double>(originalX0) + lineDx * clipStart)),
+                  ctx.scissor.x0, ctx.scissor.x1);
+    y0 = clampInt(static_cast<int>(std::lround(
+                      static_cast<double>(originalY0) + lineDy * clipStart)),
+                  ctx.scissor.y0, ctx.scissor.y1);
+    x1 = clampInt(static_cast<int>(std::lround(
+                      static_cast<double>(originalX0) + lineDx * clipEnd)),
+                  ctx.scissor.x0, ctx.scissor.x1);
+    y1 = clampInt(static_cast<int>(std::lround(
+                      static_cast<double>(originalY0) + lineDy * clipEnd)),
+                  ctx.scissor.y0, ctx.scissor.y1);
+
     int dx = std::abs(x1 - x0);
     int dy = -std::abs(y1 - y0);
     int sx = (x0 < x1) ? 1 : -1;
@@ -3552,7 +3962,10 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
 
     for (;;)
     {
-        float t = static_cast<float>(step) / static_cast<float>(totalSteps);
+        const double clippedT = static_cast<double>(step) /
+                                static_cast<double>(totalSteps);
+        const float t = static_cast<float>(
+            clipStart + (clipEnd - clipStart) * clippedT);
         uint8_t r, g, b, a;
         if (state.prim.iip)
         {
@@ -4156,7 +4569,16 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
 
     thread_local GSCpuBackend snapshotBackend;
     snapshotBackend.Initialize(snapshot.data(), static_cast<uint32_t>(snapshot.size()));
-    return snapshotBackend.PresentFromLocalMemory(request);
+    PresentationFrame result = snapshotBackend.PresentFromLocalMemory(request);
+    m_debugPresentCount.fetch_add(1u, std::memory_order_relaxed);
+    m_debugLastPresentNonblackPixelCount.store(
+        result.pixels.empty()
+            ? 0u
+            : countNonBlackPixels(result.pixels, result.width, result.height),
+        std::memory_order_relaxed);
+    m_debugLastDisplayFbp.store(result.displayFbp, std::memory_order_relaxed);
+    m_debugLastSourceFbp.store(result.sourceFbp, std::memory_order_relaxed);
+    return result;
 }
 
 PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &request)

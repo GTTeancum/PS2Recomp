@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cfenv>
 #include <cmath>
 #include <cstdio>
@@ -18,6 +19,23 @@
 
 namespace
 {
+    template <uint32_t Capacity>
+    uint32_t firstAvailablePipelineSlot(uint32_t occupied)
+    {
+        static_assert(Capacity > 0u && Capacity < 32u);
+        constexpr uint32_t allSlots = (1u << Capacity) - 1u;
+        const uint32_t available = ~occupied & allSlots;
+        return available != 0u
+            ? static_cast<uint32_t>(std::countr_zero(available))
+            : Capacity;
+    }
+
+    bool xmenDiagnosticsEnabled()
+    {
+        static const bool enabled = std::getenv("PS2X_XMEN_DIAGNOSTICS") != nullptr;
+        return enabled;
+    }
+
     thread_local bool xmenTraceVu1Program = false;
     thread_local uint32_t xmenCurrentVuProgramStart = UINT32_MAX;
     thread_local uint64_t xmenCurrentVuTick = 0u;
@@ -27,6 +45,15 @@ namespace
     thread_local uint64_t xmenXgkickIssueTick = 0u;
     thread_local uint64_t xmenXgkickExecution = UINT64_MAX;
     std::atomic<uint64_t> xmenVuExecutionSerial{0u};
+    constexpr size_t kXmenVuProgramCount = 0x4000u / 8u;
+    std::array<std::atomic<uint64_t>, kXmenVuProgramCount> xmenXgkickProgramCounts{};
+    std::array<std::atomic<uint64_t>, kXmenVuProgramCount> xmenXgkickProgramLastTicks{};
+    std::array<std::atomic<uint64_t>, kXmenVuProgramCount> xmenXgkickProgramLastExecutions{};
+    std::array<std::atomic<uint64_t>, kXmenVuProgramCount> xmenXgkickProgramLastTagLo{};
+    std::array<std::atomic<uint64_t>, kXmenVuProgramCount> xmenXgkickProgramLastTagHi{};
+    std::array<std::atomic<uint32_t>, kXmenVuProgramCount> xmenXgkickProgramLastIssuePcs{};
+    std::array<std::atomic<uint32_t>, kXmenVuProgramCount> xmenXgkickProgramLastSources{};
+    std::array<std::atomic<uint32_t>, kXmenVuProgramCount> xmenXgkickProgramLastBytes{};
 
     struct XmenTargetXgkickConfig
     {
@@ -306,6 +333,74 @@ namespace
     }
 }
 
+extern "C" void ps2xGetXmenXgkickProgramDebug(
+    uint32_t capacity, uint32_t *programs, uint64_t *counts,
+    uint64_t *ticks, uint64_t *executions, uint64_t *tagLo,
+    uint64_t *tagHi, uint32_t *issuePcs, uint32_t *sources,
+    uint32_t *bytes)
+{
+    if (capacity == 0u || !programs || !counts || !ticks || !executions ||
+        !tagLo || !tagHi || !issuePcs || !sources || !bytes)
+    {
+        return;
+    }
+
+    for (uint32_t i = 0u; i < capacity; ++i)
+    {
+        programs[i] = 0u;
+        counts[i] = 0u;
+        ticks[i] = 0u;
+        executions[i] = 0u;
+        tagLo[i] = 0u;
+        tagHi[i] = 0u;
+        issuePcs[i] = 0u;
+        sources[i] = 0u;
+        bytes[i] = 0u;
+    }
+
+    for (size_t programIndex = 0u; programIndex < kXmenVuProgramCount; ++programIndex)
+    {
+        const uint64_t count = xmenXgkickProgramCounts[programIndex].load(std::memory_order_relaxed);
+        if (count == 0u)
+            continue;
+
+        uint32_t insert = capacity;
+        for (uint32_t i = 0u; i < capacity; ++i)
+        {
+            if (count > counts[i])
+            {
+                insert = i;
+                break;
+            }
+        }
+        if (insert == capacity)
+            continue;
+
+        for (uint32_t i = capacity - 1u; i > insert; --i)
+        {
+            programs[i] = programs[i - 1u];
+            counts[i] = counts[i - 1u];
+            ticks[i] = ticks[i - 1u];
+            executions[i] = executions[i - 1u];
+            tagLo[i] = tagLo[i - 1u];
+            tagHi[i] = tagHi[i - 1u];
+            issuePcs[i] = issuePcs[i - 1u];
+            sources[i] = sources[i - 1u];
+            bytes[i] = bytes[i - 1u];
+        }
+
+        programs[insert] = static_cast<uint32_t>(programIndex * 8u);
+        counts[insert] = count;
+        ticks[insert] = xmenXgkickProgramLastTicks[programIndex].load(std::memory_order_relaxed);
+        executions[insert] = xmenXgkickProgramLastExecutions[programIndex].load(std::memory_order_relaxed);
+        tagLo[insert] = xmenXgkickProgramLastTagLo[programIndex].load(std::memory_order_relaxed);
+        tagHi[insert] = xmenXgkickProgramLastTagHi[programIndex].load(std::memory_order_relaxed);
+        issuePcs[insert] = xmenXgkickProgramLastIssuePcs[programIndex].load(std::memory_order_relaxed);
+        sources[insert] = xmenXgkickProgramLastSources[programIndex].load(std::memory_order_relaxed);
+        bytes[insert] = xmenXgkickProgramLastBytes[programIndex].load(std::memory_order_relaxed);
+    }
+}
+
 void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
 {
     if (lanes == 0u)
@@ -357,6 +452,11 @@ void VU1Interpreter::resetScheduler()
     m_vfWritePipeline = {};
     m_viWritePipeline = {};
     m_accWritePipeline = {};
+    m_flagPipelineMask = 0u;
+    m_storePipelineMask = 0u;
+    m_vfWritePipelineMask = 0u;
+    m_viWritePipelineMask = 0u;
+    m_accWritePipelineMask = 0u;
     m_xgkick = {};
     m_vfReady = {};
     m_viReady = {};
@@ -803,21 +903,15 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
         status |= flags;
     }
 
-    FlagPipelineEntry *entry = nullptr;
-    for (FlagPipelineEntry &candidate : m_flagPipeline)
-    {
-        if (!candidate.valid)
-        {
-            entry = &candidate;
-            break;
-        }
-    }
-    if (!entry)
+    const uint32_t slot =
+        firstAvailablePipelineSlot<kMaxFlagEntries>(m_flagPipelineMask);
+    if (slot == kMaxFlagEntries)
     {
         reportReservedInstruction(true, 0xFFFFFFFFu);
         return;
     }
 
+    FlagPipelineEntry *entry = &m_flagPipeline[slot];
     *entry = {};
     entry->valid = true;
     entry->issueCycle = m_cycle;
@@ -827,6 +921,7 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
     entry->extraSticky = extraSticky;
     entry->writesMac = true;
     entry->writesStatus = true;
+    m_flagPipelineMask |= 1u << slot;
 }
 
 void VU1Interpreter::applyFmacDest(float *dst, float *result, uint8_t dest)
@@ -847,24 +942,26 @@ void VU1Interpreter::applyFmacDestAcc(float *result, uint8_t dest)
 
 void VU1Interpreter::queueFsset(uint16_t immediate)
 {
-    for (FlagPipelineEntry &entry : m_flagPipeline)
+    for (uint32_t slots = m_flagPipelineMask; slots != 0u; slots &= slots - 1u)
     {
-        if (entry.valid && entry.issueCycle == m_cycle)
+        FlagPipelineEntry &entry = m_flagPipeline[std::countr_zero(slots)];
+        if (entry.issueCycle == m_cycle)
             entry.writesStatus = false;
     }
 
-    for (FlagPipelineEntry &entry : m_flagPipeline)
+    const uint32_t slot =
+        firstAvailablePipelineSlot<kMaxFlagEntries>(m_flagPipelineMask);
+    if (slot != kMaxFlagEntries)
     {
-        if (!entry.valid)
-        {
-            entry = {};
-            entry.valid = true;
-            entry.issueCycle = m_cycle;
-            entry.readyCycle = m_cycle + kFmacLatency;
-            entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
-            entry.writesSticky = true;
-            return;
-        }
+        FlagPipelineEntry &entry = m_flagPipeline[slot];
+        entry = {};
+        entry.valid = true;
+        entry.issueCycle = m_cycle;
+        entry.readyCycle = m_cycle + kFmacLatency;
+        entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
+        entry.writesSticky = true;
+        m_flagPipelineMask |= 1u << slot;
+        return;
     }
     reportReservedInstruction(false, 0xFFFFFFFEu);
 }
@@ -872,18 +969,19 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
 void VU1Interpreter::queueClip(uint32_t clip)
 {
     m_workingClip = ((m_workingClip << 6) | (clip & 0x3Fu)) & 0xFFFFFFu;
-    for (FlagPipelineEntry &entry : m_flagPipeline)
+    const uint32_t slot =
+        firstAvailablePipelineSlot<kMaxFlagEntries>(m_flagPipelineMask);
+    if (slot != kMaxFlagEntries)
     {
-        if (!entry.valid)
-        {
-            entry = {};
-            entry.valid = true;
-            entry.issueCycle = m_cycle;
-            entry.readyCycle = m_cycle + kFmacLatency;
-            entry.clip = m_workingClip;
-            entry.writesClip = true;
-            return;
-        }
+        FlagPipelineEntry &entry = m_flagPipeline[slot];
+        entry = {};
+        entry.valid = true;
+        entry.issueCycle = m_cycle;
+        entry.readyCycle = m_cycle + kFmacLatency;
+        entry.clip = m_workingClip;
+        entry.writesClip = true;
+        m_flagPipelineMask |= 1u << slot;
+        return;
     }
     reportReservedInstruction(true, 0xFFFFFFFDu);
 }
@@ -891,23 +989,25 @@ void VU1Interpreter::queueClip(uint32_t clip)
 void VU1Interpreter::queueFcset(uint32_t clip)
 {
     m_workingClip = clip & 0xFFFFFFu;
-    for (FlagPipelineEntry &entry : m_flagPipeline)
+    for (uint32_t slots = m_flagPipelineMask; slots != 0u; slots &= slots - 1u)
     {
-        if (entry.valid && entry.issueCycle == m_cycle)
+        FlagPipelineEntry &entry = m_flagPipeline[std::countr_zero(slots)];
+        if (entry.issueCycle == m_cycle)
             entry.writesClip = false;
     }
-    for (FlagPipelineEntry &entry : m_flagPipeline)
+    const uint32_t slot =
+        firstAvailablePipelineSlot<kMaxFlagEntries>(m_flagPipelineMask);
+    if (slot != kMaxFlagEntries)
     {
-        if (!entry.valid)
-        {
-            entry = {};
-            entry.valid = true;
-            entry.issueCycle = m_cycle;
-            entry.readyCycle = m_cycle + kFmacLatency;
-            entry.clip = m_workingClip;
-            entry.writesClip = true;
-            return;
-        }
+        FlagPipelineEntry &entry = m_flagPipeline[slot];
+        entry = {};
+        entry.valid = true;
+        entry.issueCycle = m_cycle;
+        entry.readyCycle = m_cycle + kFmacLatency;
+        entry.clip = m_workingClip;
+        entry.writesClip = true;
+        m_flagPipelineMask |= 1u << slot;
+        return;
     }
     reportReservedInstruction(false, 0xFFFFFFFAu);
 }
@@ -1059,17 +1159,19 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
                      static_cast<unsigned long long>(m_cycle), m_state.pc, address,
                      laneMask, words[0], words[1], words[2], words[3]);
     }
-    for (PendingStore &store : m_storePipeline)
+    const uint32_t slot =
+        firstAvailablePipelineSlot<kMaxPendingStores>(m_storePipelineMask);
+    if (slot != kMaxPendingStores)
     {
-        if (!store.valid)
-        {
-            store.valid = true;
-            store.readyCycle = m_cycle + 1u;
-            store.address = address;
-            store.laneMask = laneMask;
-            std::copy(words, words + 4, store.words.begin());
-            return;
-        }
+        PendingStore &store = m_storePipeline[slot];
+        store = {};
+        store.valid = true;
+        store.readyCycle = m_cycle + 1u;
+        store.address = address;
+        store.laneMask = laneMask;
+        std::copy(words, words + 4, store.words.begin());
+        m_storePipelineMask |= 1u << slot;
+        return;
     }
     reportReservedInstruction(false, 0xFFFFFFFCu);
 }
@@ -1079,24 +1181,25 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
 {
     if (reg == 0u || laneMask == 0u)
         return;
-    for (PendingVfWrite &write : m_vfWritePipeline)
+    const uint32_t slot =
+        firstAvailablePipelineSlot<kMaxPendingVfWrites>(m_vfWritePipelineMask);
+    if (slot != kMaxPendingVfWrites)
     {
-        if (!write.valid)
+        PendingVfWrite &write = m_vfWritePipeline[slot];
+        write = {};
+        write.valid = true;
+        write.readyCycle = m_cycle + latency;
+        write.sequence = ++m_nextWriteSequence;
+        write.reg = reg;
+        write.laneMask = laneMask;
+        std::copy(value, value + 4, write.value.begin());
+        for (uint32_t component = 0; component < 4u; ++component)
         {
-            write = {};
-            write.valid = true;
-            write.readyCycle = m_cycle + latency;
-            write.sequence = ++m_nextWriteSequence;
-            write.reg = reg;
-            write.laneMask = laneMask;
-            std::copy(value, value + 4, write.value.begin());
-            for (uint32_t component = 0; component < 4u; ++component)
-            {
-                if ((laneMask & laneForComponent(component)) != 0u)
-                    m_vfLatestWrite[reg][component] = write.sequence;
-            }
-            return;
+            if ((laneMask & laneForComponent(component)) != 0u)
+                m_vfLatestWrite[reg][component] = write.sequence;
         }
+        m_vfWritePipelineMask |= 1u << slot;
+        return;
     }
     reportReservedInstruction(false, 0xFFFFFFF7u);
 }
@@ -1105,19 +1208,20 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
 {
     if (reg == 0u)
         return;
-    for (PendingViWrite &write : m_viWritePipeline)
+    const uint32_t slot =
+        firstAvailablePipelineSlot<kMaxPendingViWrites>(m_viWritePipelineMask);
+    if (slot != kMaxPendingViWrites)
     {
-        if (!write.valid)
-        {
-            write = {};
-            write.valid = true;
-            write.readyCycle = m_cycle + latency;
-            write.sequence = ++m_nextWriteSequence;
-            write.reg = reg;
-            write.value = value;
-            m_viLatestWrite[reg] = write.sequence;
-            return;
-        }
+        PendingViWrite &write = m_viWritePipeline[slot];
+        write = {};
+        write.valid = true;
+        write.readyCycle = m_cycle + latency;
+        write.sequence = ++m_nextWriteSequence;
+        write.reg = reg;
+        write.value = value;
+        m_viLatestWrite[reg] = write.sequence;
+        m_viWritePipelineMask |= 1u << slot;
+        return;
     }
     reportReservedInstruction(false, 0xFFFFFFF6u);
 }
@@ -1126,32 +1230,35 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
 {
     if (laneMask == 0u)
         return;
-    for (PendingAccWrite &write : m_accWritePipeline)
+    const uint32_t slot =
+        firstAvailablePipelineSlot<kMaxPendingAccWrites>(m_accWritePipelineMask);
+    if (slot != kMaxPendingAccWrites)
     {
-        if (!write.valid)
+        PendingAccWrite &write = m_accWritePipeline[slot];
+        write = {};
+        write.valid = true;
+        write.readyCycle = m_cycle + latency;
+        write.sequence = ++m_nextWriteSequence;
+        write.laneMask = laneMask;
+        std::copy(value, value + 4, write.value.begin());
+        for (uint32_t component = 0; component < 4u; ++component)
         {
-            write = {};
-            write.valid = true;
-            write.readyCycle = m_cycle + latency;
-            write.sequence = ++m_nextWriteSequence;
-            write.laneMask = laneMask;
-            std::copy(value, value + 4, write.value.begin());
-            for (uint32_t component = 0; component < 4u; ++component)
-            {
-                if ((laneMask & laneForComponent(component)) != 0u)
-                    m_accLatestWrite[component] = write.sequence;
-            }
-            return;
+            if ((laneMask & laneForComponent(component)) != 0u)
+                m_accLatestWrite[component] = write.sequence;
         }
+        m_accWritePipelineMask |= 1u << slot;
+        return;
     }
     reportReservedInstruction(true, 0xFFFFFFF5u);
 }
 
 void VU1Interpreter::commitReadyPipelines()
 {
-    for (FlagPipelineEntry &entry : m_flagPipeline)
+    for (uint32_t slots = m_flagPipelineMask; slots != 0u; slots &= slots - 1u)
     {
-        if (!entry.valid || entry.readyCycle > m_cycle)
+        const uint32_t slot = static_cast<uint32_t>(std::countr_zero(slots));
+        FlagPipelineEntry &entry = m_flagPipeline[slot];
+        if (entry.readyCycle > m_cycle)
             continue;
 
         if (entry.writesMac)
@@ -1168,6 +1275,7 @@ void VU1Interpreter::commitReadyPipelines()
         if (entry.writesClip)
             m_state.clip = entry.clip;
         entry = {};
+        m_flagPipelineMask &= ~(1u << slot);
     }
 
     if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
@@ -1187,9 +1295,11 @@ void VU1Interpreter::commitReadyPipelines()
         }
     }
 
-    for (PendingStore &store : m_storePipeline)
+    for (uint32_t slots = m_storePipelineMask; slots != 0u; slots &= slots - 1u)
     {
-        if (!store.valid || store.readyCycle > m_cycle)
+        const uint32_t slot = static_cast<uint32_t>(std::countr_zero(slots));
+        PendingStore &store = m_storePipeline[slot];
+        if (store.readyCycle > m_cycle)
             continue;
         if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
         {
@@ -1203,11 +1313,14 @@ void VU1Interpreter::commitReadyPipelines()
             std::memcpy(m_activeVuData + store.address, oldWords, sizeof(oldWords));
         }
         store = {};
+        m_storePipelineMask &= ~(1u << slot);
     }
 
-    for (PendingVfWrite &write : m_vfWritePipeline)
+    for (uint32_t slots = m_vfWritePipelineMask; slots != 0u; slots &= slots - 1u)
     {
-        if (!write.valid || write.readyCycle > m_cycle)
+        const uint32_t slot = static_cast<uint32_t>(std::countr_zero(slots));
+        PendingVfWrite &write = m_vfWritePipeline[slot];
+        if (write.readyCycle > m_cycle)
             continue;
         for (uint32_t component = 0; component < 4u; ++component)
         {
@@ -1218,20 +1331,26 @@ void VU1Interpreter::commitReadyPipelines()
             }
         }
         write = {};
+        m_vfWritePipelineMask &= ~(1u << slot);
     }
 
-    for (PendingViWrite &write : m_viWritePipeline)
+    for (uint32_t slots = m_viWritePipelineMask; slots != 0u; slots &= slots - 1u)
     {
-        if (!write.valid || write.readyCycle > m_cycle)
+        const uint32_t slot = static_cast<uint32_t>(std::countr_zero(slots));
+        PendingViWrite &write = m_viWritePipeline[slot];
+        if (write.readyCycle > m_cycle)
             continue;
         if (m_viLatestWrite[write.reg] == write.sequence)
             m_state.vi[write.reg] = static_cast<int16_t>(write.value);
         write = {};
+        m_viWritePipelineMask &= ~(1u << slot);
     }
 
-    for (PendingAccWrite &write : m_accWritePipeline)
+    for (uint32_t slots = m_accWritePipelineMask; slots != 0u; slots &= slots - 1u)
     {
-        if (!write.valid || write.readyCycle > m_cycle)
+        const uint32_t slot = static_cast<uint32_t>(std::countr_zero(slots));
+        PendingAccWrite &write = m_accWritePipeline[slot];
+        if (write.readyCycle > m_cycle)
             continue;
         for (uint32_t component = 0; component < 4u; ++component)
         {
@@ -1242,6 +1361,7 @@ void VU1Interpreter::commitReadyPipelines()
             }
         }
         write = {};
+        m_accWritePipelineMask &= ~(1u << slot);
     }
 }
 
@@ -1325,6 +1445,28 @@ void VU1Interpreter::finishXgkick()
         return;
 
     m_debugXgkickFinishCount.fetch_add(1u, std::memory_order_relaxed);
+
+    if (xmenXgkickProgramStart != UINT32_MAX && m_xgkick.totalBytes >= 16u)
+    {
+        const size_t programIndex = (xmenXgkickProgramStart & 0x3FFFu) / 8u;
+        if (programIndex < kXmenVuProgramCount)
+        {
+            uint64_t firstTagLo = 0u;
+            uint64_t firstTagHi = 0u;
+            std::memcpy(&firstTagLo, m_xgkick.packet.data(), sizeof(firstTagLo));
+            std::memcpy(&firstTagHi,
+                        m_xgkick.packet.data() + sizeof(firstTagLo),
+                        sizeof(firstTagHi));
+            xmenXgkickProgramCounts[programIndex].fetch_add(1u, std::memory_order_relaxed);
+            xmenXgkickProgramLastTicks[programIndex].store(xmenXgkickIssueTick, std::memory_order_relaxed);
+            xmenXgkickProgramLastExecutions[programIndex].store(xmenXgkickExecution, std::memory_order_relaxed);
+            xmenXgkickProgramLastTagLo[programIndex].store(firstTagLo, std::memory_order_relaxed);
+            xmenXgkickProgramLastTagHi[programIndex].store(firstTagHi, std::memory_order_relaxed);
+            xmenXgkickProgramLastIssuePcs[programIndex].store(xmenXgkickIssuePc, std::memory_order_relaxed);
+            xmenXgkickProgramLastSources[programIndex].store(m_xgkick.sourceAddress, std::memory_order_relaxed);
+            xmenXgkickProgramLastBytes[programIndex].store(m_xgkick.totalBytes, std::memory_order_relaxed);
+        }
+    }
 
     const XmenXgkickCbpConfig &cbpConfig = xmenXgkickCbpConfig();
     static uint32_t cbpTraceCount = 0u;
@@ -1668,7 +1810,8 @@ void VU1Interpreter::finishXgkick()
     }
 
     static uint32_t finishTraceCount = 0u;
-    if (xmenTraceVu1Program || finishTraceCount++ < 32u)
+    if (xmenTraceVu1Program ||
+        (xmenDiagnosticsEnabled() && finishTraceCount++ < 32u))
     {
         uint64_t tagLo = 0u;
         uint64_t tagHi = 0u;
@@ -1731,7 +1874,8 @@ void VU1Interpreter::finishXgkick()
     }
 
     static uint32_t submitTraceCount = 0u;
-    if (xmenTraceVu1Program || submitTraceCount++ < 64u)
+    if (xmenDiagnosticsEnabled() &&
+        (xmenTraceVu1Program || submitTraceCount++ < 64u))
     {
         std::fprintf(stderr,
                      "[vu1:xgkick-submit] source=0x%x bytes=%u copied=%u memory=%p gs=%p\n",
@@ -1766,7 +1910,8 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
     if (xmenGameplayVuSummary.active)
         ++xmenGameplayVuSummary.xgkickStarts;
     static uint32_t startTraceCount = 0u;
-    if (xmenTraceVu1Program || startTraceCount++ < 32u)
+    if (xmenTraceVu1Program ||
+        (xmenDiagnosticsEnabled() && startTraceCount++ < 32u))
     {
         std::fprintf(stderr,
                      "[vu1:xgkick-start] qword=0x%x source=0x%x pc=0x%x cycle=%llu\n",
@@ -1805,22 +1950,11 @@ bool VU1Interpreter::pipelinesPending() const
     for (const ScalarPipelineEntry &entry : m_efu)
         if (entry.valid)
             return true;
-    for (const FlagPipelineEntry &entry : m_flagPipeline)
-        if (entry.valid)
-            return true;
-    for (const PendingStore &store : m_storePipeline)
-        if (store.valid)
-            return true;
-    for (const PendingVfWrite &write : m_vfWritePipeline)
-        if (write.valid)
-            return true;
-    for (const PendingViWrite &write : m_viWritePipeline)
-        if (write.valid)
-            return true;
-    for (const PendingAccWrite &write : m_accWritePipeline)
-        if (write.valid)
-            return true;
-    return false;
+    return m_flagPipelineMask != 0u ||
+        m_storePipelineMask != 0u ||
+        m_vfWritePipelineMask != 0u ||
+        m_viWritePipelineMask != 0u ||
+        m_accWritePipelineMask != 0u;
 }
 
 void VU1Interpreter::flushPipelines()
@@ -2462,7 +2596,8 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
         xmenVuCensusCounts[censusIndex] < 8u;
     if (traceVuCensus)
         ++xmenVuCensusCounts[censusIndex];
-    if (m_unit == Unit::VU1 && (titleTick == 635u || traceVuCensus))
+    if (m_unit == Unit::VU1 &&
+        ((xmenDiagnosticsEnabled() && titleTick == 635u) || traceVuCensus))
     {
         xmenGameplayVuSummary = {};
         xmenGameplayVuSummary.active = true;
@@ -2481,7 +2616,8 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
         }
     }
     uint32_t titleExecutionIndex = UINT32_MAX;
-    if (m_unit == Unit::VU1 && titleTick >= 1910u && titleTick <= 1960u)
+    if (xmenDiagnosticsEnabled() && m_unit == Unit::VU1 &&
+        titleTick >= 1910u && titleTick <= 1960u)
     {
         titleExecutionIndex =
             titleExecutionCount.fetch_add(1u, std::memory_order_relaxed);
@@ -2496,7 +2632,8 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     }
 
     static bool dumpedFirstMainProgram = false;
-    if (m_unit == Unit::VU1 && startPC == 0u && !dumpedFirstMainProgram)
+    if (xmenDiagnosticsEnabled() &&
+        m_unit == Unit::VU1 && startPC == 0u && !dumpedFirstMainProgram)
     {
         dumpedFirstMainProgram = true;
         for (uint32_t pc = 0u; pc <= 0x230u && pc + 8u <= codeSize; pc += 8u)
@@ -2555,8 +2692,8 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
         (targetExecutionEnvironment == nullptr ||
          xmenCurrentVuExecution == targetExecution) &&
         tracedXmenTargetProgram < targetProgramTraceLimit;
-    const bool traceThisProgram =
-        traceMeshProgram || traceGameplayKickProgram || traceTargetProgram;
+    const bool traceThisProgram = traceTargetProgram ||
+        (xmenDiagnosticsEnabled() && (traceMeshProgram || traceGameplayKickProgram));
     if (traceThisProgram)
     {
         if (traceMeshProgram)
@@ -2661,7 +2798,7 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
         xmenTitleVuTrace = {};
     }
     static uint32_t executeTraceCount = 0u;
-    if (executeTraceCount++ < 96u)
+    if (xmenDiagnosticsEnabled() && executeTraceCount++ < 96u)
     {
         std::fprintf(stderr,
             "[vu1:execute-summary] start=0x%x top=0x%x itop=0x%x cycles=%llu/%u "
@@ -2748,11 +2885,14 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         }
 
         const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
-        BudgetTraceEntry &budgetEntry = budgetTrace[budgetTraceCount++ & 31u];
-        budgetEntry.pc = m_state.pc;
-        budgetEntry.lower = decoded.lower;
-        budgetEntry.upper = decoded.upper;
-        std::memcpy(budgetEntry.vi, m_state.vi, sizeof(budgetEntry.vi));
+        if (xmenDiagnosticsEnabled())
+        {
+            BudgetTraceEntry &budgetEntry = budgetTrace[budgetTraceCount++ & 31u];
+            budgetEntry.pc = m_state.pc;
+            budgetEntry.lower = decoded.lower;
+            budgetEntry.upper = decoded.upper;
+            std::memcpy(budgetEntry.vi, m_state.vi, sizeof(budgetEntry.vi));
+        }
         if (xmenTraceVu1Program)
         {
             std::fprintf(stderr,
@@ -3066,7 +3206,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     }
 
     static bool dumpedBudgetTrace = false;
-    if (!dumpedBudgetTrace && m_cycle >= budgetEnd && !m_stopRequested)
+    if (xmenDiagnosticsEnabled() &&
+        !dumpedBudgetTrace && m_cycle >= budgetEnd && !m_stopRequested)
     {
         dumpedBudgetTrace = true;
         const uint32_t retained = std::min(budgetTraceCount, 32u);

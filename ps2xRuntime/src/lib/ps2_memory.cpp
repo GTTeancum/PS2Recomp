@@ -14,6 +14,10 @@
 #include <string>
 #include <vector>
 
+extern "C" void ps2xRecordXmenVif1Chain(
+    uint64_t tick, uint32_t start, uint32_t end, uint32_t tags,
+    uint32_t bytes, uint32_t chcr, uint32_t ended);
+
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -50,6 +54,12 @@ namespace
     bool traceVifDmaProvenance()
     {
         static const bool enabled = std::getenv("PS2X_TRACE_VIF_PROVENANCE") != nullptr;
+        return enabled;
+    }
+
+    bool xmenDiagnosticsEnabled()
+    {
+        static const bool enabled = std::getenv("PS2X_XMEN_DIAGNOSTICS") != nullptr;
         return enabled;
     }
 
@@ -1621,7 +1631,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             return false;
         }
         static std::atomic<uint32_t> timerWriteTraceCount{0u};
-        if (timerIndex < 2u && timerWriteTraceCount.fetch_add(1u, std::memory_order_relaxed) < 128u)
+        if (xmenDiagnosticsEnabled() && timerIndex < 2u &&
+            timerWriteTraceCount.fetch_add(1u, std::memory_order_relaxed) < 128u)
         {
             std::fprintf(stderr,
                          "[ee-timer:write] timer=%zu off=0x%x value=0x%x count=%u->%u mode=0x%x->0x%x compare=%u->%u\n",
@@ -1957,7 +1968,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                 break;
                             const uint32_t flatStart = static_cast<uint32_t>(chainBuf.size());
                             chainBuf.insert(chainBuf.end(), base2 + src, base2 + src + chunk);
-                            if (traceVifDmaProvenance() && channelBase == 0x10009000u)
+                            if (channelBase == 0x10009000u)
                             {
                                 chainProvenance.push_back({
                                     flatStart,
@@ -2129,7 +2140,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         }
 
                         static std::atomic<uint32_t> xmenVifChainTagLogCount{0u};
-                        if (traceXmenCorruptChain &&
+                        if (xmenDiagnosticsEnabled() && traceXmenCorruptChain &&
                             (tagsProcessed <= 256 || endChain ||
                              (tagsProcessed & (tagsProcessed - 1)) == 0) &&
                             xmenVifChainTagLogCount.fetch_add(1u, std::memory_order_relaxed) < 256u)
@@ -2151,7 +2162,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         {
                             const uint32_t tagFlatStart = static_cast<uint32_t>(chainBuf.size());
                             appendVifChainTagData(currentTagAddr);
-                            if (traceVifDmaProvenance() && channelBase == 0x10009000u &&
+                            if (channelBase == 0x10009000u &&
                                 chainBuf.size() > tagFlatStart)
                             {
                                 chainProvenance.push_back({
@@ -2247,7 +2258,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                 }
                             }
                         }
-                        if (channelBase == 0x10009000u &&
+                        if (xmenDiagnosticsEnabled() && channelBase == 0x10009000u &&
                             ((flattenedStart <= 9928u && chainBuf.size() > 9928u) ||
                              (flattenedStart <= 10404u && chainBuf.size() > 10404u)))
                         {
@@ -2265,7 +2276,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         }
                     }
 
-                    if (channelBase == 0x10009000u &&
+                    if ((xmenDiagnosticsEnabled() || traceVifDmaProvenance()) &&
+                        channelBase == 0x10009000u &&
                         (chainBuf.size() >= 0x10000u || tagsProcessed >= kMaxChainTags))
                     {
                         std::fprintf(stderr,
@@ -2275,7 +2287,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             chainBuf.size(), asp, tieEnabled ? 1u : 0u, lastTagUpper);
                     }
                     if (channelBase == 0x1000A000u &&
-                        (dmaStartIndex >= 70u || traceGifChain))
+                        (traceGifChain ||
+                         (xmenDiagnosticsEnabled() && dmaStartIndex >= 70u)))
                     {
                         uint64_t chainHash = 1469598103934665603ull;
                         for (const uint8_t byte : chainBuf)
@@ -2295,7 +2308,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         std::fprintf(stderr, "\n");
                     }
 
-                    if (channelBase == 0x1000A000u)
+                    if (xmenDiagnosticsEnabled() && channelBase == 0x1000A000u)
                     {
                         uint32_t consoleDbp = 0u;
                         size_t consoleOffset = 0u;
@@ -2328,6 +2341,17 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     chcr = (chcr & ~(0x3u << 4)) | ((asp & 0x3u) << 4);
                     chcr = (chcr & 0x0000FFFFu) | (lastTagUpper << 16);
                     m_ioRegisters[channelBase + 0x00] = chcr;
+
+                    if (channelBase == 0x10009000u)
+                    {
+                        ps2xRecordXmenVif1Chain(
+                            gs().vsyncTick.load(std::memory_order_relaxed),
+                            canonicalDmacAddress(chainStartTagAddr),
+                            canonicalDmacAddress(tagAddr),
+                            static_cast<uint32_t>(tagsProcessed),
+                            static_cast<uint32_t>(chainBuf.size()), chcr,
+                            chainEnded ? 1u : 0u);
+                    }
 
                     if (!chainBuf.empty() || chainEnded)
                     {
@@ -2744,7 +2768,7 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
     std::memcpy(&tagHi, data + sizeof(tagLo), sizeof(tagHi));
     static std::atomic<uint32_t> submitTraceCount{0u};
     const uint32_t submitTraceIndex = submitTraceCount.fetch_add(1u, std::memory_order_relaxed);
-    if (submitTraceIndex < 128u)
+    if (xmenDiagnosticsEnabled() && submitTraceIndex < 128u)
     {
         std::fprintf(stderr,
                      "[gif-submit] idx=%u path=%u bytes=%u drain=%u arbiter=%u callback=%u masked=%u directHl=%u tagLo=0x%016llx tagHi=0x%016llx\n",
@@ -2763,7 +2787,8 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 
     uint32_t consoleDbp = 0u;
     size_t consoleOffset = 0u;
-    if (findXmenConsoleTextureBitblt(data, sizeBytes, consoleDbp, consoleOffset))
+    if (xmenDiagnosticsEnabled() &&
+        findXmenConsoleTextureBitblt(data, sizeBytes, consoleDbp, consoleOffset))
     {
         std::fprintf(stderr,
                      "[xmen-console-submit] path=%u bytes=%u drain=%u directHl=%u "

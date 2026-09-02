@@ -16,6 +16,12 @@ namespace
 {
     static constexpr uint32_t kHostFrameWidth = 640u;
 
+    bool xmenDiagnosticsEnabled()
+    {
+        static const bool enabled = std::getenv("PS2X_XMEN_DIAGNOSTICS") != nullptr;
+        return enabled;
+    }
+
     bool writePresentationPpm(const std::string &path,
                               const std::vector<uint8_t> &pixels,
                               uint32_t width,
@@ -945,7 +951,8 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     static std::atomic<uint32_t> targetPacketTraceCount{0u};
     const bool traceTargetPacket = matchesTargetPacket &&
         targetPacketTraceCount.fetch_add(1u, std::memory_order_relaxed) == 0u;
-    const bool traceThisPacket = processTraceIndex < 128u || traceTargetPacket;
+    const bool traceThisPacket = traceTargetPacket ||
+        (xmenDiagnosticsEnabled() && processTraceIndex < 128u);
     if (traceThisPacket)
     {
         std::fprintf(stderr,
@@ -961,7 +968,9 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     }
 
     constexpr uint64_t kXmenLegalTex0 = 0x4005788401302bc0ull;
-    for (uint32_t probeOffset = 0; probeOffset + 8u <= sizeBytes; probeOffset += 8u)
+    for (uint32_t probeOffset = 0;
+         xmenDiagnosticsEnabled() && probeOffset + 8u <= sizeBytes;
+         probeOffset += 8u)
     {
         if (loadLE64(data + probeOffset) != kXmenLegalTex0)
             continue;
@@ -1038,7 +1047,8 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
             ? traceTargetPacket
             : matchesTargetTag &&
                 targetPacketTraceCount.fetch_add(1u, std::memory_order_relaxed) == 0u;
-        const bool traceThisTag = processTraceIndex < 128u || traceTargetTag;
+        const bool traceThisTag = traceTargetTag ||
+            (xmenDiagnosticsEnabled() && processTraceIndex < 128u);
         m_traceCurrentGifPacket = previousTracePacket || traceTargetTag;
         if (traceTargetTag)
         {
@@ -1983,19 +1993,22 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             m_privRegs->siglblid = (m_privRegs->siglblid & 0xFFFFFFFF00000000ULL) | lo;
             m_privRegs->csr.fetch_or(0x1);
             const bool masked = (m_privRegs->imr & (1ull << 8u)) != 0u;
-            static std::atomic<uint32_t> signalTraceCount{0u};
-            const uint32_t signalIndex =
-                signalTraceCount.fetch_add(1u, std::memory_order_relaxed);
-            if (signalIndex < 128u)
+            if (xmenDiagnosticsEnabled())
             {
-                std::fprintf(stderr,
-                             "[gs:signal] index=%u id=0x%x mask=0x%x csr=0x%llx imr=0x%llx interrupt=%u\n",
-                             signalIndex,
-                             id,
-                             mask,
-                             static_cast<unsigned long long>(m_privRegs->csr.load()),
-                             static_cast<unsigned long long>(m_privRegs->imr),
-                             masked ? 0u : 1u);
+                static std::atomic<uint32_t> signalTraceCount{0u};
+                const uint32_t signalIndex =
+                    signalTraceCount.fetch_add(1u, std::memory_order_relaxed);
+                if (signalIndex < 128u)
+                {
+                    std::fprintf(stderr,
+                                 "[gs:signal] index=%u id=0x%x mask=0x%x csr=0x%llx imr=0x%llx interrupt=%u\n",
+                                 signalIndex,
+                                 id,
+                                 mask,
+                                 static_cast<unsigned long long>(m_privRegs->csr.load()),
+                                 static_cast<unsigned long long>(m_privRegs->imr),
+                                 masked ? 0u : 1u);
+                }
             }
             if (!masked && m_interruptCallback)
                 m_interruptCallback(0u);
@@ -2013,17 +2026,20 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         {
             m_privRegs->csr.fetch_or(0x2);
             const bool masked = (m_privRegs->imr & (1ull << 9u)) != 0u;
-            static std::atomic<uint32_t> finishTraceCount{0u};
-            const uint32_t finishIndex =
-                finishTraceCount.fetch_add(1u, std::memory_order_relaxed);
-            if (finishIndex < 512u)
+            if (xmenDiagnosticsEnabled())
             {
-                std::fprintf(stderr,
-                             "[gs:finish] index=%u csr=0x%llx imr=0x%llx interrupt=%u\n",
-                             finishIndex,
-                             static_cast<unsigned long long>(m_privRegs->csr.load()),
-                             static_cast<unsigned long long>(m_privRegs->imr),
-                             masked ? 0u : 1u);
+                static std::atomic<uint32_t> finishTraceCount{0u};
+                const uint32_t finishIndex =
+                    finishTraceCount.fetch_add(1u, std::memory_order_relaxed);
+                if (finishIndex < 512u)
+                {
+                    std::fprintf(stderr,
+                                 "[gs:finish] index=%u csr=0x%llx imr=0x%llx interrupt=%u\n",
+                                 finishIndex,
+                                 static_cast<unsigned long long>(m_privRegs->csr.load()),
+                                 static_cast<unsigned long long>(m_privRegs->imr),
+                                 masked ? 0u : 1u);
+                }
             }
             if (!masked && m_interruptCallback)
                 m_interruptCallback(0u);
@@ -2231,6 +2247,8 @@ void GS::vertexKick(bool drawing)
                 std::fflush(stderr);
             }
         }
+        if (xmenDiagnosticsEnabled())
+        {
         static std::atomic<uint32_t> submittedDrawTraceCount{0u};
         static std::atomic<uint32_t> interestingDrawTraceCount{0u};
         static std::atomic<uint32_t> nonSpriteDrawCount{0u};
@@ -2453,6 +2471,7 @@ void GS::vertexKick(bool drawing)
                          nonSpriteDrawCount.load(std::memory_order_relaxed),
                          texturedDrawCount.load(std::memory_order_relaxed),
                          coloredDrawCount.load(std::memory_order_relaxed));
+        }
         }
         updatePreferredDisplaySourceForDraw(batch);
         m_debugSubmittedDrawBatchCount.fetch_add(1u, std::memory_order_relaxed);

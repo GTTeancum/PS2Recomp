@@ -4,7 +4,6 @@
 
 #include <array>
 #include <atomic>
-#include <functional>
 #include <mutex>
 #include <vector>
 
@@ -42,6 +41,7 @@ private:
     void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
 
     void DrawPrimitive(const GSPrimitiveBatch &batch);
+    void DrawWhiteWireframe(const GSPrimitiveBatch &batch);
     void DrawSprite(const GSPrimitiveBatch &batch);
     void DrawTriangle(const GSPrimitiveBatch &batch);
     void DrawLine(const GSPrimitiveBatch &batch);
@@ -62,8 +62,8 @@ private:
                              uint32_t sourceOriginX,
                              uint32_t sourceOriginY) const;
 
-    using WriteVramFunc = std::function<void(uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t)>;
-    using ReadVramFunc = std::function<uint32_t(uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t)>;
+    using WriteVramFunc = void (*)(uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+    using ReadVramFunc = uint32_t (*)(uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t);
 
     static constexpr size_t kPsmHandlerCount = 1u << 6u;
     mutable std::mutex m_mutex;
@@ -83,4 +83,18 @@ private:
     std::atomic<uint64_t> m_debugFrame140SubmitCount{0u};
     std::atomic<uint64_t> m_debugOtherFrameSubmitCount{0u};
     std::atomic<uint64_t> m_debugViewportVertexCount{0u};
+    std::array<std::atomic<uint64_t>, 7> m_debugPrimitiveSubmitCounts{};
+    std::atomic<uint64_t> m_debugFullViewportSpriteCount{0u};
+    std::atomic<uint64_t> m_debugBlackFullViewportSpriteCount{0u};
+    std::atomic<uint64_t> m_debugLastWireframeSubmit{0u};
+    std::atomic<uint64_t> m_debugLastFullViewportSpriteSubmit{0u};
+    std::atomic<uint32_t> m_debugLastFullViewportSpriteFbp{0u};
+    std::atomic<uint32_t> m_debugLastFullViewportSpriteRgba{0u};
+    std::atomic<uint32_t> m_debugLastFullViewportSpriteFlags{0u};
+    std::atomic<uint64_t> m_debugWireframeEdgeCount{0u};
+    std::atomic<uint64_t> m_debugWireframeVerifiedEdgeCount{0u};
+    std::atomic<uint64_t> m_debugPresentCount{0u};
+    std::atomic<uint64_t> m_debugLastPresentNonblackPixelCount{0u};
+    std::atomic<uint32_t> m_debugLastDisplayFbp{0u};
+    std::atomic<uint32_t> m_debugLastSourceFbp{0u};
 };

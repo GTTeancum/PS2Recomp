@@ -1,6 +1,10 @@
-include(CheckIPOSupported)
+option(PS2X_ENABLE_IPO "Enable interprocedural and link-time optimization" OFF)
+option(PS2X_ENABLE_LINKER_SYMBOLS "Emit linker public symbols for native profiling" OFF)
 
-check_ipo_supported(RESULT IPO_SUPPORTED OUTPUT IPO_ERROR)
+if(PS2X_ENABLE_IPO)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT IPO_SUPPORTED OUTPUT IPO_ERROR)
+endif()
 
 # ps2_runtime.h unconditionally includes <smmintrin.h> and the recompiler emits
 # SSE4.1-only intrinsics (_mm_blendv_ps and friends) for the COP2/FPU select
@@ -26,11 +30,10 @@ function(EnableFastReleaseMode TargetName)
     message("> Enabling optimization for: ${TargetName}")
     if(MSVC)
         target_compile_options(${TargetName} PRIVATE
-            $<$<CONFIG:Release>:
+            $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:
                 /O2 # speed
                 /Ob2 # inline aggressively
                 /Oi # intrinsics
-                /GL # whole program opt
                 /Gy # function-level linking
                 /Gw # global data in COMDAT
                 /GF # string pooling
@@ -43,20 +46,26 @@ function(EnableFastReleaseMode TargetName)
             >
         )
 
-        if(TARGET ${TargetName})
+        target_link_options(${TargetName} PRIVATE
+            $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:
+                /OPT:REF # remove unreferenced
+                /OPT:ICF # fold identical COMDATs
+            >
+        )
+
+        if(PS2X_ENABLE_LINKER_SYMBOLS)
             target_link_options(${TargetName} PRIVATE
-                $<$<CONFIG:Release>:
-                    /LTCG # link-time code generation
-                    /OPT:REF # remove unreferenced
-                    /OPT:ICF # fold identical COMDATs
-                >
+                $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/DEBUG:FULL>
             )
         endif()
     endif()
 
-    if(IPO_SUPPORTED)
-        set_property(TARGET ${TargetName} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
-    else()
-        message(WARNING "Interprocedural optimization not supported: ${ipo_error}")
+    if(PS2X_ENABLE_IPO)
+        if(IPO_SUPPORTED)
+            set_property(TARGET ${TargetName} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+            set_property(TARGET ${TargetName} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO TRUE)
+        else()
+            message(WARNING "Interprocedural optimization not supported: ${IPO_ERROR}")
+        endif()
     endif()
 endfunction()

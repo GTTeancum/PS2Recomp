@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <limits>
@@ -36,6 +37,12 @@ namespace
     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
+
+    bool xmenDiagnosticsEnabled()
+    {
+        static const bool enabled = std::getenv("PS2X_XMEN_DIAGNOSTICS") != nullptr;
+        return enabled;
+    }
 
     constexpr uint64_t microsecondsToEeCycles(uint64_t microseconds)
     {
@@ -311,7 +318,8 @@ void EeScheduler::run()
                 GuestThread *owner = &acquireInvocationThread();
                 GuestInvocation invocation = std::move(m_pendingInvocations.front());
                 m_pendingInvocations.pop_front();
-                if (invocation.kind == GuestInvocationKind::Interrupt &&
+                if (xmenDiagnosticsEnabled() &&
+                    invocation.kind == GuestInvocationKind::Interrupt &&
                     getRegU32(&invocation.context, 4) == 1u)
                 {
                     std::fprintf(stderr,
@@ -352,9 +360,10 @@ void EeScheduler::run()
             }
         }
         R5900Context &context = running->activeContext();
-        if (context.pc == 0x002DE3D0u ||
-            context.pc == 0x002DE524u ||
-            context.pc == 0x002DE52Cu)
+        if (xmenDiagnosticsEnabled() &&
+            (context.pc == 0x002DE3D0u ||
+             context.pc == 0x002DE524u ||
+             context.pc == 0x002DE52Cu))
         {
             const uint32_t queue = readXmenWord(m_rdram, 0x007507D4u);
             const uint64_t sequence = running->invocations.empty()
@@ -378,7 +387,7 @@ void EeScheduler::run()
                          readXmenWord(m_rdram, 0x007537E8u),
                          static_cast<unsigned long long>(m_eeCycle));
         }
-        if (context.pc == 0x002DE550u)
+        if (xmenDiagnosticsEnabled() && context.pc == 0x002DE550u)
         {
             static uint32_t gifHandlerEntryTraceCount = 0u;
             const uint32_t queueHead = readXmenWord(m_rdram, 0x007507D8u);
@@ -409,24 +418,27 @@ void EeScheduler::run()
             }
             ++gifHandlerEntryTraceCount;
         }
-        const uint32_t movieStreamState = xmenMovieStreamState(m_rdram);
-        if (xmenMoviePlaybackStarted(m_rdram))
+        if (xmenDiagnosticsEnabled())
         {
-            static uint32_t xmenMovieDispatchTraceCount = 0u;
-            if (xmenMovieDispatchTraceCount++ < 128u)
+            const uint32_t movieStreamState = xmenMovieStreamState(m_rdram);
+            if (((movieStreamState >> 8u) & 0xFFu) >= 2u)
             {
-                std::fprintf(stderr,
-                             "[xmen-movie-dispatch] index=%u thread=%d invocations=%zu pc=0x%x ra=0x%x sp=0x%x basePc=0x%x baseRa=0x%x stream0=0x%x cycle=%llu\n",
-                             xmenMovieDispatchTraceCount - 1u,
-                             running->id,
-                             running->invocations.size(),
-                             context.pc,
-                             getRegU32(&context, 31),
-                             getRegU32(&context, 29),
-                             running->context.pc,
-                             getRegU32(&running->context, 31),
-                             movieStreamState,
-                             static_cast<unsigned long long>(m_eeCycle));
+                static uint32_t xmenMovieDispatchTraceCount = 0u;
+                if (xmenMovieDispatchTraceCount++ < 128u)
+                {
+                    std::fprintf(stderr,
+                                 "[xmen-movie-dispatch] index=%u thread=%d invocations=%zu pc=0x%x ra=0x%x sp=0x%x basePc=0x%x baseRa=0x%x stream0=0x%x cycle=%llu\n",
+                                 xmenMovieDispatchTraceCount - 1u,
+                                 running->id,
+                                 running->invocations.size(),
+                                 context.pc,
+                                 getRegU32(&context, 31),
+                                 getRegU32(&context, 29),
+                                 running->context.pc,
+                                 getRegU32(&running->context, 31),
+                                 movieStreamState,
+                                 static_cast<unsigned long long>(m_eeCycle));
+                }
             }
         }
         if (m_debugPublishCountdown == 0u)
@@ -454,7 +466,7 @@ void EeScheduler::run()
                 releaseInvocationStack(running->id, completedDepth);
                 running->invocations.pop_back();
                 static uint32_t invocationCompleteTraceCount = 0u;
-                if (invocationCompleteTraceCount++ < 128u)
+                if (xmenDiagnosticsEnabled() && invocationCompleteTraceCount++ < 128u)
                 {
                     std::fprintf(stderr,
                                  "[ee-invocation:complete] thread=%d kind=%u sequence=%llu remaining=%zu resumePc=0x%x resumeRa=0x%x\n",
@@ -491,7 +503,7 @@ void EeScheduler::run()
                              static_cast<unsigned long long>(m_eeCycle));
             }
             static uint32_t dormantTraceCount = 0u;
-            if (dormantTraceCount++ < 128u)
+            if (xmenDiagnosticsEnabled() && dormantTraceCount++ < 128u)
             {
                 std::fprintf(stderr,
                              "[ee-thread:dormant] id=%d entry=0x%x ra=0x%x sp=0x%x cycle=%llu\n",
@@ -511,7 +523,7 @@ void EeScheduler::run()
             const GuestInvocation &pending = m_pendingInvocations.front();
             if (pending.kind == GuestInvocationKind::Interrupt && !eeInterruptsEnabled(context))
             {
-                if (getRegU32(&pending.context, 4) == 1u)
+                if (xmenDiagnosticsEnabled() && getRegU32(&pending.context, 4) == 1u)
                 {
                     static uint32_t xmenVif1BlockedTraceCount = 0u;
                     if (xmenVif1BlockedTraceCount++ < 128u)
@@ -535,7 +547,7 @@ void EeScheduler::run()
                                      static_cast<unsigned long long>(m_eeCycle));
                     }
                 }
-                if (pending.context.pc == 0x002E63E0u &&
+                if (xmenDiagnosticsEnabled() && pending.context.pc == 0x002E63E0u &&
                     (m_runtime.memory().gs().csr.load(std::memory_order_relaxed) & 0x2u) != 0u)
                 {
                     static uint32_t xmenFinishBlockedTraceCount = 0u;
@@ -559,7 +571,8 @@ void EeScheduler::run()
             {
                 GuestInvocation invocation = std::move(m_pendingInvocations.front());
                 m_pendingInvocations.pop_front();
-                if (invocation.kind == GuestInvocationKind::Interrupt &&
+                if (xmenDiagnosticsEnabled() &&
+                    invocation.kind == GuestInvocationKind::Interrupt &&
                     getRegU32(&invocation.context, 4) == 1u)
                 {
                     std::fprintf(stderr,
@@ -642,9 +655,10 @@ void EeScheduler::run()
                          getRegU32(&context, 20),
                          getRegU32(&context, 21));
         }
-        if (context.pc == 0x00325AE0u || context.pc == 0x00325840u ||
-            context.pc == 0x00325890u || context.pc == 0x003258F8u ||
-            context.pc == 0x00158300u)
+        if (xmenDiagnosticsEnabled() &&
+            (context.pc == 0x00325AE0u || context.pc == 0x00325840u ||
+             context.pc == 0x00325890u || context.pc == 0x003258F8u ||
+             context.pc == 0x00158300u))
         {
             static std::atomic<uint32_t> s_xmenLayerResumeTraceCount{0u};
             const uint32_t count = s_xmenLayerResumeTraceCount.fetch_add(1u, std::memory_order_relaxed);
@@ -663,6 +677,26 @@ void EeScheduler::run()
                              getRegU32(&context, 20),
                              static_cast<unsigned long long>(m_eeCycle));
             }
+        }
+        const uint32_t xmenFastReturnDispatchPc = context.pc;
+        static const bool traceXmenFastReturnEnabled =
+            std::getenv("PS2X_TRACE_XMEN_FAST_RETURN") != nullptr;
+        const bool traceXmenFastReturnDispatch =
+            traceXmenFastReturnEnabled &&
+            (xmenFastReturnDispatchPc == 0x00420360u ||
+             xmenFastReturnDispatchPc == 0x003DF434u);
+        if (traceXmenFastReturnDispatch)
+        {
+            std::fprintf(stderr,
+                         "[xmen-fast-return] phase=scheduler-before thread=%d depth=%zu "
+                         "pc=0x%x ra=0x%x cycle=%llu checkpoint=%d reschedule=%d\n",
+                         running->id,
+                         running->invocations.size(),
+                         context.pc,
+                         getRegU32(&context, 31),
+                         static_cast<unsigned long long>(m_eeCycle),
+                         m_checkpointPending.load(std::memory_order_acquire) ? 1 : 0,
+                         m_rescheduleRequested ? 1 : 0);
         }
         PS2Runtime::RecompiledFunction function = m_runtime.lookupFunction(context.pc);
 
@@ -685,6 +719,17 @@ void EeScheduler::run()
 
         if (checkpointDue(kGuestDispatchCycles))
         {
+            if (traceXmenFastReturnDispatch)
+            {
+                std::fprintf(stderr,
+                             "[xmen-fast-return] phase=scheduler-checkpoint thread=%d "
+                             "pc=0x%x cycle=%llu checkpoint=%d reschedule=%d\n",
+                             running->id,
+                             context.pc,
+                             static_cast<unsigned long long>(m_eeCycle),
+                             m_checkpointPending.load(std::memory_order_acquire) ? 1 : 0,
+                             m_rescheduleRequested ? 1 : 0);
+            }
             if (traceXmenPollingDispatch)
             {
                 std::fprintf(stderr,
@@ -739,6 +784,21 @@ void EeScheduler::run()
             function(m_rdram, &context, &m_runtime);
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
+            if (traceXmenFastReturnDispatch)
+            {
+                std::fprintf(stderr,
+                             "[xmen-fast-return] phase=scheduler-after thread=%d depth=%zu "
+                             "beforePc=0x%x pc=0x%x ra=0x%x cycle=%llu checkpoint=%d "
+                             "reschedule=%d\n",
+                             running->id,
+                             running->invocations.size(),
+                             xmenFastReturnDispatchPc,
+                             context.pc,
+                             getRegU32(&context, 31),
+                             static_cast<unsigned long long>(m_eeCycle),
+                             m_checkpointPending.load(std::memory_order_acquire) ? 1 : 0,
+                             m_rescheduleRequested ? 1 : 0);
+            }
             if (traceXmenChainDispatch && xmenChainTraceIndex < 8192u)
             {
                 std::fprintf(stderr,
@@ -1844,7 +1904,8 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
 {
     assertExecutor();
     invocation.sequence = ++m_invocationSequence;
-    if (invocation.kind == GuestInvocationKind::Interrupt &&
+    if (xmenDiagnosticsEnabled() &&
+        invocation.kind == GuestInvocationKind::Interrupt &&
         getRegU32(&invocation.context, 4) == 1u)
     {
         const GuestThread *owner = currentThread();
@@ -2072,7 +2133,7 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     }
     std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)
               { return left.order < right.order; });
-    if (!dmac && cause == 0u &&
+    if (xmenDiagnosticsEnabled() && !dmac && cause == 0u &&
         (m_runtime.memory().gs().csr.load(std::memory_order_relaxed) & 0x2u) != 0u)
     {
         const GuestThread *interrupted = currentThread();
@@ -2090,7 +2151,7 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
                      static_cast<unsigned long long>(m_runtime.memory().gs().imr),
                      static_cast<unsigned long long>(m_eeCycle));
     }
-    if (dmac && cause == 1u)
+    if (xmenDiagnosticsEnabled() && dmac && cause == 1u)
     {
         static uint32_t vif1IrqTraceCount = 0u;
         const GuestThread *interrupted = currentThread();
@@ -2116,7 +2177,7 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
                          handler.order);
         }
     }
-    if (dmac && cause == 2u)
+    if (xmenDiagnosticsEnabled() && dmac && cause == 2u)
     {
         static uint32_t gifIrqDispatchTraceCount = 0u;
         const GuestThread *interrupted = currentThread();
@@ -2146,7 +2207,7 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
         ++gifIrqDispatchTraceCount;
     }
     static uint32_t irqTraceCount = 0u;
-    if (irqTraceCount++ < 128u)
+    if (xmenDiagnosticsEnabled() && irqTraceCount++ < 128u)
     {
         std::fprintf(stderr,
                      "[ee-irq:dispatch] kind=%s cause=%u registered=%zu matching=%zu cycle=%llu\n",
@@ -2160,7 +2221,7 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     {
         const GuestThread *interrupted = currentThread();
         static uint32_t irqQueueTraceCount = 0u;
-        if (irqQueueTraceCount++ < 128u)
+        if (xmenDiagnosticsEnabled() && irqQueueTraceCount++ < 128u)
         {
             std::fprintf(stderr,
                          "[ee-irq:queue] kind=%s cause=%u handler=0x%x current=%d activePc=0x%x basePc=0x%x depth=%zu\n",
@@ -2943,7 +3004,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         dispatchIrq(false, 3u);
         break;
     case EeEventType::Intc:
-        if (event.id == 0u &&
+        if (xmenDiagnosticsEnabled() && event.id == 0u &&
             (m_runtime.memory().gs().csr.load(std::memory_order_relaxed) & 0x2u) != 0u)
         {
             std::fprintf(stderr,

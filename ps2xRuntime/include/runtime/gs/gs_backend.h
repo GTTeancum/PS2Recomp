@@ -2,6 +2,7 @@
 
 #include "runtime/gs/gs_types.h"
 
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -12,6 +13,20 @@ struct GSRasterDebugCounters
     uint64_t frame140Submits = 0u;
     uint64_t otherFrameSubmits = 0u;
     uint64_t viewportVertices = 0u;
+    std::array<uint64_t, 7> primitiveSubmits{};
+    uint64_t fullViewportSprites = 0u;
+    uint64_t blackFullViewportSprites = 0u;
+    uint64_t lastWireframeSubmit = 0u;
+    uint64_t lastFullViewportSpriteSubmit = 0u;
+    uint32_t lastFullViewportSpriteFbp = 0u;
+    uint32_t lastFullViewportSpriteRgba = 0u;
+    uint32_t lastFullViewportSpriteFlags = 0u;
+    uint64_t wireframeEdges = 0u;
+    uint64_t wireframeVerifiedEdges = 0u;
+    uint64_t presents = 0u;
+    uint64_t lastPresentNonblackPixels = 0u;
+    uint32_t lastDisplayFbp = 0u;
+    uint32_t lastSourceFbp = 0u;
 };
 
 class GSRasterBackend

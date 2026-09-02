@@ -1007,6 +1007,48 @@ void register_ps2_gs_tests()
                      "with FBA enabled, CT32 writes should force the framebuffer alpha high bit");
         });
 
+        tc.Run("GS line clipping preserves interpolation from the original segment", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            constexpr uint64_t kFrame =
+                (1ull << 16) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint64_t kZbuf = (1ull << 32);
+            constexpr uint64_t kScissor =
+                (2ull << 0) |
+                (4ull << 16) |
+                (2ull << 32) |
+                (4ull << 48);
+            constexpr uint64_t kLinePrim =
+                static_cast<uint64_t>(GS_PRIM_LINE) |
+                (1ull << 3);
+
+            gs.writeRegister(GS_REG_FRAME_1, kFrame);
+            gs.writeRegister(GS_REG_ZBUF_1, kZbuf);
+            gs.writeRegister(GS_REG_SCISSOR_1, kScissor);
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_PRIM, kLinePrim);
+            gs.writeRegister(GS_REG_RGBAQ, 0x80000000ull);
+            gs.writeRegister(GS_REG_XYZ2, (48ull << 16));
+            gs.writeRegister(GS_REG_RGBAQ, 0x80000078ull);
+            gs.writeRegister(GS_REG_XYZ2, 96ull | (48ull << 16));
+
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 3u), 0u,
+                     "a line pixel left of the scissor should remain untouched");
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 2u, 3u), 0x80000028u,
+                     "the first clipped pixel should retain its original-segment color");
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 3u, 3u), 0x8000003Cu,
+                     "the middle clipped pixel should retain its original-segment color");
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 4u, 3u), 0x80000050u,
+                     "the last clipped pixel should retain its original-segment color");
+            t.Equals(readReferencePSMCT32Pixel(vram, 0u, 1u, 5u, 3u), 0u,
+                     "a line pixel right of the scissor should remain untouched");
+        });
+
         tc.Run("CT32 raster writes alias cleanly into later CT32 texture sampling", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
@@ -3893,6 +3935,73 @@ void register_ps2_gs_tests()
                      "a passing alpha test should write the framebuffer");
             t.Equals(result.depth, 0x11111111u,
                      "ZMSK should preserve depth");
+        });
+
+        tc.Run("GS clear sprites preserve independent framebuffer and depth masks", [](TestCase &t)
+        {
+            constexpr uint32_t kFrameBlock = 0u;
+            constexpr uint32_t kDepthBlock = 32u;
+            constexpr uint32_t kInitialColor = 0x11223344u;
+            constexpr uint32_t kClearColor = 0xA0B0C0D0u;
+            constexpr uint32_t kInitialDepth = 0x12345678u;
+            constexpr uint32_t kClearDepth = 0x87654321u;
+            constexpr uint64_t kScissor = (3ull << 16) | (1ull << 48);
+            constexpr uint64_t kTestAlways = (1ull << 16) | (1ull << 17);
+            constexpr uint64_t kXyz0 = 0ull;
+            constexpr uint64_t kXyz1 =
+                (4ull * 16ull) | ((2ull * 16ull) << 16) |
+                (static_cast<uint64_t>(kClearDepth) << 32);
+
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            for (uint32_t y = 0u; y < 2u; ++y)
+            {
+                for (uint32_t x = 0u; x < 4u; ++x)
+                {
+                    gs.WriteVram(GS_PSM_CT32, kFrameBlock, 1u, x, y, kInitialColor);
+                    gs.WriteVram(GS_PSM_Z32, kDepthBlock, 1u, x, y, kInitialDepth);
+                }
+            }
+
+            gs.writeRegister(GS_REG_SCISSOR_1, kScissor);
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, kTestAlways);
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
+            gs.writeRegister(GS_REG_RGBAQ, kClearColor);
+
+            gs.writeRegister(GS_REG_FRAME_1, (1ull << 16) | (UINT64_MAX << 32));
+            gs.writeRegister(GS_REG_ZBUF_1, 1ull);
+            gs.writeRegister(GS_REG_XYZ2, kXyz0);
+            gs.writeRegister(GS_REG_XYZ2, kXyz1);
+
+            for (uint32_t y = 0u; y < 2u; ++y)
+            {
+                for (uint32_t x = 0u; x < 4u; ++x)
+                {
+                    t.Equals(gs.ReadVram(GS_PSM_CT32, kFrameBlock, 1u, x, y), kInitialColor,
+                             "a fully masked clear sprite should preserve framebuffer color");
+                    t.Equals(gs.ReadVram(GS_PSM_Z32, kDepthBlock, 1u, x, y), kClearDepth,
+                             "a clear sprite with ZMSK disabled should replace depth");
+                    gs.WriteVram(GS_PSM_Z32, kDepthBlock, 1u, x, y, kInitialDepth);
+                }
+            }
+
+            gs.writeRegister(GS_REG_FRAME_1, 1ull << 16);
+            gs.writeRegister(GS_REG_ZBUF_1, 1ull | (1ull << 32));
+            gs.writeRegister(GS_REG_XYZ2, kXyz0);
+            gs.writeRegister(GS_REG_XYZ2, kXyz1);
+
+            for (uint32_t y = 0u; y < 2u; ++y)
+            {
+                for (uint32_t x = 0u; x < 4u; ++x)
+                {
+                    t.Equals(gs.ReadVram(GS_PSM_CT32, kFrameBlock, 1u, x, y), kClearColor,
+                             "an unmasked clear sprite should replace framebuffer color");
+                    t.Equals(gs.ReadVram(GS_PSM_Z32, kDepthBlock, 1u, x, y), kInitialDepth,
+                             "a clear sprite with ZMSK enabled should preserve depth");
+                }
+            }
         });
 
         tc.Run("GS DATE and DATM inspect the framebuffer-format alpha bit", [](TestCase &t)

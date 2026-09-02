@@ -2,10 +2,18 @@
 #include "Sync.h"
 #include "runtime/ee_scheduler.h"
 
+#include <cstdlib>
+
 namespace ps2_syscalls
 {
     namespace
     {
+        bool xmenDiagnosticsEnabled()
+        {
+            static const bool enabled = std::getenv("PS2X_XMEN_DIAGNOSTICS") != nullptr;
+            return enabled;
+        }
+
         constexpr uint32_t WEF_OR = 0x01u;
         constexpr uint32_t WEF_CLEAR = 0x10u;
         constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
@@ -39,7 +47,7 @@ namespace ps2_syscalls
             const int id = static_cast<int>(getRegU32(ctx, 4));
             const EeSemaphore *before = ee.semaphore(id);
             static uint32_t signalLogs = 0u;
-            if (signalLogs++ < 128u)
+            if (xmenDiagnosticsEnabled() && signalLogs++ < 128u)
             {
                 std::cerr << "[ee-sema:signal] id=" << id
                           << " count=" << (before ? before->count : -1)
@@ -97,7 +105,7 @@ namespace ps2_syscalls
                                                 param->attr,
                                                 param->option);
         static uint32_t createLogs = 0u;
-        if (createLogs++ < 64u)
+        if (xmenDiagnosticsEnabled() && createLogs++ < 64u)
         {
             std::cerr << "[ee-sema:create] id=" << result
                       << " init=" << param->init_count
@@ -136,7 +144,7 @@ namespace ps2_syscalls
         const int id = static_cast<int>(getRegU32(ctx, 4));
         const EeSemaphore *object = runtime->eeScheduler().semaphore(id);
         static uint32_t waitLogs = 0u;
-        if (waitLogs++ < 128u)
+        if (xmenDiagnosticsEnabled() && waitLogs++ < 128u)
         {
             std::cerr << "[ee-sema:wait] id=" << id
                       << " count=" << (object ? object->count : -1)

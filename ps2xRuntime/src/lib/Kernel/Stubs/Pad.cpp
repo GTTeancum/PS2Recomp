@@ -383,6 +383,45 @@ namespace ps2_stubs
                 }
             }
 
+            static const uint64_t autoMoveLeftStickTick = []()
+            {
+                const char *value = std::getenv("PS2X_AUTOMOVE_LEFT_STICK_AT_TICK");
+                return value ? std::strtoull(value, nullptr, 0) : 0u;
+            }();
+            static const uint64_t autoMoveLeftStickDuration = []()
+            {
+                const char *value = std::getenv("PS2X_AUTOMOVE_LEFT_STICK_TICKS");
+                return value ? std::strtoull(value, nullptr, 0) : 60u;
+            }();
+            static const uint8_t autoMoveLeftStickX = []()
+            {
+                const char *value = std::getenv("PS2X_AUTOMOVE_LEFT_STICK_X");
+                return value ? static_cast<uint8_t>(std::strtoul(value, nullptr, 0)) : 0xFFu;
+            }();
+            static const uint8_t autoMoveLeftStickY = []()
+            {
+                const char *value = std::getenv("PS2X_AUTOMOVE_LEFT_STICK_Y");
+                return value ? static_cast<uint8_t>(std::strtoul(value, nullptr, 0)) : kPadAnalogCenter;
+            }();
+            if (runtime && autoMoveLeftStickTick != 0u)
+            {
+                const uint64_t tick = runtime->eeScheduler().currentVSyncTick();
+                if (tick >= autoMoveLeftStickTick &&
+                    tick < autoMoveLeftStickTick + autoMoveLeftStickDuration)
+                {
+                    state.lx = autoMoveLeftStickX;
+                    state.ly = autoMoveLeftStickY;
+                    static std::atomic<bool> autoMoveLeftStickLogged{false};
+                    if (port == 0 && !autoMoveLeftStickLogged.exchange(true, std::memory_order_relaxed))
+                    {
+                        std::fprintf(stderr,
+                                     "[pad:auto-left-stick] port=%d tick=%llu read=%u lx=0x%02x ly=0x%02x\n",
+                                     port, static_cast<unsigned long long>(tick),
+                                     portState.readCount, state.lx, state.ly);
+                    }
+                }
+            }
+
             static const uint32_t readLogInterval = []()
             {
                 const char *value = std::getenv("PS2X_PAD_READ_LOG_INTERVAL");
@@ -391,9 +430,11 @@ namespace ps2_stubs
             if (runtime && port == 0 && readLogInterval != 0u &&
                 (portState.readCount % readLogInterval) == 0u)
             {
-                std::fprintf(stderr, "[pad:read] tick=%llu read=%u buttons=0x%04x\n",
+                std::fprintf(stderr,
+                             "[pad:read] tick=%llu read=%u buttons=0x%04x lx=0x%02x ly=0x%02x rx=0x%02x ry=0x%02x\n",
                              static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()),
-                             portState.readCount, state.buttons);
+                             portState.readCount, state.buttons,
+                             state.lx, state.ly, state.rx, state.ry);
             }
 
             fillPadStatus(outData, state, portState);
