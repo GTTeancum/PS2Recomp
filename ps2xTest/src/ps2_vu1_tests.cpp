@@ -877,6 +877,52 @@ void register_ps2_vu1_tests()
                      "ILW-to-IALU dependency should account for all stalled cycles");
         });
 
+        tc.Run("integer dependency masks cover every VI source and destination", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+            if (!fx.code || !fx.data)
+                return;
+            const uint32_t first = 100u, second = 200u;
+            std::memcpy(fx.data, &first, sizeof(first));
+            std::memcpy(fx.data + 16u, &second, sizeof(second));
+            for (uint8_t left = 0u; left < 16u; ++left)
+            {
+                for (uint8_t right = 0u; right < 16u; ++right)
+                {
+                    const uint8_t dest = (left + right) & 15u;
+                    writeTrackedVuInstructionPair(fx, 0u, makeVuIlw(0x8u, left, 0u, 0), kVuUpperNop);
+                    writeTrackedVuInstructionPair(fx, 8u, makeVuIlw(0x8u, right, 0u, 1), kVuUpperNop);
+                    writeTrackedVuInstructionPair(fx, 16u, makeVuLowerDirect(0x30u, left, right, dest),
+                                                  kVuUpperNop | 0x40000000u);
+                    writeTrackedVuInstructionPair(fx, 24u, 0u, kVuUpperNop);
+                    VU1Interpreter vu;
+                    for (uint32_t reg = 1u; reg < 16u; ++reg)
+                        vu.state().vi[reg] = static_cast<int32_t>(reg * 7u);
+                    vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
+                               fx.gs, &fx.mem, 0u, 0u, 0u, 64u);
+                    const int32_t leftValue = left == 0u ? 0 : (left == right ? 200 : 100);
+                    const int32_t rightValue = right == 0u ? 0 : 200;
+                    for (uint32_t reg = 0u; reg < 16u; ++reg)
+                    {
+                        int32_t expected = static_cast<int32_t>(reg * 7u);
+                        if (reg == left)
+                            expected = 100;
+                        if (reg == right)
+                            expected = 200;
+                        if (reg == dest)
+                            expected = leftValue + rightValue;
+                        if (reg == 0u)
+                            expected = 0;
+                        t.Equals(vu.state().vi[reg], expected, "Only the named VI registers may change");
+                    }
+                    const uint64_t expectedCycles = right != 0u ? 7u : (left != 0u ? 6u : 4u);
+                    t.Equals(vu.state().cycles, expectedCycles, "IADD must wait for its latest nonzero VI input");
+                    t.Equals(vu.state().pc, 32u, "The end-bit delay slot must complete");
+                }
+            }
+        });
+
         tc.Run("DIV and SQRT update the Q register from selected vector components", [](TestCase &t)
         {
             Vu1Fixture fx;
