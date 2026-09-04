@@ -9,6 +9,12 @@
 class GS;
 class PS2Memory;
 
+#if defined(PS2X_BUILD_VU_NATIVE_UPPER)
+#define PS2X_VU_ARITH_INLINE inline
+#else
+#define PS2X_VU_ARITH_INLINE
+#endif
+
 struct VU1State
 {
     float vf[32][4];
@@ -65,6 +71,19 @@ public:
     const VU1State &state() const { return m_state; }
     [[nodiscard]] bool isRunning() const { return m_running; }
 
+#if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
+    using UpperKernel = void (*)(VU1Interpreter *);
+    using UpperLookup = UpperKernel (*)(uint32_t);
+    // The caller owns the module and must detach before unloading it.
+    void setUpperLookup(UpperLookup lookup)
+    {
+        m_upperLookup = lookup;
+        m_decodedCodeCacheValid = false;
+    }
+    struct UpperCounters { uint64_t native = 0; uint64_t interpreted = 0; };
+    UpperCounters upperCounters() const { return m_upperCounters; }
+#endif
+
     struct DebugCounters
     {
         uint64_t executions = 0u;
@@ -85,6 +104,9 @@ public:
 
 private:
     friend class VUReplay;
+#if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
+    friend struct VUNativeAccess;
+#endif
 
     enum Pipeline : uint8_t
     {
@@ -138,6 +160,9 @@ private:
         bool tBit = false;
         uint8_t upperVfShadowReg = 0;
         uint8_t suppressedLowerVf = 0;
+#if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
+        UpperKernel upperKernel = nullptr;
+#endif
     };
 
     struct FlagPipelineEntry
@@ -231,6 +256,10 @@ private:
     uint32_t m_cachedCodeSize = 0;
     uint64_t m_cachedCodeGeneration = 0;
     bool m_decodedCodeCacheValid = false;
+#if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
+    UpperLookup m_upperLookup = nullptr;
+    UpperCounters m_upperCounters{};
+#endif
 
     std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
     ScalarPipelineEntry m_fdiv{};
@@ -286,17 +315,33 @@ private:
     DecodedInstructionPair getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
     void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory, uint64_t generation);
 
-    void execUpper(uint32_t instr);
+    PS2X_VU_ARITH_INLINE void execUpper(uint32_t instr);
+#if defined(PS2X_BUILD_VU_NATIVE_UPPER)
+    template <uint32_t Word> void execUpperNative();
+#endif
+    void execDecodedUpper(const DecodedInstructionPair &decoded)
+    {
+#if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
+        if (decoded.upperKernel)
+        {
+            ++m_upperCounters.native;
+            decoded.upperKernel(this);
+            return;
+        }
+        ++m_upperCounters.interpreted;
+#endif
+        execUpper(decoded.upper);
+    }
     void execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);
 
-    void applyDest(float *dst, const float *result, uint8_t dest);
-    void applyDestAcc(const float *result, uint8_t dest);
-    void applyFmacDest(float *dst, float *result, uint8_t dest);
-    void applyFmacDestAcc(float *result, uint8_t dest);
-    void normalizeFmacResult(float *result, uint8_t dest, uint8_t laneFlags[4]);
-    bool calculateFmacExactResult(uint32_t component, long double &result) const;
-    uint8_t normalizeFmacExactResult(float &value, long double exactResult) const;
-    uint32_t calculateFmacProductSticky(uint8_t dest) const;
+    PS2X_VU_ARITH_INLINE void applyDest(float *dst, const float *result, uint8_t dest);
+    PS2X_VU_ARITH_INLINE void applyDestAcc(const float *result, uint8_t dest);
+    PS2X_VU_ARITH_INLINE void applyFmacDest(float *dst, float *result, uint8_t dest);
+    PS2X_VU_ARITH_INLINE void applyFmacDestAcc(float *result, uint8_t dest);
+    PS2X_VU_ARITH_INLINE void normalizeFmacResult(float *result, uint8_t dest, uint8_t laneFlags[4]);
+    PS2X_VU_ARITH_INLINE bool calculateFmacExactResult(uint32_t component, long double &result) const;
+    PS2X_VU_ARITH_INLINE uint8_t normalizeFmacExactResult(float &value, long double exactResult) const;
+    PS2X_VU_ARITH_INLINE uint32_t calculateFmacProductSticky(uint8_t dest) const;
     void updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky);
     void queueFsset(uint16_t immediate);
     void queueClip(uint32_t clip);
@@ -320,7 +365,7 @@ private:
     void markPairWrites(const DecodedInstructionPair &decoded);
     bool pipelinesPending() const;
 
-    float normalizeOperand(float value) const
+    PS2X_VU_ARITH_INLINE float normalizeOperand(float value) const
     {
         uint32_t bits = 0;
         std::memcpy(&bits, &value, sizeof(bits));
@@ -332,15 +377,16 @@ private:
         std::memcpy(&value, &bits, sizeof(value));
         return value;
     }
-    float normalizeResult(float value, uint32_t &laneFlags) const;
+    PS2X_VU_ARITH_INLINE float normalizeResult(float value, uint32_t &laneFlags) const;
     uint32_t microAddressMask() const;
     int32_t readBranchVi(uint8_t reg) const;
     void recordViWriteForBranch(uint8_t reg, int32_t oldValue);
     void reportReservedInstruction(bool upper, uint32_t instruction);
-    float broadcast(const float *vf, uint8_t bc)
+    PS2X_VU_ARITH_INLINE float broadcast(const float *vf, uint8_t bc)
     {
         return normalizeOperand(vf[bc & 3u]);
     }
 };
 
+#undef PS2X_VU_ARITH_INLINE
 #endif

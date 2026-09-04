@@ -604,6 +604,8 @@ EnableX86SimdBaseline(ps2_runtime)
 EnableFastReleaseMode(ps2_runtime)
 EnableFastReleaseMode(ps2EntryRunner)
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VUNativeUpper.cmake")
+
 if(WIN32 AND NOT PS2X_SHOW_WINDOWS_CONSOLE)
     if(MSVC)
         target_link_options(ps2EntryRunner PRIVATE

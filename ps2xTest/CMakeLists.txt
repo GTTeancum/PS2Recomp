@@ -82,6 +82,14 @@ if(UNIX AND NOT APPLE)
     target_link_libraries(ps2_test_lib PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
+if(TARGET ps2_vu_native_upper)
+    target_link_libraries(ps2_test_function_table PRIVATE ps2_runtime)
+    target_sources(ps2_test_lib PRIVATE src/vu_native_module.cpp)
+    target_compile_definitions(ps2_test_lib PRIVATE
+        PS2X_TEST_VU_NATIVE_MODULE="$<TARGET_FILE:ps2_vu_native_upper>")
+    add_dependencies(ps2_test_lib ps2_vu_native_upper)
+endif()
+
 if(TARGET ps2_iop_fake_plugin)
     target_compile_definitions(ps2_test_lib PRIVATE
         PS2X_TEST_IOP_PLUGIN_DIR="$<TARGET_FILE_DIR:ps2_iop_fake_plugin>"

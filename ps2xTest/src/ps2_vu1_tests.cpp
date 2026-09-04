@@ -1,5 +1,8 @@
 #include "MiniTest.h"
 #include "ReplaySampler.h"
+#if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
+#include "VUNativeModule.h"
+#endif
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
@@ -223,6 +226,141 @@ void register_ps2_vu1_tests()
 {
     MiniTest::Case("PS2VU1", [](TestCase &tc)
     {
+#if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
+        tc.Run("native VU upper module rejects incompatible hosts and reloads", [](TestCase &t)
+        {
+            const auto host = VUNative::makeHost();
+            VUNativeModule relative("ps2_vu_native_upper.dll");
+            t.IsTrue(relative.initialize(host) == nullptr, "Relative module paths must not load");
+            for (uint32_t attempt = 0; attempt < 2u; ++attempt)
+            {
+                VUNativeModule module(PS2X_TEST_VU_NATIVE_MODULE);
+                auto bad = host;
+                ++bad.version;
+                t.IsTrue(module.initialize(bad) == nullptr, "Reject a different interface version");
+                bad = host;
+                ++bad.interpreterBytes;
+                t.IsTrue(module.initialize(bad) == nullptr, "Reject a different interpreter layout");
+                bad = host;
+                bad.fingerprint[0] ^= 1;
+                t.IsTrue(module.initialize(bad) == nullptr, "Reject a stale source fingerprint");
+                bad = host;
+                bad.configuration[0] ^= 1;
+                t.IsTrue(module.initialize(bad) == nullptr, "Reject a different build configuration");
+                bad = host;
+                bad.fmac = nullptr;
+                t.IsTrue(module.initialize(bad) == nullptr, "Reject missing callbacks");
+                t.IsTrue(module.initialize(host, sizeof(host) - 1u) == nullptr, "Reject a truncated interface");
+                auto lookup = module.initialize(host);
+                t.IsTrue(lookup != nullptr, "Matching module must initialize and reload");
+                if (lookup)
+                {
+                    t.IsTrue(lookup(kVuUpperNop) != nullptr, "Synthetic NOP kernel must exist");
+                    t.IsTrue(lookup(0xffffffffu) == nullptr, "Unknown words must fall back");
+                }
+            }
+        });
+
+        tc.Run("native VU upper kernels reproduce arithmetic boundary replays", [](TestCase &t)
+        {
+            VUNativeModule module(PS2X_TEST_VU_NATIVE_MODULE);
+            const auto lookup = module.initialize(VUNative::makeHost());
+            t.IsTrue(lookup != nullptr, "Native arithmetic module must load");
+            if (!lookup)
+                return;
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+            if (!fx.code || !fx.data)
+                return;
+            constexpr uint32_t words[] = {
+#define VU_NATIVE_WORD(Word) Word,
+#include "../../ps2xRuntime/src/lib/vu/ps2_vu1_native_synthetic.inc"
+#undef VU_NATIVE_WORD
+            };
+            constexpr uint32_t values[] = {
+                0u, 0x80000000u, 1u, 0x807fffffu, 0x00800000u, 0x80800000u,
+                0x7f7fffffu, 0xff7fffffu, 0x7f800000u, 0xff800000u,
+                0x7fc01234u, 0x3f800000u, 0xc0000000u, 0x3f000001u,
+                0x4f000000u, 0xcf000000u
+            };
+            for (uint32_t sample = 0; sample < std::size(values); ++sample)
+            {
+                std::ostringstream recorded(std::ios::binary);
+                for (const uint32_t word : words)
+                {
+                    t.IsTrue(lookup(word) != nullptr, "Every synthetic instruction needs a native kernel");
+                    writeTrackedVuInstructionPair(fx, 0u, makeVuLowerSpecial(0x30u, 0u), word);
+                    writeTrackedVuInstructionPair(fx, 8u, 0u, kVuUpperNop | 0x40000000u);
+                    writeTrackedVuInstructionPair(fx, 16u, 0u, kVuUpperNop);
+                    VU1Interpreter vu;
+                    for (uint32_t reg = 1; reg < 32u; ++reg)
+                        for (uint32_t lane = 0; lane < 4u; ++lane)
+                        {
+                            const auto bits = values[(sample + reg * 3u + lane) % std::size(values)];
+                            std::memcpy(&vu.state().vf[reg][lane], &bits, sizeof(bits));
+                        }
+                    std::memcpy(vu.state().acc, vu.state().vf[4], sizeof(vu.state().acc));
+                    vu.state().q = vu.state().vf[5][0];
+                    vu.state().i = vu.state().vf[6][0];
+                    vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
+                               fx.gs, &fx.mem, 0u, 0u, 0u, 0u);
+                    t.IsTrue(VUReplay::record(recorded, vu, fx.code, fx.data, fx.gs, &fx.mem, 16u),
+                             "Synthetic arithmetic must record without overflow");
+                }
+                std::istringstream input(recorded.str(), std::ios::binary);
+                const auto result = VUReplay::replay(input, 2u, nullptr, lookup);
+                t.IsTrue(result.error.empty(), "Boundary sample " + std::to_string(sample) + ": " + result.error);
+                t.Equals(result.cases, static_cast<uint32_t>(std::size(words)), "Every kernel must replay");
+                t.IsTrue(result.nativeUpper != 0u && result.interpretedUpper == 0u,
+                         "The boundary replay must use native kernels exclusively");
+                if (!result.error.empty())
+                    return;
+            }
+        });
+
+        tc.Run("native VU provider switches invalidate decode cache and preserve fallback", [](TestCase &t)
+        {
+            VUNativeModule module(PS2X_TEST_VU_NATIVE_MODULE);
+            const auto lookup = module.initialize(VUNative::makeHost());
+            t.IsTrue(lookup != nullptr, "Native arithmetic module must load");
+            if (!lookup)
+                return;
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+            if (!fx.code || !fx.data)
+                return;
+            writeTrackedVuInstructionPair(fx, 0u, 0u, kVuUpperNop | 0x40000000u);
+            writeTrackedVuInstructionPair(fx, 8u, 0u, kVuUpperNop);
+            VU1Interpreter vu;
+            const auto run = [&] {
+                vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
+                           fx.gs, &fx.mem, 0u, 0u, 0u, 32u);
+            };
+            run();
+            t.Equals(vu.upperCounters().native, uint64_t{0}, "Default provider is interpreted");
+            vu.setUpperLookup(lookup);
+            run();
+            t.IsTrue(vu.upperCounters().native > 0u, "Attaching provider invalidates an existing cache");
+            const auto attached = vu.upperCounters();
+            vu.setUpperLookup(nullptr);
+            run();
+            t.Equals(vu.upperCounters().native, attached.native, "Detach removes cached native pointers");
+            t.IsTrue(vu.upperCounters().interpreted > attached.interpreted, "Detached VU interprets again");
+            vu.setUpperLookup(lookup);
+            const uint32_t fallbackWord = makeVuUpper(0x28u, 0xFu, 31u, 31u, 31u);
+            t.IsTrue(lookup(fallbackWord) == nullptr, "Fallback test word must not be compiled");
+            writeTrackedVuInstructionPair(fx, 0u, 0u, fallbackWord);
+            writeTrackedVuInstructionPair(fx, 8u, 0u, kVuUpperNop | 0x40000000u);
+            writeTrackedVuInstructionPair(fx, 16u, 0u, kVuUpperNop);
+            vu.state().vf[31][0] = 7.0f;
+            const auto beforeFallback = vu.upperCounters();
+            run();
+            t.Equals(vu.state().vf[31][0], 14.0f, "Unknown arithmetic must execute through the interpreter");
+            t.Equals(vu.upperCounters().interpreted, beforeFallback.interpreted + 1u,
+                     "Code edits must invalidate the native selection at that PC");
+            vu.setUpperLookup(nullptr);
+        });
+#endif
         if (const char *path = std::getenv("PS2X_VU_REPLAY_FILE"))
         {
             tc.Run("recorded VU slices reproduce state memory and graphics packets", [path = std::string(path)](TestCase &t)
@@ -239,12 +377,38 @@ void register_ps2_vu1_tests()
                     repeats = static_cast<uint32_t>(parsed);
                 }
                 std::ifstream input(path, std::ios::binary);
+                const char *exportPath = std::getenv("PS2X_VU_REPLAY_UPPER_EXPORT");
+                std::vector<VUReplay::UpperSample> upperSamples;
                 VUReplay::Result result;
+#if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
+                VUNativeModule module(PS2X_TEST_VU_NATIVE_MODULE);
+                VU1Interpreter::UpperLookup lookup = nullptr;
+                if (std::getenv("PS2X_VU_REPLAY_NATIVE"))
+                {
+                    lookup = module.initialize(VUNative::makeHost());
+                    t.IsTrue(lookup != nullptr, "Native module must match this host build");
+                    if (!lookup)
+                        return;
+                }
+#endif
                 {
                     ReplaySampler sampler(std::getenv("PS2X_VU_REPLAY_PROFILE") != nullptr);
-                    result = VUReplay::replay(input, repeats);
+                    result = VUReplay::replay(input, repeats, exportPath ? &upperSamples : nullptr
+#if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
+                                             , lookup
+#endif
+                                             );
                 }
                 t.IsTrue(result.error.empty(), result.error);
+                std::printf("[vu-replay:upper-coverage] native=%llu interpreted=%llu includes-cold-pass=1\n",
+                            static_cast<unsigned long long>(result.nativeUpper),
+                            static_cast<unsigned long long>(result.interpretedUpper));
+                if (exportPath && result.error.empty())
+                {
+                    std::ofstream output(exportPath);
+                    t.IsTrue(VUReplay::writeUpperKernels(output, upperSamples, 128u), "Native instruction export must succeed");
+                    std::printf("[vu-replay:upper-export] candidates=%zu limit=128 fetch-counts-include-stalls=1\n", upperSamples.size());
+                }
                 for (size_t index = 0; index < result.timings.size(); ++index)
                 {
                     const auto &entry = result.timings[index];
@@ -283,10 +447,17 @@ void register_ps2_vu1_tests()
             t.Equals(vu.state().vf[3][0], 10.0f, "Recording must execute the actual pending FMAC");
             t.Equals(vu.state().q, 4.0f, "Recording must execute the actual pending DIV");
             std::istringstream input(output.str(), std::ios::binary);
-            const auto result = VUReplay::replay(input, 3u);
+            std::vector<VUReplay::UpperSample> upperSamples;
+            const auto result = VUReplay::replay(input, 3u, &upperSamples);
             t.IsTrue(result.error.empty(), result.error);
             t.Equals(result.cases, 1u, "One arithmetic slice must replay");
             t.Equals(result.iterations, uint64_t{3u}, "All measured repeats must agree");
+            t.IsTrue(!upperSamples.empty(), "One-cycle replay must identify upper instructions");
+            std::ostringstream kernels;
+            t.IsTrue(VUReplay::writeUpperKernels(kernels, upperSamples, 128u), "Synthetic native recipe must be written");
+            t.IsTrue(kernels.str().find("VU_NATIVE_WORD(0x000002ffu)") != std::string::npos, "Recipe must include the reached NOP");
+            t.IsTrue(!VUReplay::writeUpperKernels(kernels, upperSamples, 0u), "Zero kernel limit must be rejected");
+            t.IsTrue(!VUReplay::writeUpperKernels(kernels, upperSamples, 513u), "Unbounded kernel limits must be rejected");
 
             auto truncated = output.str();
             truncated.pop_back();

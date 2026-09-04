@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <type_traits>
@@ -381,9 +383,17 @@ bool VUReplay::captureSlice(VU1Interpreter &vu, uint8_t *code, uint32_t codeSize
     return true;
 }
 
-VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats)
+VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
+                                 std::vector<UpperSample> *upperSamples
+#if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
+                                 , VU1Interpreter::UpperLookup upperLookup
+#endif
+                                 )
 {
     Result result;
+    std::map<uint32_t, uint64_t> fetches;
+    if (upperSamples)
+        upperSamples->clear();
     try
     {
         require(repeats > 0u && repeats <= 4096u, "Invalid VU replay repetition count");
@@ -392,6 +402,9 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats)
         GS gs;
         gs.init(memory->getGSVRAM(), PS2_GS_VRAM_SIZE, &memory->gs());
         auto vu = std::make_unique<VU1Interpreter>();
+#if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
+        vu->setUpperLookup(upperLookup);
+#endif
         size_t totalBytes = 0;
         uint64_t totalCycles = 0;
         while (input.peek() != std::char_traits<char>::eof())
@@ -443,8 +456,31 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats)
                 const auto start = std::chrono::steady_clock::now();
                 {
                     ContextScope scope(context);
-                    vu->run(memory->getVU1Code(), PS2_VU1_CODE_SIZE,
-                            memory->getVU1Data(), PS2_VU1_DATA_SIZE, gs, memory.get(), record.maxCycles);
+                    if (upperSamples && iteration == 0u && elapsedCycles != 0u)
+                    {
+                        const auto budgetEnd = initialCycle + record.maxCycles;
+                        do
+                        {
+                            if (vu->m_state.pc + 8u <= PS2_VU1_CODE_SIZE)
+                            {
+                                uint32_t upper = 0;
+                                std::memcpy(&upper, memory->getVU1Code() + vu->m_state.pc + 4u, sizeof(upper));
+                                if (!vu->decodeUpperUsage(upper).reserved)
+                                    ++fetches[upper];
+                                require(fetches.size() <= 4096u, "Too many VU upper instruction candidates");
+                            }
+                            const auto beforeCycle = vu->m_cycle;
+                            vu->run(memory->getVU1Code(), PS2_VU1_CODE_SIZE,
+                                    memory->getVU1Data(), PS2_VU1_DATA_SIZE, gs, memory.get(), 1u);
+                            if (!vu->m_running || vu->m_cycle == beforeCycle)
+                                break;
+                        } while (vu->m_cycle < budgetEnd);
+                    }
+                    else
+                    {
+                        vu->run(memory->getVU1Code(), PS2_VU1_CODE_SIZE,
+                                memory->getVU1Data(), PS2_VU1_DATA_SIZE, gs, memory.get(), record.maxCycles);
+                    }
                 }
                 const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - start).count();
@@ -476,10 +512,40 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats)
             ++result.cases;
         }
         require(result.cases != 0u && !input.bad(), "Empty or unreadable VU replay file");
+#if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
+        result.nativeUpper = vu->upperCounters().native;
+        result.interpretedUpper = vu->upperCounters().interpreted;
+#endif
+        if (upperSamples)
+        {
+            for (const auto &[instruction, count] : fetches)
+                upperSamples->push_back({instruction, count});
+            std::sort(upperSamples->begin(), upperSamples->end(), [](const auto &left, const auto &right)
+            {
+                return left.fetches != right.fetches ? left.fetches > right.fetches
+                                                    : left.instruction < right.instruction;
+            });
+        }
     }
     catch (const std::exception &error)
     {
         result.error = error.what();
     }
     return result;
+}
+
+bool VUReplay::writeUpperKernels(std::ostream &output,
+                                const std::vector<UpperSample> &samples, uint32_t limit)
+{
+    if (limit == 0u || limit > 512u || samples.empty())
+        return false;
+    const auto flags = output.flags();
+    const auto fill = output.fill();
+    output << "// Private replay-derived VU instructions. Do not redistribute.\n";
+    for (size_t i = 0; i < std::min<size_t>(limit, samples.size()); ++i)
+        output << "VU_NATIVE_WORD(0x" << std::hex << std::setw(8) << std::setfill('0')
+               << samples[i].instruction << "u)\n";
+    output.flags(flags);
+    output.fill(fill);
+    return static_cast<bool>(output);
 }

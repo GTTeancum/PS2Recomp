@@ -23,8 +23,14 @@ namespace
 // ============================================================================
 // Upper instructions (FMAC pipeline)
 // ============================================================================
+#if defined(PS2X_BUILD_VU_NATIVE_UPPER)
+template <uint32_t Word> void VU1Interpreter::execUpperNative()
+{
+    constexpr uint32_t instr = Word;
+#else
 void VU1Interpreter::execUpper(uint32_t instr)
 {
+#endif
 #if defined(PS2X_ENABLE_VU_DETAIL_PROFILE)
     RuntimeProfile::Scope profile(RuntimeProfile::Phase::VuUpper, RuntimeProfile::sampleVu);
 #endif
