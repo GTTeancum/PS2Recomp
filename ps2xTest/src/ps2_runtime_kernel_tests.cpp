@@ -4,6 +4,7 @@
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/runtime_profile.h"
 
 #include <array>
 #include <atomic>
@@ -548,6 +549,54 @@ void register_ps2_runtime_kernel_tests()
 {
     MiniTest::Case("PS2RuntimeKernel", [](TestCase &tc)
     {
+        tc.Run("Runtime phase profiler subtracts nested work and unwinds exceptions", [](TestCase &t)
+        {
+            using namespace RuntimeProfile;
+            const State saved = state;
+            state = {};
+            {
+                Scope parent(Phase::Guest, true);
+                try
+                {
+                    Scope child(Phase::Vu, true);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    throw 1;
+                }
+                catch (int)
+                {
+                }
+                t.IsTrue(state.active == &parent, "Exception unwinding must restore the parent scope");
+            }
+            const Totals parent = state.totals[static_cast<size_t>(Phase::Guest)];
+            const Totals child = state.totals[static_cast<size_t>(Phase::Vu)];
+            t.Equals(parent.calls, uint64_t{1}, "The parent should be counted once");
+            t.Equals(child.calls, uint64_t{1}, "The child should be counted despite throwing");
+            t.IsTrue(child.inclusiveNs > 0u, "The child must contain a measurable duration");
+            t.Equals(child.inclusiveNs, child.exclusiveNs, "A leaf has no child time to subtract");
+            t.Equals(parent.inclusiveNs, parent.exclusiveNs + child.inclusiveNs,
+                     "Exclusive durations must not count nested work twice");
+            t.IsTrue(state.active == nullptr, "All scopes must be closed");
+            state = saved;
+        });
+
+        tc.Run("Runtime phase profiler is inert when disabled and isolated by thread", [](TestCase &t)
+        {
+            using namespace RuntimeProfile;
+            const State saved = state;
+            state = {};
+            {
+                Scope disabled(Phase::Gs, false);
+                t.IsTrue(state.active == nullptr, "A disabled scope must not alter the active stack");
+            }
+            t.Equals(state.totals[static_cast<size_t>(Phase::Gs)].calls, uint64_t{0},
+                     "Disabled scopes must not collect samples");
+            std::thread worker([] { Scope child(Phase::Vu, true); });
+            worker.join();
+            t.Equals(state.totals[static_cast<size_t>(Phase::Vu)].calls, uint64_t{0},
+                     "Another thread must not alter this thread's counters");
+            state = saved;
+        });
+
         tc.Run("CreateThread and CreateSema decode the exact PS2SDK EE layouts", [](TestCase &t)
         {
             TestEnv env;

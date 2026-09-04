@@ -1,4 +1,5 @@
 #include "runtime/ps2_vu1.h"
+#include "runtime/runtime_profile.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_memory.h"
@@ -2856,6 +2857,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                          uint8_t *vuData, uint32_t dataSize,
                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
 {
+    RuntimeProfile::Scope vuProfile(RuntimeProfile::Phase::Vu);
     struct BudgetTraceEntry
     {
         uint32_t pc = 0;

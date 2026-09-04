@@ -1,4 +1,5 @@
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/runtime_profile.h"
 #include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_psmct16.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
@@ -1292,6 +1293,7 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
 
 void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
 {
+    RuntimeProfile::Scope gsProfile(RuntimeProfile::Phase::Gs);
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_vram || batch.vertexCount == 0u)
     {
@@ -1690,6 +1692,25 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
         batch.debugPresentCount >= 100u && batch.state.prim.type == GS_PRIM_SPRITE;
     const bool rasterEnabled =
         !skipCpuRaster && batch.debugPresentCount >= skipCpuRasterBeforePresent;
+    static const uint32_t verifyDepthPresent = []
+    {
+        const char *value = std::getenv("PS2X_GS_VERIFY_EARLY_DEPTH_PRESENT");
+        if (!value)
+            return UINT32_MAX;
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 10);
+        return end != value && *end == '\0' ? static_cast<uint32_t>(parsed) : UINT32_MAX;
+    }();
+    static thread_local uint64_t verifiedDepthBatches = 0u;
+    static thread_local uint64_t mismatchedDepthBatches = 0u;
+    if (verifiedDepthBatches != 0u && batch.debugPresentCount != verifyDepthPresent)
+    {
+        std::fprintf(stderr, "[gs:early-depth-verify] present=%u batches=%llu mismatches=%llu complete=1\n",
+                     verifyDepthPresent, static_cast<unsigned long long>(verifiedDepthBatches),
+                     static_cast<unsigned long long>(mismatchedDepthBatches));
+        verifiedDepthBatches = 0u;
+        mismatchedDepthBatches = 0u;
+    }
     struct CpuRasterFrameProfile
     {
         uint32_t present = UINT32_MAX;
@@ -1749,6 +1770,41 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
             DrawWhiteWireframe(batch);
             if (m_debugWireframeEdgeCount.load(std::memory_order_relaxed) != edgeCountBefore)
                 m_debugLastWireframeSubmit.store(submitOrdinal, std::memory_order_relaxed);
+        }
+        else if (batch.debugPresentCount == verifyDepthPresent && !s_xmenActiveRasterProbe &&
+                 batch.vertexCount >= 3u &&
+                 (batch.state.prim.type == GS_PRIM_TRIANGLE ||
+                  batch.state.prim.type == GS_PRIM_TRISTRIP ||
+                  batch.state.prim.type == GS_PRIM_TRIFAN))
+        {
+            // Replay the same draw in private VRAM, including texture/frame/depth aliasing.
+            static thread_local std::vector<uint8_t> referenceVram;
+            static thread_local GSCpuBackend referenceBackend;
+            if (referenceVram.size() != m_vramSize)
+            {
+                referenceVram.resize(m_vramSize);
+                referenceBackend.Initialize(referenceVram.data(), m_vramSize);
+            }
+            std::memcpy(referenceVram.data(), m_vram, m_vramSize);
+            referenceBackend.m_clutCache = m_clutCache;
+            referenceBackend.m_clutCbp = m_clutCbp;
+            DrawTriangle(batch);
+            referenceBackend.DrawTriangle(batch, false);
+            ++verifiedDepthBatches;
+            if (std::memcmp(m_vram, referenceVram.data(), m_vramSize) != 0)
+            {
+                ++mismatchedDepthBatches;
+                if (mismatchedDepthBatches <= 8u)
+                {
+                    const auto mismatch = std::mismatch(referenceVram.begin(), referenceVram.end(), m_vram);
+                    const auto offset = static_cast<size_t>(mismatch.first - referenceVram.begin());
+                    std::fprintf(stderr,
+                                 "[gs:early-depth-mismatch] present=%u batch=%llu offset=%zu expected=%u actual=%u\n",
+                                 batch.debugPresentCount, static_cast<unsigned long long>(verifiedDepthBatches),
+                                 offset, static_cast<unsigned>(referenceVram[offset]),
+                                 static_cast<unsigned>(m_vram[offset]));
+                }
+            }
         }
         else
             DrawPrimitive(batch);
@@ -3731,7 +3787,7 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
     }
 }
 
-void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, bool allowEarlyDepth)
 {
     const GSDrawState &state = batch.state;
     const GSVertex &v0 = batch.vertices[0];
@@ -3778,6 +3834,14 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
     const float w2StepX = -w0StepX - w1StepX;
     const float startPx = static_cast<float>(minX) + 0.5f;
     constexpr float kEdgeEpsilon = 1.0e-4f;
+    static const bool disableEarlyDepth =
+        std::getenv("PS2X_GS_DISABLE_EARLY_DEPTH") != nullptr;
+    const uint32_t depthMethod = static_cast<uint32_t>((ctx.test >> 17u) & 3u);
+    const bool earlyDepth = allowEarlyDepth && !disableEarlyDepth && !s_xmenActiveRasterProbe &&
+        ((ctx.test >> 16u) & 1u) != 0u && depthMethod >= 2u;
+    const uint32_t depthBase = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
+    const uint32_t depthWidth = std::max<uint32_t>(ctx.frame.fbw, 1u);
+    const ReadVramFunc depthReader = m_readVramFuncs[ctx.zbuf.psm & 0x3Fu];
 
     for (int y = minY; y <= maxY; ++y)
     {
@@ -3798,6 +3862,21 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
             }
 
             double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
+            const uint32_t pixelZ = static_cast<uint32_t>(z + 0.5);
+
+            // A failing depth test cannot store color or depth, regardless of
+            // alpha-test mode. Skip shading; passing pixels keep the usual path.
+            if (earlyDepth)
+            {
+                const uint32_t storedZ = depthReader(m_vram, depthBase, depthWidth, x, y);
+                if (pixelZ < storedZ || (depthMethod == 3u && pixelZ == storedZ))
+                {
+                    w0 += w0StepX;
+                    w1 += w1StepX;
+                    w2 += w2StepX;
+                    continue;
+                }
+            }
 
             uint8_t r, g, b, a;
             if (state.prim.iip)
@@ -3874,7 +3953,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
             }
 
             const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
-            WritePixel(state, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
+            WritePixel(state, x, y, pixelZ, r, g, b, a, fog);
             w0 += w0StepX;
             w1 += w1StepX;
             w2 += w2StepX;

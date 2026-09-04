@@ -1,4 +1,5 @@
 #include "runtime/ee_scheduler.h"
+#include "runtime/runtime_profile.h"
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
@@ -294,6 +295,9 @@ void EeScheduler::run()
 
     while (!m_stopRequested.load(std::memory_order_acquire))
     {
+        RuntimeProfile::Scope schedulerProfile(RuntimeProfile::Phase::Scheduler);
+        if (RuntimeProfile::enabled())
+            RuntimeProfile::state.tick = m_vsyncTick;
         processPendingEvents();
         if (m_stopRequested.load(std::memory_order_acquire))
         {
@@ -781,7 +785,10 @@ void EeScheduler::run()
             }
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
             m_guestExecuting.store(true, std::memory_order_release);
-            function(m_rdram, &context, &m_runtime);
+            {
+                RuntimeProfile::Scope guestProfile(RuntimeProfile::Phase::Guest);
+                function(m_rdram, &context, &m_runtime);
+            }
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
             if (traceXmenFastReturnDispatch)
@@ -2770,6 +2777,7 @@ void EeScheduler::applyPendingPreemption()
 
 void EeScheduler::processPendingEvents()
 {
+    RuntimeProfile::Scope eventProfile(RuntimeProfile::Phase::Events);
     assertExecutor();
     processDueDeadlines();
     const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
@@ -2828,6 +2836,7 @@ void EeScheduler::processDueDeadlines()
 
             if (now < pacingDeadline)
             {
+                RuntimeProfile::Scope waitProfile(RuntimeProfile::Phase::Wait);
                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                      { return !m_events.empty() ||
                                               m_stopRequested.load(std::memory_order_acquire); });
@@ -3105,6 +3114,7 @@ void EeScheduler::writeGuestU32(uint32_t address, uint32_t value)
 
 void EeScheduler::waitForEvent()
 {
+    RuntimeProfile::Scope waitProfile(RuntimeProfile::Phase::Wait);
     std::unique_lock lock(m_eventMutex);
     if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
     {

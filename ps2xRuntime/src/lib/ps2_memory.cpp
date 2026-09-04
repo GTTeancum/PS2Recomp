@@ -1,4 +1,5 @@
 #include "runtime/ps2_memory.h"
+#include "runtime/runtime_profile.h"
 #include "runtime/ps2_address.h"
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
@@ -2490,6 +2491,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
 void PS2Memory::processPendingTransfers()
 {
+    RuntimeProfile::Scope transferProfile(RuntimeProfile::Phase::Transfers);
     reportRdramPageWatch(gs().vsyncTick.load(std::memory_order_relaxed));
     const bool hadGif = !m_pendingGifTransfers.empty();
     uint64_t gifTransferQwc = 0u;

@@ -31,6 +31,12 @@
 #include <cstdio>
 #include <zlib.h>
 
+// Runtime diagnostic settings are fixed at process launch.
+#define PS2X_CACHED_GETENV(name) ([]() noexcept -> const char * { \
+    static const char *const value = std::getenv(name); \
+    return value; \
+}())
+
 namespace ps2_stubs
 {
     void resetSifState();
@@ -2933,12 +2939,12 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         sourcePc == 0x002B7C70u ||
         sourcePc == 0x002B7C88u ||
         sourcePc == 0x002B7C98u;
-    if (rdram && std::getenv("PS2X_TRACE_XMEN_WORLD_MIN_TICK") != nullptr &&
+    if (rdram && PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_WORLD_MIN_TICK") != nullptr &&
         isXmenRendererDiagnosticBranch)
     {
         const uint64_t currentTick = m_eeScheduler->currentVSyncTick();
         const uint64_t minimumTick = std::strtoull(
-            std::getenv("PS2X_TRACE_XMEN_WORLD_MIN_TICK"), nullptr, 0);
+            PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_WORLD_MIN_TICK"), nullptr, 0);
         const uint32_t object = GPR_U32(ctx, 4);
         uint32_t vtable = 0u;
         if (object <= PS2_RAM_SIZE - sizeof(vtable))
@@ -2964,7 +2970,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             sourcePc == 0x002B7C98u ||
             sourcePc == 0x00274074u;
         const bool traceAllRendererDispatch =
-            std::getenv("PS2X_TRACE_XMEN_RENDERER_DISPATCH_ALL") != nullptr;
+            PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_RENDERER_DISPATCH_ALL") != nullptr;
         const bool isTrackedRendererObject =
             object == 0x00AA5C00u || vtable == 0x006F49B0u;
 
@@ -3006,15 +3012,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             }
         }
     }
-    if (rdram && std::getenv("PS2X_TRACE_XMEN_SCENE_AMBIENT_USAGE") != nullptr)
+    if (rdram && PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_SCENE_AMBIENT_USAGE") != nullptr)
     {
         const char *minimumTickValue =
-            std::getenv("PS2X_TRACE_XMEN_SCENE_AMBIENT_USAGE_MIN_TICK");
+            PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_SCENE_AMBIENT_USAGE_MIN_TICK");
         const uint64_t minimumTick = minimumTickValue != nullptr
             ? std::strtoull(minimumTickValue, nullptr, 0)
             : 0u;
         const bool leafObjectsOnly =
-            std::getenv("PS2X_TRACE_XMEN_SCENE_AMBIENT_USAGE_LEAF_ONLY") != nullptr;
+            PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_SCENE_AMBIENT_USAGE_LEAF_ONLY") != nullptr;
         const uint64_t currentTick = m_eeScheduler->currentVSyncTick();
         const uint32_t light =
             s_xmenNycSceneAmbientLight.load(std::memory_order_relaxed);
@@ -3094,7 +3100,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     if (rdram)
     {
         const char *sceneAmbientScanTickValue =
-            std::getenv("PS2X_TRACE_XMEN_SCENE_AMBIENT_MEMORY_TICK");
+            PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_SCENE_AMBIENT_MEMORY_TICK");
         if (sceneAmbientScanTickValue != nullptr)
         {
             static std::atomic<bool> s_xmenSceneAmbientMemoryScanned{false};
@@ -3140,13 +3146,13 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             }
         }
     }
-    if (rdram && std::getenv("PS2X_TRACE_XMEN_LIGHT_STATE_ATTR") != nullptr)
+    if (rdram && PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_LIGHT_STATE_ATTR") != nullptr)
     {
         static std::atomic<bool> s_xmenSceneAmbientObjectsLogged{false};
         const uint32_t objectEntries =
             s_xmenNycLevelObjectEntries.load(std::memory_order_relaxed);
         const char *objectSnapshotTickValue =
-            std::getenv("PS2X_TRACE_XMEN_SCENE_AMBIENT_OBJECT_TICK");
+            PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_SCENE_AMBIENT_OBJECT_TICK");
         const uint64_t objectSnapshotTick = objectSnapshotTickValue != nullptr
             ? std::strtoull(objectSnapshotTickValue, nullptr, 0)
             : 0u;
@@ -3223,8 +3229,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
     }
     const char *xmenLightStateAttrMinimumTick =
-        std::getenv("PS2X_TRACE_XMEN_LIGHT_STATE_ATTR_MIN_TICK");
-    if (rdram && std::getenv("PS2X_TRACE_XMEN_LIGHT_STATE_ATTR") != nullptr &&
+        PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_LIGHT_STATE_ATTR_MIN_TICK");
+    if (rdram && PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_LIGHT_STATE_ATTR") != nullptr &&
         (xmenLightStateAttrMinimumTick == nullptr ||
          m_eeScheduler->currentVSyncTick() >=
              std::strtoull(xmenLightStateAttrMinimumTick, nullptr, 0)) &&
@@ -3329,12 +3335,12 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
     }
     if (rdram && targetPc == 0x002F7250u &&
-        (std::getenv("PS2X_TRACE_XMEN_TEXTURE_LINK") != nullptr ||
-         std::getenv("PS2X_TRACE_XMEN_TEXTURE_LINK_ALL") != nullptr))
+        (PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_TEXTURE_LINK") != nullptr ||
+         PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_TEXTURE_LINK_ALL") != nullptr))
     {
         const uint64_t tick = m_eeScheduler->currentVSyncTick();
         const bool traceAll =
-            std::getenv("PS2X_TRACE_XMEN_TEXTURE_LINK_ALL") != nullptr &&
+            PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_TEXTURE_LINK_ALL") != nullptr &&
             tick >= 750u && tick <= 766u;
         const uint32_t texture = GPR_U32(ctx, 4);
         const uint32_t textureBase = readRdramProbeU32(rdram, texture + 0x38u) & 0x3FFFu;
@@ -3395,7 +3401,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
     }
     if (rdram && isCall && targetPc == 0x002FA890u &&
-        std::getenv("PS2X_TRACE_XMEN_TEXTURE_RESIDENCY") != nullptr)
+        PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_TEXTURE_RESIDENCY") != nullptr)
     {
         const uint32_t textureList = GPR_U32(ctx, 4);
         const uint32_t texture = readRdramProbeU32(rdram, textureList);
@@ -3423,7 +3429,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
     }
     if (rdram && isCall && targetPc == 0x002FA560u &&
-        std::getenv("PS2X_TRACE_XMEN_TEXTURE_RESIDENCY") != nullptr)
+        PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_TEXTURE_RESIDENCY") != nullptr)
     {
         const uint32_t texture = GPR_U32(ctx, 4);
         const uint32_t planterPot =
@@ -3464,7 +3470,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         s_xmenTextureReloadTexture = 0u;
     }
     if (rdram && targetPc == 0x002D9490u && sourcePc == 0x002FAD08u &&
-        std::getenv("PS2X_TRACE_XMEN_TEXTURE_LINK_ALL") != nullptr)
+        PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_TEXTURE_LINK_ALL") != nullptr)
     {
         const uint64_t tick = m_eeScheduler->currentVSyncTick();
         if (tick >= 750u && tick <= 766u)
@@ -3777,7 +3783,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
     }
     const char *xmenControlObjectTraceTickValue =
-        std::getenv("PS2X_TRACE_XMEN_CONTROL_OBJECTS_AT_TICK");
+        PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_CONTROL_OBJECTS_AT_TICK");
     if (rdram && xmenControlObjectTraceTickValue != nullptr)
     {
         const uint64_t traceStartTick =
@@ -4864,15 +4870,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                   << std::dec << std::endl;
     }
     if (rdram && isCall && targetPc == 0x002F9FF0u &&
-        std::getenv("PS2X_TRACE_XMEN_TEXTURE_RESIDENCY") != nullptr)
+        PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_TEXTURE_RESIDENCY") != nullptr)
     {
         const uint32_t owner = GPR_U32(ctx, 4);
         const uint32_t node = GPR_U32(ctx, 5);
         const uint32_t address = GPR_U32(ctx, 6);
         const char *traceStartValue =
-            std::getenv("PS2X_TRACE_XMEN_TEXTURE_UPLOAD_DESTINATION_START");
+            PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_TEXTURE_UPLOAD_DESTINATION_START");
         const char *traceEndValue =
-            std::getenv("PS2X_TRACE_XMEN_TEXTURE_UPLOAD_DESTINATION_END");
+            PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_TEXTURE_UPLOAD_DESTINATION_END");
         const uint32_t traceStart = traceStartValue
             ? static_cast<uint32_t>(std::strtoul(traceStartValue, nullptr, 0))
             : 0u;
@@ -4991,9 +4997,9 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         const uint32_t chunkRows = rowBytes != 0u ? 0x000FFFE0u / rowBytes
                                                    : 0xFFFFFFFFu;
         const char *traceStartValue =
-            std::getenv("PS2X_TRACE_XMEN_TEXTURE_UPLOAD_DESTINATION_START");
+            PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_TEXTURE_UPLOAD_DESTINATION_START");
         const char *traceEndValue =
-            std::getenv("PS2X_TRACE_XMEN_TEXTURE_UPLOAD_DESTINATION_END");
+            PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_TEXTURE_UPLOAD_DESTINATION_END");
         const uint32_t traceStart = traceStartValue
             ? static_cast<uint32_t>(std::strtoul(traceStartValue, nullptr, 0))
             : 0u;
@@ -5007,7 +5013,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
              (index < 64u || chunkRows == 0u ||
               destination == 0x2D84u || destination == 0x2D88u));
         const bool traceResidency =
-            std::getenv("PS2X_TRACE_XMEN_TEXTURE_RESIDENCY") != nullptr;
+            PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_TEXTURE_RESIDENCY") != nullptr;
         const uint32_t data = readRdramProbeU32(rdram, descriptor + 0x30u);
         const uint32_t dataPhysical = data & PS2_RAM_MASK;
         uint32_t sourceBytes = 0u;
@@ -5110,9 +5116,9 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         const uint32_t descriptor = readRdramProbeU32(rdram, upload);
         const uint32_t destination = readRdramProbeU32(rdram, descriptor + 0x38u);
         const char *traceStartValue =
-            std::getenv("PS2X_TRACE_XMEN_TEXTURE_UPLOAD_DESTINATION_START");
+            PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_TEXTURE_UPLOAD_DESTINATION_START");
         const char *traceEndValue =
-            std::getenv("PS2X_TRACE_XMEN_TEXTURE_UPLOAD_DESTINATION_END");
+            PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_TEXTURE_UPLOAD_DESTINATION_END");
         const uint32_t traceStart = traceStartValue
             ? static_cast<uint32_t>(std::strtoul(traceStartValue, nullptr, 0))
             : 0u;
@@ -5520,7 +5526,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         0x00557ED0u, 0x00557F10u, 0x00557EB0u, 0x00557EF0u,
     };
     const bool xmenMediaReadinessTraceEnabled =
-        std::getenv("PS2X_XMEN_MEDIA_READINESS_TRACE") != nullptr;
+        PS2X_CACHED_GETENV("PS2X_XMEN_MEDIA_READINESS_TRACE") != nullptr;
     const auto xmenMediaReadinessIt = std::find(
         xmenMediaReadinessTargets.begin(), xmenMediaReadinessTargets.end(), targetPc);
     const size_t xmenMediaReadinessTargetIndex = static_cast<size_t>(
@@ -6356,7 +6362,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     const size_t xmenMovieAudioTargetIndex = static_cast<size_t>(
         xmenMovieAudioIt - xmenMovieAudioTargets.begin());
     const bool isXmenMovieAudioCall =
-        std::getenv("PS2X_XMEN_MOVIE_AUDIO_TRACE") != nullptr && isCall &&
+        PS2X_CACHED_GETENV("PS2X_XMEN_MOVIE_AUDIO_TRACE") != nullptr && isCall &&
         xmenMovieAudioTargetIndex < xmenMovieAudioTargets.size();
     uint32_t xmenMovieAudioTraceIndex = UINT32_MAX;
     uint32_t xmenMovieAudioObject = 0u;
@@ -6699,7 +6705,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     const uint32_t xmenLegalEd4 = readRdramProbeU32(rdram, xmenLegalViewer + 0xED4u);
     const bool xmenLegalSceneActive = xmenLegalEd4 != 0u && xmenLegalEd4 != 0x3FFFFFFFu;
     if (xmenLegalSceneActive && sourcePc == 0x0031F46Cu &&
-        std::getenv("PS2X_FAST_FORWARD_XMEN_LEGAL") != nullptr && ctx->f[12] < 10.0f)
+        PS2X_CACHED_GETENV("PS2X_FAST_FORWARD_XMEN_LEGAL") != nullptr && ctx->f[12] < 10.0f)
     {
         static std::atomic<uint32_t> s_xmenLegalFastForwardTraceCount{0u};
         const uint32_t traceIndex = s_xmenLegalFastForwardTraceCount.fetch_add(
@@ -6716,7 +6722,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         ctx->f[12] = 10.0f;
     }
     static const bool traceXmenLegalDiagnostics =
-        std::getenv("PS2X_TRACE_XMEN_LEGAL") != nullptr;
+        PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_LEGAL") != nullptr;
     static std::atomic<bool> s_xmenLegalLayerTraceArmed{false};
     if (traceXmenLegalDiagnostics && xmenLegalSceneActive && targetPc == 0x003272A0u)
     {
@@ -7171,7 +7177,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
     }
     const bool traceXmenInputManager =
-        std::getenv("PS2X_TRACE_XMEN_INPUT_MANAGER") != nullptr;
+        PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_INPUT_MANAGER") != nullptr;
     if (isCall && traceXmenInputManager &&
         targetPc == 0x002FD7B0u && xmenBranchTick >= 980u)
     {
@@ -8832,7 +8838,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                           << readRdramProbeU32(rdram, clutObject + offset);
                             }
                             static std::atomic<bool> s_xmenConsoleTextureRepaired{false};
-                            if (std::getenv("PS2X_XMEN_REPAIR_CONSOLE_TEXTURE") != nullptr &&
+                            if (PS2X_CACHED_GETENV("PS2X_XMEN_REPAIR_CONSOLE_TEXTURE") != nullptr &&
                                 !s_xmenConsoleTextureRepaired.exchange(true, std::memory_order_relaxed) &&
                                 rdram && imageSize == 0x400u && clutSize == 0x400u &&
                                 imageData <= PS2_RAM_SIZE - imageSize &&
@@ -9297,7 +9303,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     static thread_local uint64_t s_xmenHostClockBaseNanoseconds = 0u;
     static thread_local std::chrono::steady_clock::time_point s_xmenHostClockOrigin;
     if (!s_xmenHostClockActive &&
-        std::getenv("PS2X_XMEN_HOST_CLOCK") != nullptr &&
+        PS2X_CACHED_GETENV("PS2X_XMEN_HOST_CLOCK") != nullptr &&
         isCall && sourcePc == 0x0014B89Cu)
     {
         const double guestSeconds = std::max(0.0, static_cast<double>(ctx->f[0]));
@@ -9465,7 +9471,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     if (isCall && targetPc == 0x00277520u)
     {
         const char *minimumTickValue =
-            std::getenv("PS2X_TRACE_XMEN_LIGHT_PACKET_MIN_TICK");
+            PS2X_CACHED_GETENV("PS2X_TRACE_XMEN_LIGHT_PACKET_MIN_TICK");
         if (minimumTickValue != nullptr)
         {
             const uint64_t minimumTick = std::strtoull(minimumTickValue, nullptr, 0);
@@ -10441,7 +10447,7 @@ xmen_component_attach_trace_done:
     if (isCall && sourcePc == 0x00274B4Cu && targetPc == 0x002F62D0u)
     {
         static const uint32_t xmenFrameWindowOverride = [] {
-            const char *value = std::getenv("PS2X_XMEN_FRAME_WINDOW");
+            const char *value = PS2X_CACHED_GETENV("PS2X_XMEN_FRAME_WINDOW");
             return value && *value
                 ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0))
                 : 0u;
@@ -10454,9 +10460,9 @@ xmen_component_attach_trace_done:
         static std::atomic<uint32_t> s_xmenFrameProbeCount{0u};
         const uint32_t probeIndex = s_xmenFrameProbeCount.fetch_add(1u, std::memory_order_relaxed);
         static const bool xmenSteadyCoverageEnabled =
-            std::getenv("PS2X_XMEN_STEADY_COVERAGE") != nullptr;
+            PS2X_CACHED_GETENV("PS2X_XMEN_STEADY_COVERAGE") != nullptr;
         static const uint64_t xmenSteadyCoverageMinTick = [] {
-            const char *value = std::getenv("PS2X_XMEN_STEADY_COVERAGE_MIN_TICK");
+            const char *value = PS2X_CACHED_GETENV("PS2X_XMEN_STEADY_COVERAGE_MIN_TICK");
             return value && *value
                 ? static_cast<uint64_t>(std::strtoull(value, nullptr, 0))
                 : 0u;
@@ -11136,7 +11142,7 @@ xmen_component_attach_trace_done:
     {
         if (xmenSofdecServerIndex == 0u && sourcePc == 0x005684E4u &&
             GPR_U32(ctx, 2) != 0u &&
-            std::getenv("PS2X_XMEN_DISPATCH_CONTINUE") != nullptr)
+            PS2X_CACHED_GETENV("PS2X_XMEN_DISPATCH_CONTINUE") != nullptr)
         {
             static std::atomic<uint32_t> s_xmenDispatchContinueCount{0u};
             const uint32_t count = s_xmenDispatchContinueCount.fetch_add(
@@ -13538,7 +13544,7 @@ void PS2Runtime::run()
     uint64_t tick = 0;
     bool xmenZeroPcLogged = false;
     std::ofstream xmenProgressTrace;
-    if (std::getenv("PS2X_XMEN_PROGRESS_TRACE") != nullptr)
+    if (PS2X_CACHED_GETENV("PS2X_XMEN_PROGRESS_TRACE") != nullptr)
     {
         xmenProgressTrace.open("xmen_runtime_progress.log", std::ios::out | std::ios::trunc);
     }

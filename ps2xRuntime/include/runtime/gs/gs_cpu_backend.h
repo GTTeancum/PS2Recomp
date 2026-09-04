@@ -43,7 +43,7 @@ private:
     void DrawPrimitive(const GSPrimitiveBatch &batch);
     void DrawWhiteWireframe(const GSPrimitiveBatch &batch);
     void DrawSprite(const GSPrimitiveBatch &batch);
-    void DrawTriangle(const GSPrimitiveBatch &batch);
+    void DrawTriangle(const GSPrimitiveBatch &batch, bool allowEarlyDepth = true);
     void DrawLine(const GSPrimitiveBatch &batch);
     void WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
     uint32_t SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v);
