@@ -2551,8 +2551,31 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             programEnded = true;
             break;
         }
-
-        const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
+#if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
+        if (m_nativeBlocksEnabled && !xmenDiagnosticsEnabled() && !xmenTraceVu1Program)
+        {
+            const BlockKernel block = lookupNativeBlock(m_state.pc);
+            if (block != nullptr)
+            {
+                ++m_blockCounters.attempted;
+                const uint32_t executedPairs =
+                    block(this, vuCode, codeSize, vuData, dataSize, gs, memory, budgetEnd);
+                if (executedPairs != 0u)
+                {
+                    ++m_blockCounters.executed;
+                    m_blockCounters.pairs += executedPairs & 0x7FFFFFFFu;
+                    if ((executedPairs & 0x80000000u) != 0u)
+                    {
+                        programEnded = true;
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
+#endif
+        const DecodedInstructionPair decoded =
+            getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
         if (xmenDiagnosticsEnabled())
         {
             BudgetTraceEntry &budgetEntry = budgetTrace[budgetTraceCount++ & 31u];

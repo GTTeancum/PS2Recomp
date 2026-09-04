@@ -161,6 +161,13 @@ namespace
                (static_cast<uint32_t>(imm) & 0x7FFu);
     }
 
+    uint32_t makeVuIbgtz(uint8_t is, int16_t imm)
+    {
+        return (0x2Du << 25) |
+               (static_cast<uint32_t>(is & 0xFu) << 11) |
+               (static_cast<uint32_t>(imm) & 0x7FFu);
+    }
+
     uint32_t makeVuIlw(uint8_t dest, uint8_t targetVi, uint8_t baseVi, int16_t imm)
     {
         return (0x04u << 25) |
@@ -415,6 +422,107 @@ void register_ps2_vu1_tests()
             t.Equals(interpreted.native, native.native, "Disabling must stop native pair execution");
             t.Equals(interpreted.interpreted, native.interpreted + 3u,
                      "Disabling must invalidate cached pair kernels");
+        });
+#endif
+#if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
+        tc.Run("native VU blocks preserve loops stores and budget fallback", [](TestCase &t)
+        {
+            constexpr uint32_t startPc = 0x3000u;
+            const auto initialize = [&](Vu1Fixture &fx, VU1Interpreter &vu)
+            {
+                if (!fx.initialize())
+                    return false;
+                writeTrackedVuInstructionPair(fx, startPc + 0u,
+                                               makeVuLq(0xFu, 2u, 1u, 0), kVuUpperNop);
+                writeTrackedVuInstructionPair(fx, startPc + 8u, 0u, kVuUpperNop);
+                writeTrackedVuInstructionPair(fx, startPc + 16u, 0u, kVuUpperNop);
+                writeTrackedVuInstructionPair(fx, startPc + 24u, 0u, kVuUpperNop);
+                writeTrackedVuInstructionPair(fx, startPc + 32u,
+                                               makeVuSq(0xFu, 2u, 3u, 0), kVuUpperNop);
+                writeTrackedVuInstructionPair(fx, startPc + 40u,
+                                               makeVuIaddiu(4u, 4u, -1), kVuUpperNop);
+                writeTrackedVuInstructionPair(fx, startPc + 48u,
+                                               makeVuIbgtz(4u, -7), kVuUpperNop);
+                writeTrackedVuInstructionPair(fx, startPc + 56u, 0u, kVuUpperNop);
+
+                const float source[4] = {1.25f, -2.5f, 3.75f, 1.0f};
+                writeVuQword(fx.data, 1u, source);
+                vu.state().vi[1] = 1;
+                vu.state().vi[3] = 4;
+                vu.state().vi[4] = 2;
+                return true;
+            };
+            const auto compare = [&](const Vu1Fixture &expectedFx,
+                                     const VU1Interpreter &expected,
+                                     const Vu1Fixture &actualFx,
+                                     const VU1Interpreter &actual)
+            {
+                t.Equals(actual.state().pc, expected.state().pc,
+                         "Native block PC must match the interpreter");
+                t.Equals(actual.state().cycles, expected.state().cycles,
+                         "Native block cycle count must match the interpreter");
+                t.Equals(actual.state().vi[4], expected.state().vi[4],
+                         "Native block loop counter must match the interpreter");
+                t.IsTrue(std::memcmp(actual.state().vf[2], expected.state().vf[2],
+                                     sizeof(actual.state().vf[2])) == 0,
+                         "Native block vector result must match the interpreter");
+                t.IsTrue(std::memcmp(actualFx.data, expectedFx.data,
+                                     PS2_VU1_DATA_SIZE) == 0,
+                         "Native block stores must match the interpreter");
+            };
+
+            Vu1Fixture interpretedFx;
+            Vu1Fixture nativeFx;
+            VU1Interpreter interpreted;
+            VU1Interpreter native;
+            t.IsTrue(initialize(interpretedFx, interpreted),
+                     "Interpreted VU1 fixture should initialize");
+            t.IsTrue(initialize(nativeFx, native),
+                     "Native VU1 fixture should initialize");
+            native.setNativeBlocksEnabled(true);
+            interpreted.execute(interpretedFx.code, PS2_VU1_CODE_SIZE,
+                                interpretedFx.data, PS2_VU1_DATA_SIZE,
+                                interpretedFx.gs, &interpretedFx.mem,
+                                startPc, 0u, 0u, 16u);
+            native.execute(nativeFx.code, PS2_VU1_CODE_SIZE,
+                           nativeFx.data, PS2_VU1_DATA_SIZE,
+                           nativeFx.gs, &nativeFx.mem,
+                           startPc, 0u, 0u, 16u);
+            compare(interpretedFx, interpreted, nativeFx, native);
+            const auto nativeCounters = native.blockCounters();
+            t.Equals(nativeCounters.attempted, uint64_t{1},
+                     "The synthetic loop should enter one native block");
+            t.Equals(nativeCounters.executed, uint64_t{1},
+                     "The synthetic loop should execute natively");
+            t.Equals(nativeCounters.pairs, uint64_t{16},
+                     "The native block should execute both loop iterations");
+
+            Vu1Fixture budgetInterpretedFx;
+            Vu1Fixture budgetNativeFx;
+            VU1Interpreter budgetInterpreted;
+            VU1Interpreter budgetNative;
+            t.IsTrue(initialize(budgetInterpretedFx, budgetInterpreted),
+                     "Budget reference fixture should initialize");
+            t.IsTrue(initialize(budgetNativeFx, budgetNative),
+                     "Budget native fixture should initialize");
+            budgetNative.setNativeBlocksEnabled(true);
+            budgetInterpreted.execute(budgetInterpretedFx.code, PS2_VU1_CODE_SIZE,
+                                      budgetInterpretedFx.data, PS2_VU1_DATA_SIZE,
+                                      budgetInterpretedFx.gs, &budgetInterpretedFx.mem,
+                                      startPc, 0u, 0u, 7u);
+            budgetNative.execute(budgetNativeFx.code, PS2_VU1_CODE_SIZE,
+                                 budgetNativeFx.data, PS2_VU1_DATA_SIZE,
+                                 budgetNativeFx.gs, &budgetNativeFx.mem,
+                                 startPc, 0u, 0u, 7u);
+            compare(budgetInterpretedFx, budgetInterpreted,
+                    budgetNativeFx, budgetNative);
+            const auto budgetCounters = budgetNative.blockCounters();
+            t.Equals(budgetCounters.attempted, uint64_t{1},
+                     "A short budget should still attempt the native block");
+            t.Equals(budgetCounters.executed, uint64_t{0},
+                     "A short budget should fall back before partial execution");
+            t.Equals(budgetCounters.pairs, uint64_t{0},
+                     "Budget fallback must not report native pairs");
         });
 #endif
         if (const char *path = std::getenv("PS2X_VU_REPLAY_FILE"))

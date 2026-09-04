@@ -405,6 +405,15 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
     try
     {
         require(repeats > 0u && repeats <= 4096u, "Invalid VU replay repetition count");
+        uint32_t replaySliceCycles = 0u;
+        if (const char *value = std::getenv("PS2X_VU_REPLAY_SLICE_CYCLES"))
+        {
+            char *end = nullptr;
+            const unsigned long parsed = std::strtoul(value, &end, 10);
+            require(end != value && *end == '\0' && parsed > 0u && parsed <= (1u << 20u),
+                    "Invalid VU replay slice cycle count");
+            replaySliceCycles = static_cast<uint32_t>(parsed);
+        }
         auto memory = std::make_unique<PS2Memory>();
         require(memory->initialize(), "Cannot initialize VU replay memory");
         GS gs;
@@ -415,6 +424,9 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
 #endif
 #if defined(PS2X_ENABLE_VU_NATIVE_PAIRS)
         vu->setNativePairsEnabled(std::getenv("PS2X_VU_REPLAY_PAIRS") != nullptr);
+#endif
+#if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
+        vu->setNativeBlocksEnabled(std::getenv("PS2X_VU_REPLAY_BLOCKS") != nullptr);
 #endif
         size_t totalBytes = 0;
         uint64_t totalCycles = 0;
@@ -501,8 +513,27 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
                     }
                     else
                     {
-                        vu->run(memory->getVU1Code(), PS2_VU1_CODE_SIZE,
-                                memory->getVU1Data(), PS2_VU1_DATA_SIZE, gs, memory.get(), record.maxCycles);
+                        if (replaySliceCycles == 0u)
+                        {
+                            vu->run(memory->getVU1Code(), PS2_VU1_CODE_SIZE,
+                                    memory->getVU1Data(), PS2_VU1_DATA_SIZE, gs, memory.get(), record.maxCycles);
+                        }
+                        else
+                        {
+                            const uint64_t budgetEnd = vu->m_cycle + record.maxCycles;
+                            while (vu->m_cycle < budgetEnd)
+                            {
+                                const uint64_t remaining = budgetEnd - vu->m_cycle;
+                                const uint32_t slice = static_cast<uint32_t>(
+                                    std::min<uint64_t>(remaining, replaySliceCycles));
+                                const uint64_t beforeCycle = vu->m_cycle;
+                                vu->run(memory->getVU1Code(), PS2_VU1_CODE_SIZE,
+                                        memory->getVU1Data(), PS2_VU1_DATA_SIZE,
+                                        gs, memory.get(), slice);
+                                if (!vu->m_running || vu->m_cycle == beforeCycle)
+                                    break;
+                            }
+                        }
                     }
                 }
                 const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -511,9 +542,26 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
                 if (actual != record.after || context.overflow || context.gifs.bytes != record.gifs ||
                     std::memcmp(memory->getVU1Data(), record.afterData.data(), record.afterData.size()) != 0)
                 {
+                    size_t stateOffset = 0u;
+                    while (stateOffset < actual.size() && stateOffset < record.after.size() &&
+                           actual[stateOffset] == record.after[stateOffset])
+                        ++stateOffset;
+                    const uint32_t actualByte = stateOffset < actual.size() ? actual[stateOffset] : 0u;
+                    const uint32_t expectedByte = stateOffset < record.after.size() ? record.after[stateOffset] : 0u;
+                    uint32_t actualWord = 0u;
+                    uint32_t expectedWord = 0u;
+                    if (stateOffset + sizeof(actualWord) <= actual.size() &&
+                        stateOffset + sizeof(expectedWord) <= record.after.size())
+                    {
+                        std::memcpy(&actualWord, actual.data() + stateOffset, sizeof(actualWord));
+                        std::memcpy(&expectedWord, record.after.data() + stateOffset, sizeof(expectedWord));
+                    }
                     result.error = "Replay mismatch in case " + std::to_string(result.cases) +
                         " pc=" + std::to_string(initialPc) + " iteration=" + std::to_string(iteration) +
                         " state=" + std::to_string(actual == record.after) +
+                        " state-offset=" + std::to_string(stateOffset) +
+                        " state-byte=" + std::to_string(actualByte) + "/" + std::to_string(expectedByte) +
+                        " state-word=" + std::to_string(actualWord) + "/" + std::to_string(expectedWord) +
                         " data=" + std::to_string(std::memcmp(memory->getVU1Data(), record.afterData.data(), record.afterData.size()) == 0) +
                         " gifs=" + std::to_string(context.gifs.bytes == record.gifs);
                     return result;
@@ -542,6 +590,17 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
 #if defined(PS2X_ENABLE_VU_NATIVE_PAIRS)
         result.nativePairs = vu->pairCounters().native;
         result.interpretedPairs = vu->pairCounters().interpreted;
+#endif
+#if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
+        if (std::getenv("PS2X_VU_REPLAY_BLOCKS") != nullptr)
+        {
+            const auto counters = vu->blockCounters();
+            std::fprintf(stderr,
+                         "[vu-replay:block-coverage] attempted=%llu executed=%llu pairs=%llu\n",
+                         static_cast<unsigned long long>(counters.attempted),
+                         static_cast<unsigned long long>(counters.executed),
+                         static_cast<unsigned long long>(counters.pairs));
+        }
 #endif
         if (upperSamples)
         {

@@ -92,6 +92,11 @@ public:
     struct PairCounters { uint64_t native = 0; uint64_t interpreted = 0; };
     PairCounters pairCounters() const { return m_pairCounters; }
 #endif
+#if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
+    void setNativeBlocksEnabled(bool enabled) { m_nativeBlocksEnabled = enabled; }
+    struct BlockCounters { uint64_t attempted = 0; uint64_t executed = 0; uint64_t pairs = 0; };
+    BlockCounters blockCounters() const { return m_blockCounters; }
+#endif
 
     struct DebugCounters
     {
@@ -118,6 +123,9 @@ private:
 #endif
 #if defined(PS2X_ENABLE_VU_NATIVE_PAIRS)
     friend struct VUNativePairAccess;
+#endif
+#if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
+    friend struct VUNativeBlockAccess;
 #endif
 
     enum Pipeline : uint8_t
@@ -161,6 +169,10 @@ private:
 
 #if defined(PS2X_ENABLE_VU_NATIVE_PAIRS)
     using PairKernel = void (*)(VU1Interpreter *, const void *, uint8_t *, uint32_t, GS &, PS2Memory *);
+#endif
+#if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
+    using BlockKernel = uint32_t (*)(VU1Interpreter *, const uint8_t *, uint32_t,
+                                     uint8_t *, uint32_t, GS &, PS2Memory *, uint64_t);
 #endif
 
     struct DecodedInstructionPair
@@ -283,6 +295,10 @@ private:
     PairCounters m_pairCounters{};
     bool m_nativePairsEnabled = false;
 #endif
+#if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
+    BlockCounters m_blockCounters{};
+    bool m_nativeBlocksEnabled = false;
+#endif
 
     std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
     ScalarPipelineEntry m_fdiv{};
@@ -335,7 +351,8 @@ private:
     static void addVfWrite(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
     static uint8_t vfReadLanes(const InstructionUsage &usage, uint8_t reg);
     DecodedInstructionPair decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const;
-    DecodedInstructionPair getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
+    DecodedInstructionPair getDecodedInstructionPairForPc(
+        const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
     void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory, uint64_t generation);
 
     PS2X_VU_ARITH_INLINE void execUpper(uint32_t instr);
@@ -353,6 +370,9 @@ private:
 #endif
 #if defined(PS2X_ENABLE_VU_NATIVE_PAIRS)
     static PairKernel lookupNativePair(uint64_t words);
+#endif
+#if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
+    static BlockKernel lookupNativeBlock(uint32_t pc);
 #endif
     void execDecodedUpper(const DecodedInstructionPair &decoded)
     {
