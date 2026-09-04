@@ -303,11 +303,12 @@ void register_ps2_vu1_tests()
             constexpr uint32_t pairs = 40u;
             for (uint32_t i = 0; i < pairs + 8u; ++i)
             {
+                const bool alternate = ((i / 8u) & 1u) != 0u;
                 const uint32_t lower = i >= pairs ? 0u : i % 3u == 0u
                     ? makeVuFlagImmediate(0x15u, 0u, static_cast<uint16_t>((i & 15u) << 6u))
-                    : makeVuLowerSpecial(0x30u, 2u, static_cast<uint8_t>(20u + i % 8u), 0u, 0xFu);
+                    : makeVuLowerSpecial(0x30u, alternate ? 1u : 2u, static_cast<uint8_t>(20u + i % 8u), 0u, 0xFu);
                 const uint32_t upper = i >= pairs ? kVuUpperNop
-                    : makeVuUpper(0x28u, 0xFu, 2u, 1u, static_cast<uint8_t>(4u + i % 8u));
+                    : makeVuUpper(0x28u, 0xFu, 2u, alternate ? 2u : 1u, static_cast<uint8_t>(4u + i % 8u));
                 writeTrackedVuInstructionPair(fx, i * 8u, lower, upper);
             }
             VU1Interpreter vu;
@@ -331,11 +332,12 @@ void register_ps2_vu1_tests()
                 if (cycle >= 4u && cycle - 4u < pairs)
                 {
                     const uint32_t retired = cycle - 4u;
+                    const bool alternate = ((retired / 8u) & 1u) != 0u;
                     for (uint32_t lane = 0; lane < 4u; ++lane)
                     {
-                        expected[4u + retired % 8u][lane] = static_cast<float>((lane + 1u) * 11u);
+                        expected[4u + retired % 8u][lane] = static_cast<float>((lane + 1u) * (alternate ? 20u : 11u));
                         if (retired % 3u != 0u)
-                            expected[20u + retired % 8u][lane] = expected[2][lane];
+                            expected[20u + retired % 8u][lane] = expected[alternate ? 1u : 2u][lane];
                     }
                     if (retired % 3u == 0u)
                         expectedStatus = (retired & 15u) << 6u;
