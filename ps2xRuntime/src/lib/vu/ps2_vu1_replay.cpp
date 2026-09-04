@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <map>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <tuple>
 #include <type_traits>
@@ -395,6 +396,8 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
     Result result;
     std::map<uint32_t, uint64_t> fetches;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t>, uint64_t> executedPairs;
+    std::map<std::pair<uint32_t, uint32_t>, uint64_t> executedEdges;
+    std::set<uint32_t> entryPcs;
     if (upperSamples)
         upperSamples->clear();
     if (pairSamples)
@@ -437,6 +440,8 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
             loadState(record.before, *vu);
             const auto initialCycle = vu->m_cycle;
             const auto initialPc = vu->m_state.pc;
+            if (pairSamples)
+                entryPcs.insert(initialPc);
             loadState(record.after, *vu);
             require(vu->m_cycle >= initialCycle, "Invalid VU replay cycle ordering");
             const auto elapsedCycles = vu->m_cycle - initialCycle;
@@ -483,7 +488,9 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
                             if (pairSamples && vu->m_state.pc != pairPc)
                             {
                                 ++executedPairs[{pairPc, lower, upper}];
+                                ++executedEdges[{pairPc, vu->m_state.pc}];
                                 require(executedPairs.size() <= 4096u, "Too many VU instruction-pair candidates");
+                                require(executedEdges.size() <= 8192u, "Too many VU instruction-pair edges");
                             }
                             if (!vu->m_running || vu->m_cycle == beforeCycle)
                                 break;
@@ -544,7 +551,15 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
             for (const auto &[key, count] : executedPairs)
             {
                 const auto &[pc, lower, upper] = key;
-                pairSamples->push_back({pc, lower, upper, count});
+                PairSample sample{pc, lower, upper, count};
+                sample.entry = entryPcs.contains(pc);
+                for (const auto &[edge, edgeCount] : executedEdges)
+                {
+                    (void)edgeCount;
+                    if (edge.first == pc)
+                        sample.successors.push_back(edge.second);
+                }
+                pairSamples->push_back(std::move(sample));
             }
             std::sort(pairSamples->begin(), pairSamples->end(), [](const auto &left, const auto &right)
             {
@@ -588,16 +603,84 @@ bool VUReplay::writePairKernels(std::ostream &output,
         return false;
     const auto flags = output.flags();
     const auto fill = output.fill();
-    output << "// Private replay-derived VU instruction pairs. Do not redistribute.\n";
+    std::set<uint32_t> entries;
+    std::set<std::pair<uint32_t, uint32_t>> edges;
+    std::map<uint32_t, const PairSample *> pairsByPc;
     for (size_t i = 0; i < std::min<size_t>(limit, samples.size()); ++i)
     {
         const auto &sample = samples[i];
         if ((sample.pc & 7u) != 0u || sample.pc >= PS2_VU1_CODE_SIZE || sample.executions == 0u)
             return false;
+        if (!pairsByPc.emplace(sample.pc, &sample).second)
+            return false;
+        if (sample.entry)
+            entries.insert(sample.pc);
+        for (const uint32_t successor : sample.successors)
+        {
+            if ((successor & 7u) != 0u || successor >= PS2_VU1_CODE_SIZE)
+                return false;
+            edges.insert({sample.pc, successor});
+        }
+    }
+    output << "// Private replay-derived VU instruction pairs. Do not redistribute.\n";
+    for (const uint32_t entry : entries)
+        output << "VU_NATIVE_ENTRY(0x" << std::hex << std::setw(4) << std::setfill('0') << entry << "u)\n";
+    std::map<uint32_t, std::set<uint32_t>> predecessors;
+    for (const auto &[from, to] : edges)
+    {
+        (void)from;
+        predecessors[to].insert(from);
+    }
+    std::set<uint32_t> assigned;
+    const auto emitBlock = [&](uint32_t start)
+    {
+        if (assigned.contains(start))
+            return;
+        uint32_t pc = start;
+        uint32_t count = 0u;
+        while (count < 8u)
+        {
+            const auto pair = pairsByPc.find(pc);
+            if (pair == pairsByPc.end() || !assigned.insert(pc).second)
+                break;
+            ++count;
+            const auto &successors = pair->second->successors;
+            const uint32_t next = (pc + 8u) & (PS2_VU1_CODE_SIZE - 1u);
+            const auto incoming = predecessors.find(next);
+            if (successors.size() != 1u || successors[0] != next || entries.contains(next) ||
+                incoming == predecessors.end() || incoming->second.size() != 1u ||
+                !incoming->second.contains(pc))
+                break;
+            pc = next;
+        }
+        output << "VU_NATIVE_BLOCK(0x" << std::hex << std::setw(4) << std::setfill('0') << start
+               << "u, " << std::dec << count << "u)\n";
+    };
+    for (const auto &[pc, pair] : pairsByPc)
+    {
+        (void)pair;
+        const uint32_t previous = (pc - 8u) & (PS2_VU1_CODE_SIZE - 1u);
+        const auto incoming = predecessors.find(pc);
+        const bool sequentialOnly = incoming != predecessors.end() && incoming->second.size() == 1u &&
+                                    incoming->second.contains(previous);
+        if (entries.contains(pc) || !sequentialOnly)
+            emitBlock(pc);
+    }
+    for (const auto &[pc, pair] : pairsByPc)
+    {
+        (void)pair;
+        emitBlock(pc);
+    }
+    for (size_t i = 0; i < std::min<size_t>(limit, samples.size()); ++i)
+    {
+        const auto &sample = samples[i];
         output << "VU_NATIVE_PAIR(0x" << std::hex << std::setw(4) << std::setfill('0') << sample.pc
                << "u, 0x" << std::setw(8) << sample.lower
                << "u, 0x" << std::setw(8) << sample.upper << "u)\n";
     }
+    for (const auto &[from, to] : edges)
+        output << "VU_NATIVE_EDGE(0x" << std::hex << std::setw(4) << std::setfill('0') << from
+               << "u, 0x" << std::setw(4) << to << "u)\n";
     output.flags(flags);
     output.fill(fill);
     return static_cast<bool>(output);

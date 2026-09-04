@@ -491,8 +491,14 @@ void register_ps2_vu1_tests()
             t.IsTrue(!pairSamples.empty(), "One-cycle replay must identify executed instruction pairs");
             std::ostringstream pairKernels;
             t.IsTrue(VUReplay::writePairKernels(pairKernels, pairSamples, 4096u), "Synthetic pair recipe must be written");
+            t.IsTrue(pairKernels.str().find("VU_NATIVE_ENTRY(0x0008u)") != std::string::npos,
+                     "Pair recipe must retain replay entry PCs");
+            t.IsTrue(pairKernels.str().find("VU_NATIVE_BLOCK(0x0008u, 2u)") != std::string::npos,
+                     "Pair recipe must partition a bounded straight-line block");
             t.IsTrue(pairKernels.str().find("VU_NATIVE_PAIR(0x0008u, 0x00000000u, 0x400002ffu)") != std::string::npos,
                      "Pair recipe must retain PC and both instruction words");
+            t.IsTrue(pairKernels.str().find("VU_NATIVE_EDGE(0x0008u, 0x0010u)") != std::string::npos,
+                     "Pair recipe must retain observed successors");
             t.IsTrue(!VUReplay::writeUpperKernels(kernels, upperSamples, 0u), "Zero kernel limit must be rejected");
             t.IsTrue(!VUReplay::writeUpperKernels(kernels, upperSamples, 513u), "Unbounded kernel limits must be rejected");
             t.IsTrue(!VUReplay::writePairKernels(pairKernels, pairSamples, 0u), "Zero pair limit must be rejected");

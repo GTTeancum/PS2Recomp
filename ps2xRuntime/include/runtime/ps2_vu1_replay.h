@@ -49,6 +49,8 @@ public:
         uint32_t lower = 0;
         uint32_t upper = 0;
         uint64_t executions = 0;
+        std::vector<uint32_t> successors;
+        bool entry = false;
     };
 
     static bool captureRequested();
