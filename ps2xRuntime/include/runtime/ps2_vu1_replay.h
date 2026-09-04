@@ -43,6 +43,14 @@ public:
         uint64_t fetches = 0;
     };
 
+    struct PairSample
+    {
+        uint32_t pc = 0;
+        uint32_t lower = 0;
+        uint32_t upper = 0;
+        uint64_t executions = 0;
+    };
+
     static bool captureRequested();
     static bool captureSlice(VU1Interpreter &vu, uint8_t *code, uint32_t codeSize,
                              uint8_t *data, uint32_t dataSize, GS &gs,
@@ -53,15 +61,19 @@ public:
     static bool record(std::ostream &output, VU1Interpreter &vu,
                        uint8_t *code, uint8_t *data, GS &gs,
                        PS2Memory *memory, uint32_t maxCycles);
-    // Optional one-cycle cold pass; fetch counts include dependency-stall retries.
+    // Optional one-cycle cold pass. Upper fetches include dependency stalls;
+    // pair executions are counted only when the instruction retires.
     static Result replay(std::istream &input, uint32_t repeats,
-                         std::vector<UpperSample> *upperSamples = nullptr
+                         std::vector<UpperSample> *upperSamples = nullptr,
+                         std::vector<PairSample> *pairSamples = nullptr
 #if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
                          , VU1Interpreter::UpperLookup upperLookup = nullptr
 #endif
                          );
     static bool writeUpperKernels(std::ostream &output,
                                   const std::vector<UpperSample> &samples, uint32_t limit);
+    static bool writePairKernels(std::ostream &output,
+                                 const std::vector<PairSample> &samples, uint32_t limit);
 
 private:
     template <class Archive> static void visitState(Archive &archive, VU1Interpreter &vu);

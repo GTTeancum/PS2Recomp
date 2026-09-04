@@ -295,7 +295,7 @@ void register_ps2_vu1_tests()
                 const auto checkBatch = [&]()
                 {
                     std::istringstream input(recorded.str(), std::ios::binary);
-                    const auto result = VUReplay::replay(input, 2u, nullptr, lookup);
+                    const auto result = VUReplay::replay(input, 2u, nullptr, nullptr, lookup);
                     t.IsTrue(result.error.empty(), "Arithmetic sample " + std::to_string(sample) + ": " + result.error);
                     t.Equals(result.cases, batchCases, "Every kernel in the batch must replay");
                     t.IsTrue(result.nativeUpper != 0u && result.interpretedUpper == 0u,
@@ -399,7 +399,9 @@ void register_ps2_vu1_tests()
                 }
                 std::ifstream input(path, std::ios::binary);
                 const char *exportPath = std::getenv("PS2X_VU_REPLAY_UPPER_EXPORT");
+                const char *pairExportPath = std::getenv("PS2X_VU_REPLAY_PAIR_EXPORT");
                 std::vector<VUReplay::UpperSample> upperSamples;
+                std::vector<VUReplay::PairSample> pairSamples;
                 VUReplay::Result result;
 #if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
                 VUNativeModule module(PS2X_TEST_VU_NATIVE_MODULE);
@@ -414,11 +416,19 @@ void register_ps2_vu1_tests()
 #endif
                 {
                     ReplaySampler sampler(std::getenv("PS2X_VU_REPLAY_PROFILE") != nullptr);
-                    result = VUReplay::replay(input, repeats, exportPath ? &upperSamples : nullptr
+                    result = VUReplay::replay(input, repeats, exportPath ? &upperSamples : nullptr,
+                                             pairExportPath ? &pairSamples : nullptr
 #if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
                                              , lookup
 #endif
                                              );
+                }
+                if (pairExportPath && result.error.empty())
+                {
+                    std::ofstream output(pairExportPath);
+                    t.IsTrue(VUReplay::writePairKernels(output, pairSamples, 4096u), "Native pair export must succeed");
+                    std::printf("[vu-replay:pair-export] candidates=%zu limit=4096 executions-exclude-stalls=1\n",
+                                pairSamples.size());
                 }
                 t.IsTrue(result.error.empty(), result.error);
                 std::printf("[vu-replay:upper-coverage] native=%llu interpreted=%llu includes-cold-pass=1\n",
@@ -469,7 +479,8 @@ void register_ps2_vu1_tests()
             t.Equals(vu.state().q, 4.0f, "Recording must execute the actual pending DIV");
             std::istringstream input(output.str(), std::ios::binary);
             std::vector<VUReplay::UpperSample> upperSamples;
-            const auto result = VUReplay::replay(input, 3u, &upperSamples);
+            std::vector<VUReplay::PairSample> pairSamples;
+            const auto result = VUReplay::replay(input, 3u, &upperSamples, &pairSamples);
             t.IsTrue(result.error.empty(), result.error);
             t.Equals(result.cases, 1u, "One arithmetic slice must replay");
             t.Equals(result.iterations, uint64_t{3u}, "All measured repeats must agree");
@@ -477,8 +488,15 @@ void register_ps2_vu1_tests()
             std::ostringstream kernels;
             t.IsTrue(VUReplay::writeUpperKernels(kernels, upperSamples, 128u), "Synthetic native recipe must be written");
             t.IsTrue(kernels.str().find("VU_NATIVE_WORD(0x000002ffu)") != std::string::npos, "Recipe must include the reached NOP");
+            t.IsTrue(!pairSamples.empty(), "One-cycle replay must identify executed instruction pairs");
+            std::ostringstream pairKernels;
+            t.IsTrue(VUReplay::writePairKernels(pairKernels, pairSamples, 4096u), "Synthetic pair recipe must be written");
+            t.IsTrue(pairKernels.str().find("VU_NATIVE_PAIR(0x0008u, 0x00000000u, 0x400002ffu)") != std::string::npos,
+                     "Pair recipe must retain PC and both instruction words");
             t.IsTrue(!VUReplay::writeUpperKernels(kernels, upperSamples, 0u), "Zero kernel limit must be rejected");
             t.IsTrue(!VUReplay::writeUpperKernels(kernels, upperSamples, 513u), "Unbounded kernel limits must be rejected");
+            t.IsTrue(!VUReplay::writePairKernels(pairKernels, pairSamples, 0u), "Zero pair limit must be rejected");
+            t.IsTrue(!VUReplay::writePairKernels(pairKernels, pairSamples, 4097u), "Unbounded pair limit must be rejected");
 
             auto truncated = output.str();
             truncated.pop_back();

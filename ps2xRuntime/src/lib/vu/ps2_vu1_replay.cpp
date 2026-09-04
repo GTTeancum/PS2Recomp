@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <stdexcept>
+#include <tuple>
 #include <type_traits>
 
 namespace
@@ -384,7 +385,8 @@ bool VUReplay::captureSlice(VU1Interpreter &vu, uint8_t *code, uint32_t codeSize
 }
 
 VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
-                                 std::vector<UpperSample> *upperSamples
+                                 std::vector<UpperSample> *upperSamples,
+                                 std::vector<PairSample> *pairSamples
 #if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
                                  , VU1Interpreter::UpperLookup upperLookup
 #endif
@@ -392,8 +394,11 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
 {
     Result result;
     std::map<uint32_t, uint64_t> fetches;
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t>, uint64_t> executedPairs;
     if (upperSamples)
         upperSamples->clear();
+    if (pairSamples)
+        pairSamples->clear();
     try
     {
         require(repeats > 0u && repeats <= 4096u, "Invalid VU replay repetition count");
@@ -456,22 +461,30 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
                 const auto start = std::chrono::steady_clock::now();
                 {
                     ContextScope scope(context);
-                    if (upperSamples && iteration == 0u && elapsedCycles != 0u)
+                    if ((upperSamples || pairSamples) && iteration == 0u && elapsedCycles != 0u)
                     {
                         const auto budgetEnd = initialCycle + record.maxCycles;
                         do
                         {
-                            if (vu->m_state.pc + 8u <= PS2_VU1_CODE_SIZE)
+                            const auto pairPc = vu->m_state.pc;
+                            uint32_t lower = 0;
+                            uint32_t upper = 0;
+                            if (pairPc + 8u <= PS2_VU1_CODE_SIZE)
                             {
-                                uint32_t upper = 0;
-                                std::memcpy(&upper, memory->getVU1Code() + vu->m_state.pc + 4u, sizeof(upper));
-                                if (!vu->decodeUpperUsage(upper).reserved)
+                                std::memcpy(&lower, memory->getVU1Code() + pairPc, sizeof(lower));
+                                std::memcpy(&upper, memory->getVU1Code() + pairPc + 4u, sizeof(upper));
+                                if (upperSamples && !vu->decodeUpperUsage(upper).reserved)
                                     ++fetches[upper];
                                 require(fetches.size() <= 4096u, "Too many VU upper instruction candidates");
                             }
                             const auto beforeCycle = vu->m_cycle;
                             vu->run(memory->getVU1Code(), PS2_VU1_CODE_SIZE,
                                     memory->getVU1Data(), PS2_VU1_DATA_SIZE, gs, memory.get(), 1u);
+                            if (pairSamples && vu->m_state.pc != pairPc)
+                            {
+                                ++executedPairs[{pairPc, lower, upper}];
+                                require(executedPairs.size() <= 4096u, "Too many VU instruction-pair candidates");
+                            }
                             if (!vu->m_running || vu->m_cycle == beforeCycle)
                                 break;
                         } while (vu->m_cycle < budgetEnd);
@@ -526,6 +539,24 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
                                                     : left.instruction < right.instruction;
             });
         }
+        if (pairSamples)
+        {
+            for (const auto &[key, count] : executedPairs)
+            {
+                const auto &[pc, lower, upper] = key;
+                pairSamples->push_back({pc, lower, upper, count});
+            }
+            std::sort(pairSamples->begin(), pairSamples->end(), [](const auto &left, const auto &right)
+            {
+                if (left.executions != right.executions)
+                    return left.executions > right.executions;
+                if (left.pc != right.pc)
+                    return left.pc < right.pc;
+                if (left.lower != right.lower)
+                    return left.lower < right.lower;
+                return left.upper < right.upper;
+            });
+        }
     }
     catch (const std::exception &error)
     {
@@ -545,6 +576,28 @@ bool VUReplay::writeUpperKernels(std::ostream &output,
     for (size_t i = 0; i < std::min<size_t>(limit, samples.size()); ++i)
         output << "VU_NATIVE_WORD(0x" << std::hex << std::setw(8) << std::setfill('0')
                << samples[i].instruction << "u)\n";
+    output.flags(flags);
+    output.fill(fill);
+    return static_cast<bool>(output);
+}
+
+bool VUReplay::writePairKernels(std::ostream &output,
+                               const std::vector<PairSample> &samples, uint32_t limit)
+{
+    if (limit == 0u || limit > 4096u || samples.empty())
+        return false;
+    const auto flags = output.flags();
+    const auto fill = output.fill();
+    output << "// Private replay-derived VU instruction pairs. Do not redistribute.\n";
+    for (size_t i = 0; i < std::min<size_t>(limit, samples.size()); ++i)
+    {
+        const auto &sample = samples[i];
+        if ((sample.pc & 7u) != 0u || sample.pc >= PS2_VU1_CODE_SIZE || sample.executions == 0u)
+            return false;
+        output << "VU_NATIVE_PAIR(0x" << std::hex << std::setw(4) << std::setfill('0') << sample.pc
+               << "u, 0x" << std::setw(8) << sample.lower
+               << "u, 0x" << std::setw(8) << sample.upper << "u)\n";
+    }
     output.flags(flags);
     output.fill(fill);
     return static_cast<bool>(output);
