@@ -857,10 +857,16 @@ void VU1Interpreter::progressXgkick()
         }
 
         const uint32_t qwordOffset = m_xgkick.copiedBytes;
-        for (uint32_t i = 0; i < 16u; ++i)
+        const uint32_t address = m_xgkick.sourceAddress + qwordOffset;
+        const uint32_t source = address % m_activeVuDataSize;
+        if (address <= UINT32_MAX - 15u && m_activeVuDataSize - source >= 16u)
         {
-            const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes + i) % m_activeVuDataSize;
-            m_xgkick.packet[m_xgkick.copiedBytes + i] = m_activeVuData[source];
+            std::memcpy(m_xgkick.packet.data() + qwordOffset, m_activeVuData + source, 16u);
+        }
+        else
+        {
+            for (uint32_t i = 0; i < 16u; ++i)
+                m_xgkick.packet[qwordOffset + i] = m_activeVuData[(address + i) % m_activeVuDataSize];
         }
         m_xgkick.copiedBytes += 16u;
 
@@ -1633,9 +1639,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
     const uint64_t budgetEnd = m_cycle + maxCycles;
     bool programEnded = false;
+    // Resume may enter with pending work. Subsequent cycle boundaries already
+    // retire pipelines in advanceOneCycle(), before PATH1 reads VU memory.
+    if (m_cycle < budgetEnd && !m_stopRequested)
+        commitReadyPipelines();
     while (m_cycle < budgetEnd && !m_stopRequested)
     {
-        commitReadyPipelines();
         if (m_state.pc + 8u > codeSize)
             break;
 

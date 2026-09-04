@@ -1136,6 +1136,50 @@ void register_ps2_vu1_tests()
             t.Equals(vu1.state().vi[1], 2, "second execution should rebuild decode after the direct write");
         });
 
+        tc.Run("XGKICK preserves qword bytes across arbitrary memory boundaries", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+            if (!fx.code || !fx.data)
+                return;
+            writeTrackedVuInstructionPair(fx, 0u, makeVuLowerSpecial(0x6Cu, 1u), kVuUpperNop);
+            writeTrackedVuInstructionPair(fx, 8u, 0u, kVuUpperNop);
+            writeTrackedVuInstructionPair(fx, 16u, 0u, kVuUpperNop);
+            std::vector<uint8_t> expected(32u, 0u), captured;
+            const uint64_t tag = makeGifTag(1u, GIF_FMT_IMAGE, 0u, true);
+            std::memcpy(expected.data(), &tag, sizeof(tag));
+            for (uint32_t i = 16u; i < 32u; ++i)
+                expected[i] = static_cast<uint8_t>(0xA0u + i);
+            fx.mem.setGifPacketCallback([&](const uint8_t *packet, uint32_t size)
+            {
+                captured.assign(packet, packet + size);
+            });
+            for (const uint32_t size : {32u, 33u, 47u, 64u, uint32_t{PS2_VU1_DATA_SIZE}})
+            {
+                const uint32_t source = ((size - 1u) / 16u) * 16u;
+                std::vector<uint8_t> data(size + 16u, 0xCDu);
+                for (uint32_t i = 0; i < expected.size(); ++i)
+                    data[(source + i) % size] = expected[i];
+                VU1Interpreter vu;
+                vu.state().vi[1] = static_cast<int32_t>(source / 16u);
+                captured.clear();
+                vu.execute(fx.code, PS2_VU1_CODE_SIZE, data.data(), size,
+                           fx.gs, &fx.mem, 0u, 0u, 0u, 1u);
+                t.IsTrue(captured.empty(), "The first cycle must transfer only the tag");
+                vu.resume(fx.code, PS2_VU1_CODE_SIZE, data.data(), size,
+                          fx.gs, &fx.mem, 0u, 0u, 0u);
+                t.Equals(vu.state().cycles, uint64_t{1u}, "A zero-cycle resume must not advance PATH1");
+                t.IsTrue(captured.empty(), "A zero-cycle resume must not emit the packet");
+                vu.resume(fx.code, PS2_VU1_CODE_SIZE, data.data(), size,
+                          fx.gs, &fx.mem, 0u, 0u, 1u);
+                t.IsTrue(captured.empty(), "The payload must still be pending at cycle two");
+                vu.resume(fx.code, PS2_VU1_CODE_SIZE, data.data(), size,
+                          fx.gs, &fx.mem, 0u, 0u, 1u);
+                t.Equals(vu.state().cycles, uint64_t{3u}, "The payload must finish at cycle three");
+                t.IsTrue(captured == expected, "Every wrapped tag and payload byte must match");
+            }
+        });
+
         tc.Run("XGKICK sends a VU memory GIF packet through PATH1", [](TestCase &t)
         {
             PS2Memory mem;
