@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/ps2_vu1.h"
+#include "vu_native_build_id.h"
 #include <cstddef>
 #include <cstdint>
 #include <cstring>

@@ -1,4 +1,4 @@
-#include "VUNativeModule.h"
+#include "runtime/ps2_vu1_native_module.h"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX

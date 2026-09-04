@@ -27,6 +27,15 @@ namespace
 template <uint32_t Word> void VU1Interpreter::execUpperNative()
 {
     constexpr uint32_t instr = Word;
+    // Bind the existing write sites to the same arithmetic with a known opcode.
+    const auto applyFmacDest = [this](float *dst, float *result, uint8_t dest)
+    {
+        applyFmacDestFor<Word>(dst, result, dest);
+    };
+    const auto applyFmacDestAcc = [this](float *result, uint8_t dest)
+    {
+        applyFmacDestAccFor<Word>(result, dest);
+    };
 #else
 void VU1Interpreter::execUpper(uint32_t instr)
 {

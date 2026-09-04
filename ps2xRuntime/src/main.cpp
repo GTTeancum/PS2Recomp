@@ -1,5 +1,9 @@
 #include "ps2_runtime.h"
 #include "games_database.h"
+#if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
+#include "runtime/ps2_vu1_native_module.h"
+#include <memory>
+#endif
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
 #include "ps2_debug_panel.h"
 #endif
@@ -244,6 +248,22 @@ int main(int argc, char *argv[])
             windowTitle += elfName;
         }
 
+        const char *nativeModulePath = std::getenv("PS2X_VU_NATIVE_MODULE");
+#if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
+        // Declared before runtime so early-return unwinding cannot unload live kernels.
+        std::unique_ptr<VUNativeModule> nativeModule;
+        VU1Interpreter::UpperLookup nativeLookup = nullptr;
+        if (nativeModulePath && *nativeModulePath)
+        {
+            nativeModule = std::make_unique<VUNativeModule>(nativeModulePath);
+            nativeLookup = nativeModule->initialize(VUNative::makeHost());
+            if (!nativeLookup)
+                throw std::runtime_error("Unable to load matching native VU module; use an absolute path to the DLL from this build");
+        }
+#else
+        if (nativeModulePath && *nativeModulePath)
+            throw std::runtime_error("This runner was built without native VU upper support");
+#endif
         PS2Runtime runtime;
 #if defined(_WIN32)
         g_activeRuntime = &runtime;
@@ -280,7 +300,27 @@ int main(int argc, char *argv[])
             return 1;
         }
 
+#if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
+        runtime.vu0().setUpperLookup(nativeLookup);
+        runtime.vu1().setUpperLookup(nativeLookup);
+        std::fprintf(stderr, "[vu:native] mode=%s fingerprint=%s\n",
+                     nativeLookup ? "native-with-fallback" : "interpreter",
+                     PS2X_VU_NATIVE_FINGERPRINT);
+#endif
         runtime.run();
+#if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
+        // run() joins the game thread before these non-atomic counters are read.
+        const auto vu0Counters = runtime.vu0().upperCounters();
+        const auto vu1Counters = runtime.vu1().upperCounters();
+        std::fprintf(stderr, "[vu:native] stopped vu0=%llu/%llu vu1=%llu/%llu (native/interpreted)\n",
+                     static_cast<unsigned long long>(vu0Counters.native),
+                     static_cast<unsigned long long>(vu0Counters.interpreted),
+                     static_cast<unsigned long long>(vu1Counters.native),
+                     static_cast<unsigned long long>(vu1Counters.interpreted));
+        runtime.vu0().setUpperLookup(nullptr);
+        runtime.vu1().setUpperLookup(nullptr);
+        nativeModule.reset();
+#endif
 
 #ifdef _DEBUG
         ps2_log::print_saved_location();

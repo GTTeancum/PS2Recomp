@@ -13516,6 +13516,16 @@ void PS2Runtime::run()
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
 
+    uint64_t probeVsyncLimit = 0u;
+    if (const char *value = std::getenv("PS2X_RUN_VSYNC_LIMIT"); value && *value)
+    {
+        char *end = nullptr;
+        const auto parsed = std::strtoull(value, &end, 10);
+        if (*value < '0' || *value > '9' || !end || *end || parsed > UINT32_MAX)
+            throw std::runtime_error("PS2X_RUN_VSYNC_LIMIT must be an unsigned 32-bit decimal tick (0 disables it)");
+        probeVsyncLimit = parsed;
+    }
+
     std::atomic<bool> gameThreadFinished{false};
 
     std::thread gameThread([&]()
@@ -13550,6 +13560,14 @@ void PS2Runtime::run()
     }
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
+        if (probeVsyncLimit != 0u &&
+            m_memory.gs().vsyncTick.load(std::memory_order_acquire) >= probeVsyncLimit)
+        {
+            std::fprintf(stderr, "[run:probe-limit] vsync=%llu\n",
+                         static_cast<unsigned long long>(probeVsyncLimit));
+            requestStop();
+            break;
+        }
         tick++;
         if (xmenProgressTrace.is_open() && (tick % 120u) == 0u)
         {

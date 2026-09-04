@@ -1,7 +1,7 @@
 #include "MiniTest.h"
 #include "ReplaySampler.h"
 #if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
-#include "VUNativeModule.h"
+#include "runtime/ps2_vu1_native_module.h"
 #endif
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/gs/gs_frontend.h"
@@ -232,6 +232,9 @@ void register_ps2_vu1_tests()
             const auto host = VUNative::makeHost();
             VUNativeModule relative("ps2_vu_native_upper.dll");
             t.IsTrue(relative.initialize(host) == nullptr, "Relative module paths must not load");
+            VUNativeModule missing(std::filesystem::path(PS2X_TEST_VU_NATIVE_MODULE) /
+                                   "missing.dll");
+            t.IsTrue(missing.initialize(host) == nullptr, "Missing modules must not initialize");
             for (uint32_t attempt = 0; attempt < 2u; ++attempt)
             {
                 VUNativeModule module(PS2X_TEST_VU_NATIVE_MODULE);
@@ -283,9 +286,26 @@ void register_ps2_vu1_tests()
                 0x7fc01234u, 0x3f800000u, 0xc0000000u, 0x3f000001u,
                 0x4f000000u, 0xcf000000u
             };
-            for (uint32_t sample = 0; sample < std::size(values); ++sample)
+            uint32_t random = 0x9e3779b9u;
+            for (uint32_t sample = 0; sample < 32u; ++sample)
             {
                 std::ostringstream recorded(std::ios::binary);
+                uint32_t batchCases = 0u;
+                uint32_t checkedCases = 0u;
+                const auto checkBatch = [&]()
+                {
+                    std::istringstream input(recorded.str(), std::ios::binary);
+                    const auto result = VUReplay::replay(input, 2u, nullptr, lookup);
+                    t.IsTrue(result.error.empty(), "Arithmetic sample " + std::to_string(sample) + ": " + result.error);
+                    t.Equals(result.cases, batchCases, "Every kernel in the batch must replay");
+                    t.IsTrue(result.nativeUpper != 0u && result.interpretedUpper == 0u,
+                             "Arithmetic replay must use native kernels exclusively");
+                    checkedCases += result.cases;
+                    recorded.str("");
+                    recorded.clear();
+                    batchCases = 0u;
+                    return result.error.empty();
+                };
                 for (const uint32_t word : words)
                 {
                     t.IsTrue(lookup(word) != nullptr, "Every synthetic instruction needs a native kernel");
@@ -296,7 +316,11 @@ void register_ps2_vu1_tests()
                     for (uint32_t reg = 1; reg < 32u; ++reg)
                         for (uint32_t lane = 0; lane < 4u; ++lane)
                         {
-                            const auto bits = values[(sample + reg * 3u + lane) % std::size(values)];
+                            random ^= random << 13u;
+                            random ^= random >> 17u;
+                            random ^= random << 5u;
+                            const auto bits = sample < std::size(values)
+                                ? values[(sample + reg * 3u + lane) % std::size(values)] : random;
                             std::memcpy(&vu.state().vf[reg][lane], &bits, sizeof(bits));
                         }
                     std::memcpy(vu.state().acc, vu.state().vf[4], sizeof(vu.state().acc));
@@ -306,15 +330,12 @@ void register_ps2_vu1_tests()
                                fx.gs, &fx.mem, 0u, 0u, 0u, 0u);
                     t.IsTrue(VUReplay::record(recorded, vu, fx.code, fx.data, fx.gs, &fx.mem, 16u),
                              "Synthetic arithmetic must record without overflow");
+                    if (++batchCases == 32u && !checkBatch())
+                        return;
                 }
-                std::istringstream input(recorded.str(), std::ios::binary);
-                const auto result = VUReplay::replay(input, 2u, nullptr, lookup);
-                t.IsTrue(result.error.empty(), "Boundary sample " + std::to_string(sample) + ": " + result.error);
-                t.Equals(result.cases, static_cast<uint32_t>(std::size(words)), "Every kernel must replay");
-                t.IsTrue(result.nativeUpper != 0u && result.interpretedUpper == 0u,
-                         "The boundary replay must use native kernels exclusively");
-                if (!result.error.empty())
+                if (batchCases != 0u && !checkBatch())
                     return;
+                t.Equals(checkedCases, static_cast<uint32_t>(std::size(words)), "Every synthetic instruction must be checked");
             }
         });
 

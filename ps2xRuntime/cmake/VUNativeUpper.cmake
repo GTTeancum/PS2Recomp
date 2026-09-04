@@ -79,12 +79,16 @@ foreach(source IN LISTS abi_sources)
 endforeach()
 string(SHA256 abi_hash "${abi_hashes}")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${abi_sources})
-set(native_definitions
-    PS2X_ENABLE_VU_NATIVE_UPPER=1
-    PS2X_VU_NATIVE_FINGERPRINT="${abi_hash}"
-    PS2X_VU_NATIVE_CONFIGURATION="$<CONFIG>")
+set(native_build_dir "${CMAKE_CURRENT_BINARY_DIR}/vu-native/$<CONFIG>")
+# Only ABI consumers need rebuilding when arithmetic changes, not every guest source.
+file(GENERATE OUTPUT "${native_build_dir}/vu_native_build_id.h" CONTENT
+    "#pragma once\n#define PS2X_VU_NATIVE_FINGERPRINT \"${abi_hash}\"\n#define PS2X_VU_NATIVE_CONFIGURATION \"$<CONFIG>\"\n")
+set(native_definitions PS2X_ENABLE_VU_NATIVE_UPPER=1)
 target_compile_definitions(ps2_runtime PUBLIC ${native_definitions})
-target_sources(ps2_runtime PRIVATE "${native_dir}/ps2_vu1_native_host.cpp")
+target_include_directories(ps2_runtime PUBLIC "${native_build_dir}")
+target_sources(ps2_runtime PRIVATE
+    "${native_dir}/ps2_vu1_native_host.cpp"
+    "${native_dir}/ps2_vu1_native_loader.cpp")
 
 add_library(ps2_vu_native_upper MODULE "${native_dir}/ps2_vu1_native_module.cpp")
 set(native_targets ps2_vu_native_upper)
@@ -98,11 +102,13 @@ foreach(source IN LISTS kernel_sources)
 endforeach()
 foreach(native_target IN LISTS native_targets)
     target_include_directories(${native_target} PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_BINARY_DIR}" "${native_dir}")
+        "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_BINARY_DIR}" "${native_dir}"
+        "${native_build_dir}")
     set_target_properties(${native_target} PROPERTIES UNITY_BUILD OFF)
     target_compile_definitions(${native_target} PRIVATE ${native_definitions} PS2X_BUILD_VU_NATIVE_UPPER=1)
     target_compile_features(${native_target} PRIVATE cxx_std_20)
     target_compile_options(${native_target} PRIVATE /MP1)
     EnableFastReleaseMode(${native_target})
 endforeach()
+add_dependencies(ps2EntryRunner ps2_vu_native_upper)
 message(STATUS "Experimental native VU upper kernels: ${word_count}")

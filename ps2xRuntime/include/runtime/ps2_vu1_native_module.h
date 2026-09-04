@@ -6,6 +6,7 @@
 class VUNativeModule
 {
 public:
+    // Keep this owner alive until every attached interpreter has stopped and detached.
     explicit VUNativeModule(const std::filesystem::path &path);
     ~VUNativeModule();
     VUNativeModule(const VUNativeModule &) = delete;

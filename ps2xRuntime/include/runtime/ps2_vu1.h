@@ -338,10 +338,13 @@ private:
     PS2X_VU_ARITH_INLINE void applyDestAcc(const float *result, uint8_t dest);
     PS2X_VU_ARITH_INLINE void applyFmacDest(float *dst, float *result, uint8_t dest);
     PS2X_VU_ARITH_INLINE void applyFmacDestAcc(float *result, uint8_t dest);
-    PS2X_VU_ARITH_INLINE void normalizeFmacResult(float *result, uint8_t dest, uint8_t laneFlags[4]);
-    PS2X_VU_ARITH_INLINE bool calculateFmacExactResult(uint32_t component, long double &result) const;
     PS2X_VU_ARITH_INLINE uint8_t normalizeFmacExactResult(float &value, long double exactResult) const;
-    PS2X_VU_ARITH_INLINE uint32_t calculateFmacProductSticky(uint8_t dest) const;
+    static constexpr uint64_t kDynamicUpper = uint64_t{1} << 32u;
+    template <uint64_t Word> void normalizeFmacResultFor(float *result, uint8_t dest, uint8_t laneFlags[4]);
+    template <uint64_t Word> bool calculateFmacExactResultFor(uint32_t component, long double &result) const;
+    template <uint64_t Word> uint32_t calculateFmacProductStickyFor(uint8_t dest) const;
+    template <uint64_t Word> void applyFmacDestFor(float *dst, float *result, uint8_t dest);
+    template <uint64_t Word> void applyFmacDestAccFor(float *result, uint8_t dest);
     void updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky);
     void queueFsset(uint16_t immediate);
     void queueClip(uint32_t clip);
