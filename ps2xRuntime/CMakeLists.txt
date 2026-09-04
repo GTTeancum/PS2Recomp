@@ -11,6 +11,7 @@ option(PS2X_ENABLE_RUNNER_PCH "Precompile the heavy runtime headers for ps2Entry
 option(PS2X_ENABLE_SCCACHE "Use sccache as compiler launcher when available" ON)
 
 option(PS2X_ENABLE_RUNTIME_LOGS "Enable PS2 runtime logs" OFF)
+option(PS2X_ENABLE_VU_DETAIL_PROFILE "Build sampled per-instruction VU timing diagnostics" OFF)
 option(PS2X_ENABLE_AGRESSIVE_LOGS "Enable very verbose/agressive PS2 runtime logs" OFF)
 option(PS2X_ENABLE_IOP_RPC_TRACE "Log unhandled IOP/SIF RPC trace suggestions" ON)
 option(PS2X_STRICT_RETURN_DIAGNOSTICS "Route generated JR $ra returns through runtime branch diagnostics" OFF)
@@ -401,6 +402,10 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu1_lower.cpp
     src/lib/games_database.cpp
 )
+
+if(PS2X_ENABLE_VU_DETAIL_PROFILE)
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_ENABLE_VU_DETAIL_PROFILE=1)
+endif()
 
 if(PS2X_ENABLE_RUNTIME_LOGS)
     target_compile_definitions(ps2_runtime PUBLIC

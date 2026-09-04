@@ -491,28 +491,6 @@ void VU1Interpreter::reset()
     resetScheduler();
 }
 
-float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
-{
-    return normalizeOperand(vf[bc & 3u]);
-}
-
-float VU1Interpreter::normalizeOperand(float value) const
-{
-    uint32_t bits = 0;
-    std::memcpy(&bits, &value, sizeof(bits));
-    const uint32_t exponent = (bits >> 23) & 0xFFu;
-    if (exponent == 0u)
-    {
-        bits &= 0x80000000u;
-    }
-    else if (exponent == 0xFFu)
-    {
-        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
-    }
-    std::memcpy(&value, &bits, sizeof(value));
-    return value;
-}
-
 float VU1Interpreter::normalizeResult(float value, uint32_t &laneFlags) const
 {
     uint32_t bits = 0;
@@ -1255,6 +1233,9 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
 
 void VU1Interpreter::commitReadyPipelines()
 {
+#if defined(PS2X_ENABLE_VU_DETAIL_PROFILE)
+    RuntimeProfile::Scope profile(RuntimeProfile::Phase::VuRetire, RuntimeProfile::sampleVu);
+#endif
     for (uint32_t slots = m_flagPipelineMask; slots != 0u; slots &= slots - 1u)
     {
         const uint32_t slot = static_cast<uint32_t>(std::countr_zero(slots));
@@ -1966,6 +1947,9 @@ void VU1Interpreter::flushPipelines()
 
 uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &decoded) const
 {
+#if defined(PS2X_ENABLE_VU_DETAIL_PROFILE)
+    RuntimeProfile::Scope profile(RuntimeProfile::Phase::VuHazard, RuntimeProfile::sampleVu);
+#endif
     uint64_t ready = m_cycle;
     const InstructionUsage *usages[2] = {
         &decoded.upperUsage,
@@ -2014,6 +1998,9 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
 
 void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
 {
+#if defined(PS2X_ENABLE_VU_DETAIL_PROFILE)
+    RuntimeProfile::Scope profile(RuntimeProfile::Phase::VuWriteback, RuntimeProfile::sampleVu);
+#endif
     const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
     if (lowerWrite.reg != 0u &&
         decoded.suppressedLowerVf != lowerWrite.reg)
@@ -2526,6 +2513,9 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
 VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPairForPc(
     const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc)
 {
+#if defined(PS2X_ENABLE_VU_DETAIL_PROFILE)
+    RuntimeProfile::Scope profile(RuntimeProfile::Phase::VuDecode, RuntimeProfile::sampleVu);
+#endif
     if ((pc & 7u) != 0u)
         return decodeInstructionPair(vuCode, pc);
 
@@ -2858,6 +2848,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
 {
     RuntimeProfile::Scope vuProfile(RuntimeProfile::Phase::Vu);
+#if defined(PS2X_ENABLE_VU_DETAIL_PROFILE)
+    RuntimeProfile::VuDetailSample detailSample;
+    RuntimeProfile::Scope sampleProfile(RuntimeProfile::Phase::VuSample, RuntimeProfile::sampleVu);
+#endif
     struct BudgetTraceEntry
     {
         uint32_t pc = 0;

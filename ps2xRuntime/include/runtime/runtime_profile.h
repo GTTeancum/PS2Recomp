@@ -8,7 +8,11 @@
 
 namespace RuntimeProfile
 {
-    enum class Phase : size_t { Scheduler, Guest, Events, Wait, Transfers, Vu, Gs, Count };
+    enum class Phase : size_t
+    {
+        Scheduler, Guest, Events, Wait, Transfers, Vu, Gs,
+        VuSample, VuDecode, VuHazard, VuUpper, VuLower, VuRetire, VuWriteback, Count
+    };
     struct Totals
     {
         uint64_t calls = 0u;
@@ -24,12 +28,43 @@ namespace RuntimeProfile
         uint64_t tick = 0u;
     };
     inline thread_local State state{};
+    inline thread_local bool sampleVu = false;
 
     inline bool enabled()
     {
         static const bool value = std::getenv("PS2X_RUNTIME_PHASE_PROFILE") != nullptr;
         return value;
     }
+
+    class VuDetailSample
+    {
+    public:
+        VuDetailSample() noexcept
+        {
+            static const bool requested = std::getenv("PS2X_VU_DETAIL_PROFILE") != nullptr;
+            if (!requested || !enabled())
+                return;
+            m_enabled = true;
+            m_previous = sampleVu;
+            // Sample complete slices without synchronizing to microprogram loop lengths.
+            static thread_local uint32_t random = 0x93A76C51u;
+            random ^= random << 13u;
+            random ^= random >> 17u;
+            random ^= random << 5u;
+            sampleVu = state.tick >= 1000u && (random & 63u) == 0u;
+        }
+        ~VuDetailSample()
+        {
+            if (m_enabled)
+                sampleVu = m_previous;
+        }
+        VuDetailSample(const VuDetailSample &) = delete;
+        VuDetailSample &operator=(const VuDetailSample &) = delete;
+
+    private:
+        bool m_enabled = false;
+        bool m_previous = false;
+    };
 
     // Nested stages are subtracted from their parents, including exception unwinds.
     class Scope
@@ -69,8 +104,10 @@ namespace RuntimeProfile
     private:
         static void report(std::chrono::steady_clock::time_point now) noexcept
         {
-            constexpr std::array<const char *, 7> names{
-                "scheduler", "guest", "events", "wait", "transfers", "vu", "gs"};
+            constexpr std::array names{
+                "scheduler", "guest", "events", "wait", "transfers", "vu", "gs",
+                "vu-sample", "vu-decode", "vu-hazard", "vu-upper", "vu-lower", "vu-retire", "vu-writeback"};
+            static_assert(names.size() == static_cast<size_t>(Phase::Count));
             const double wallMs = std::chrono::duration<double, std::milli>(now - state.windowStart).count();
             char line[1536]{};
             size_t used = static_cast<size_t>(std::snprintf(line, sizeof(line),

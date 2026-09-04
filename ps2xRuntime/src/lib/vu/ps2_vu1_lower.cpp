@@ -1,4 +1,5 @@
 #include "runtime/ps2_vu1.h"
+#include "runtime/runtime_profile.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_memory.h"
@@ -71,6 +72,9 @@ namespace
 // ============================================================================
 void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr)
 {
+#if defined(PS2X_ENABLE_VU_DETAIL_PROFILE)
+    RuntimeProfile::Scope profile(RuntimeProfile::Phase::VuLower, RuntimeProfile::sampleVu);
+#endif
     (void)upperInstr;
     if (instr == 0x00000000 || instr == 0x8000033C) // NOP
         return;

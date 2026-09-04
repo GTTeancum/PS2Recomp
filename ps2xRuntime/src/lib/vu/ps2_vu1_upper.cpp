@@ -1,4 +1,5 @@
 #include "runtime/ps2_vu1.h"
+#include "runtime/runtime_profile.h"
 #include "ps2_vu1_detail.h"
 
 #include <cmath>
@@ -24,7 +25,12 @@ namespace
 // ============================================================================
 void VU1Interpreter::execUpper(uint32_t instr)
 {
+#if defined(PS2X_ENABLE_VU_DETAIL_PROFILE)
+    RuntimeProfile::Scope profile(RuntimeProfile::Phase::VuUpper, RuntimeProfile::sampleVu);
+#endif
     m_currentUpperInstruction = instr;
+    if ((instr & 0x7FFu) == 0x2FFu)
+        return; // NOP does not read or normalize arithmetic operands.
     uint8_t dest = DEST(instr);
     uint8_t ft = FT(instr);
     uint8_t fs = FS(instr);
