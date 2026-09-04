@@ -84,6 +84,8 @@ public:
     }
 
 private:
+    friend class VUReplay;
+
     enum Pipeline : uint8_t
     {
         PipelineNone = 0,

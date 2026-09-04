@@ -4,13 +4,16 @@
 #include "runtime/gs/ps2_gs_psmct32.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu1.h"
+#include "runtime/ps2_vu1_replay.h"
 
 #include <cmath>
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <limits>
+#include <sstream>
 #include <vector>
 
 namespace
@@ -219,6 +222,120 @@ void register_ps2_vu1_tests()
 {
     MiniTest::Case("PS2VU1", [](TestCase &tc)
     {
+        if (const char *path = std::getenv("PS2X_VU_REPLAY_FILE"))
+        {
+            tc.Run("recorded VU slices reproduce state memory and graphics packets", [path = std::string(path)](TestCase &t)
+            {
+                uint32_t repeats = 128u;
+                if (const char *value = std::getenv("PS2X_VU_REPLAY_REPEATS"))
+                {
+                    char *end = nullptr;
+                    const auto parsed = std::strtoul(value, &end, 10);
+                    t.IsTrue(end != value && *end == '\0' && parsed > 0u && parsed <= 4096u,
+                             "Replay repetitions must be between 1 and 4096");
+                    if (end == value || *end != '\0' || parsed == 0u || parsed > 4096u)
+                        return;
+                    repeats = static_cast<uint32_t>(parsed);
+                }
+                std::ifstream input(path, std::ios::binary);
+                const auto result = VUReplay::replay(input, repeats);
+                t.IsTrue(result.error.empty(), result.error);
+                for (size_t index = 0; index < result.timings.size(); ++index)
+                {
+                    const auto &entry = result.timings[index];
+                    std::printf("[vu-replay:case] index=%zu pc=0x%x budget=%u cycles=%llu gif-bytes=%u execute-ms=%.3f\n",
+                                index, entry.pc, entry.budget, static_cast<unsigned long long>(entry.cycles),
+                                entry.gifBytes, static_cast<double>(entry.executeNs) / 1000000.0);
+                }
+                std::printf("[vu-replay:result] cases=%u iterations=%llu cycles=%llu execute-ms=%.3f digest=%016llx error=%s\n",
+                            result.cases, static_cast<unsigned long long>(result.iterations),
+                            static_cast<unsigned long long>(result.cycles),
+                            static_cast<double>(result.executeNs) / 1000000.0,
+                            static_cast<unsigned long long>(result.digest), result.error.c_str());
+            });
+        }
+
+        tc.Run("VU replay preserves pending arithmetic pipelines", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+            if (!fx.code || !fx.data)
+                return;
+            writeTrackedVuInstructionPair(fx, 0u, makeVuDiv(1u, 2u, 0u, 0u),
+                                          makeVuUpper(0x28u, 0xFu, 2u, 1u, 3u));
+            writeTrackedVuInstructionPair(fx, 8u, 0u, kVuUpperNop | 0x40000000u);
+            writeTrackedVuInstructionPair(fx, 16u, 0u, kVuUpperNop);
+            VU1Interpreter vu;
+            vu.state().vf[1][0] = 8.0f;
+            vu.state().vf[2][0] = 2.0f;
+            vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
+                       fx.gs, &fx.mem, 0u, 0u, 0u, 1u);
+            t.Equals(vu.state().vf[3][0], 0.0f, "FMAC must still be pending at capture");
+            t.Equals(vu.state().q, 1.0f, "DIV must still be pending at capture");
+            std::ostringstream output(std::ios::binary);
+            t.IsTrue(VUReplay::record(output, vu, fx.code, fx.data, fx.gs, &fx.mem, 32u),
+                     "The arithmetic slice must be recorded");
+            t.Equals(vu.state().vf[3][0], 10.0f, "Recording must execute the actual pending FMAC");
+            t.Equals(vu.state().q, 4.0f, "Recording must execute the actual pending DIV");
+            std::istringstream input(output.str(), std::ios::binary);
+            const auto result = VUReplay::replay(input, 3u);
+            t.IsTrue(result.error.empty(), result.error);
+            t.Equals(result.cases, 1u, "One arithmetic slice must replay");
+            t.Equals(result.iterations, uint64_t{3u}, "All measured repeats must agree");
+
+            auto truncated = output.str();
+            truncated.pop_back();
+            std::istringstream badInput(truncated, std::ios::binary);
+            t.IsTrue(!VUReplay::replay(badInput, 1u).error.empty(), "Truncated captures must be rejected");
+        });
+
+        tc.Run("VU replay preserves partial PATH1 transfers and checks packet bytes", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+            if (!fx.code || !fx.data)
+                return;
+            const uint64_t tag = makeGifTag(4u, GIF_FMT_PACKED, 1u, true);
+            const uint64_t regs = 0xFu;
+            std::memcpy(fx.data, &tag, sizeof(tag));
+            std::memcpy(fx.data + 8u, &regs, sizeof(regs));
+            std::memset(fx.data + 16u, 0x5Au, 64u);
+            writeTrackedVuInstructionPair(fx, 0u, makeVuLowerSpecial(0x6Cu, 1u), kVuUpperNop);
+            writeTrackedVuInstructionPair(fx, 8u, 0u, kVuUpperNop | 0x40000000u);
+            writeTrackedVuInstructionPair(fx, 16u, 0u, kVuUpperNop);
+            VU1Interpreter vu;
+            vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
+                       fx.gs, &fx.mem, 0u, 0u, 0u, 1u);
+            t.Equals(vu.debugCounters().xgkickFinishes, uint64_t{0u}, "PATH1 must still be active at capture");
+            std::ostringstream output(std::ios::binary);
+            t.IsTrue(VUReplay::record(output, vu, fx.code, fx.data, fx.gs, &fx.mem, 32u),
+                     "The PATH1 slice must be recorded");
+            t.Equals(vu.debugCounters().xgkickFinishes, uint64_t{1u}, "Recording must finish the live transfer");
+            std::istringstream input(output.str(), std::ios::binary);
+            const auto result = VUReplay::replay(input, 2u);
+            t.IsTrue(result.error.empty(), result.error);
+            t.Equals(result.cases, 1u, "One PATH1 slice must replay");
+
+            auto corrupted = output.str();
+            corrupted.back() ^= 1; // Last byte is in the expected emitted GIF packet.
+            std::istringstream badInput(corrupted, std::ios::binary);
+            t.IsTrue(!VUReplay::replay(badInput, 1u).error.empty(), "Changed packet bytes must fail replay");
+            auto wrongCycle = output.str();
+            wrongCycle[wrongCycle.size() - 80u - 12u] ^= 1;
+            std::istringstream badTiming(wrongCycle, std::ios::binary);
+            t.IsTrue(!VUReplay::replay(badTiming, 1u).error.empty(), "Changed packet emission cycles must fail replay");
+        });
+
+        tc.Run("VU replay rejects invalid headers and repetition counts", [](TestCase &t)
+        {
+            std::istringstream badHeader(std::string(8u, '\xFF'), std::ios::binary);
+            t.IsTrue(!VUReplay::replay(badHeader, 1u).error.empty(), "Invalid headers must fail");
+            std::istringstream empty;
+            t.IsTrue(!VUReplay::replay(empty, 1u).error.empty(), "An empty capture must fail");
+            std::istringstream noRepeats;
+            t.IsTrue(!VUReplay::replay(noRepeats, 0u).error.empty(), "Zero repetitions must fail");
+        });
+
         tc.Run("upper NOP preserves register bits and flags", [](TestCase &t)
         {
             Vu1Fixture fx;
@@ -1332,6 +1449,50 @@ void register_ps2_vu1_tests()
                     }
                 }
                 t.IsTrue(payloadOk, "wrapped payload should be copied from start of VU1 memory");
+            }
+        });
+
+        tc.Run("XGKICK preserves qword bytes across arbitrary memory boundaries", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+            if (!fx.code || !fx.data)
+                return;
+            writeTrackedVuInstructionPair(fx, 0u, makeVuLowerSpecial(0x6Cu, 1u), kVuUpperNop);
+            writeTrackedVuInstructionPair(fx, 8u, 0u, kVuUpperNop);
+            writeTrackedVuInstructionPair(fx, 16u, 0u, kVuUpperNop);
+            std::vector<uint8_t> expected(32u, 0u), captured;
+            const uint64_t tag = makeGifTag(1u, GIF_FMT_IMAGE, 0u, true);
+            std::memcpy(expected.data(), &tag, sizeof(tag));
+            for (uint32_t i = 16u; i < 32u; ++i)
+                expected[i] = static_cast<uint8_t>(0xA0u + i);
+            fx.mem.setGifPacketCallback([&](const uint8_t *packet, uint32_t size)
+            {
+                captured.assign(packet, packet + size);
+            });
+            for (const uint32_t size : {32u, 33u, 47u, 64u, uint32_t{PS2_VU1_DATA_SIZE}})
+            {
+                const uint32_t source = ((size - 1u) / 16u) * 16u;
+                std::vector<uint8_t> data(size + 16u, 0xCDu);
+                for (uint32_t i = 0; i < expected.size(); ++i)
+                    data[(source + i) % size] = expected[i];
+                VU1Interpreter vu;
+                vu.state().vi[1] = static_cast<int32_t>(source / 16u);
+                captured.clear();
+                vu.execute(fx.code, PS2_VU1_CODE_SIZE, data.data(), size,
+                           fx.gs, &fx.mem, 0u, 0u, 0u, 1u);
+                t.IsTrue(captured.empty(), "The first cycle must transfer only the tag");
+                vu.resume(fx.code, PS2_VU1_CODE_SIZE, data.data(), size,
+                          fx.gs, &fx.mem, 0u, 0u, 0u);
+                t.Equals(vu.state().cycles, uint64_t{1u}, "A zero-cycle resume must not advance PATH1");
+                t.IsTrue(captured.empty(), "A zero-cycle resume must not emit the packet");
+                vu.resume(fx.code, PS2_VU1_CODE_SIZE, data.data(), size,
+                          fx.gs, &fx.mem, 0u, 0u, 1u);
+                t.IsTrue(captured.empty(), "The payload must still be pending at cycle two");
+                vu.resume(fx.code, PS2_VU1_CODE_SIZE, data.data(), size,
+                          fx.gs, &fx.mem, 0u, 0u, 1u);
+                t.Equals(vu.state().cycles, uint64_t{3u}, "The payload must finish at cycle three");
+                t.IsTrue(captured == expected, "Every wrapped tag and payload byte must match");
             }
         });
 
