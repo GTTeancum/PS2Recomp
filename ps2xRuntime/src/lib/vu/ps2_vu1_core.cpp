@@ -2152,6 +2152,13 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructionPair(con
         if (decoded.lowerUsage.vfWrite.reg == upperWriteReg)
             decoded.suppressedLowerVf = upperWriteReg;
     }
+#if defined(PS2X_ENABLE_VU_NATIVE_PAIRS)
+    if (m_nativePairsEnabled && !decoded.upperUsage.reserved && !decoded.lowerUsage.reserved)
+    {
+        const uint64_t words = (uint64_t{decoded.upper} << 32u) | decoded.lower;
+        decoded.pairKernel = lookupNativePair(words);
+    }
+#endif
     return decoded;
 }
 
@@ -2684,6 +2691,16 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         if (decoded.upperUsage.accWrite != 0u)
             std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
 
+#if defined(PS2X_ENABLE_VU_NATIVE_PAIRS)
+        if (decoded.pairKernel != nullptr && !xmenDiagnosticsEnabled())
+        {
+            ++m_pairCounters.native;
+            decoded.pairKernel(this, &decoded, vuData, dataSize, gs, memory);
+        }
+        else
+        {
+            ++m_pairCounters.interpreted;
+#endif
         if (decoded.iBit)
         {
             execDecodedUpper(decoded);
@@ -2715,6 +2732,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             execDecodedUpper(decoded);
             execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
         }
+#if defined(PS2X_ENABLE_VU_NATIVE_PAIRS)
+        }
+#endif
 
         if (xmenTraceVu1Program)
         {

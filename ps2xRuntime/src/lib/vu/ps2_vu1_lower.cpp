@@ -70,8 +70,17 @@ namespace
 // ============================================================================
 // Lower instructions
 // ============================================================================
-void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr)
+#if defined(PS2X_BUILD_VU_NATIVE_PAIRS)
+template <uint32_t Word>
+void VU1Interpreter::execLowerNative(uint8_t *vuData, uint32_t dataSize, GS &gs,
+                                     PS2Memory *memory, uint32_t upperInstr)
 {
+    constexpr uint32_t instr = Word;
+#else
+void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize,
+                               GS &gs, PS2Memory *memory, uint32_t upperInstr)
+{
+#endif
 #if defined(PS2X_ENABLE_VU_DETAIL_PROFILE)
     RuntimeProfile::Scope profile(RuntimeProfile::Phase::VuLower, RuntimeProfile::sampleVu);
 #endif

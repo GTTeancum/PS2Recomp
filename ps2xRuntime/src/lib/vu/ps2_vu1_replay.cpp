@@ -413,6 +413,9 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
 #if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
         vu->setUpperLookup(upperLookup);
 #endif
+#if defined(PS2X_ENABLE_VU_NATIVE_PAIRS)
+        vu->setNativePairsEnabled(std::getenv("PS2X_VU_REPLAY_PAIRS") != nullptr);
+#endif
         size_t totalBytes = 0;
         uint64_t totalCycles = 0;
         while (input.peek() != std::char_traits<char>::eof())
@@ -536,6 +539,10 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
         result.nativeUpper = vu->upperCounters().native;
         result.interpretedUpper = vu->upperCounters().interpreted;
 #endif
+#if defined(PS2X_ENABLE_VU_NATIVE_PAIRS)
+        result.nativePairs = vu->pairCounters().native;
+        result.interpretedPairs = vu->pairCounters().interpreted;
+#endif
         if (upperSamples)
         {
             for (const auto &[instruction, count] : fetches)
@@ -606,6 +613,7 @@ bool VUReplay::writePairKernels(std::ostream &output,
     std::set<uint32_t> entries;
     std::set<std::pair<uint32_t, uint32_t>> edges;
     std::map<uint32_t, const PairSample *> pairsByPc;
+    std::map<std::pair<uint32_t, uint32_t>, uint64_t> pairWordHits;
     for (size_t i = 0; i < std::min<size_t>(limit, samples.size()); ++i)
     {
         const auto &sample = samples[i];
@@ -613,6 +621,10 @@ bool VUReplay::writePairKernels(std::ostream &output,
             return false;
         if (!pairsByPc.emplace(sample.pc, &sample).second)
             return false;
+        auto &wordHits = pairWordHits[{sample.lower, sample.upper}];
+        if (UINT64_MAX - wordHits < sample.executions)
+            return false;
+        wordHits += sample.executions;
         if (sample.entry)
             entries.insert(sample.pc);
         for (const uint32_t successor : sample.successors)
@@ -677,6 +689,20 @@ bool VUReplay::writePairKernels(std::ostream &output,
         output << "VU_NATIVE_PAIR(0x" << std::hex << std::setw(4) << std::setfill('0') << sample.pc
                << "u, 0x" << std::setw(8) << sample.lower
                << "u, 0x" << std::setw(8) << sample.upper << "u)\n";
+    }
+    std::vector<std::pair<std::pair<uint32_t, uint32_t>, uint64_t>> rankedPairs(
+        pairWordHits.begin(), pairWordHits.end());
+    std::sort(rankedPairs.begin(), rankedPairs.end(), [](const auto &left, const auto &right)
+    {
+        if (left.second != right.second)
+            return left.second > right.second;
+        return left.first < right.first;
+    });
+    for (const auto &[words, executions] : rankedPairs)
+    {
+        output << "VU_NATIVE_PAIR_WORDS(0x" << std::hex << std::setw(8) << std::setfill('0') << words.first
+               << "u, 0x" << std::setw(8) << words.second
+               << "u, " << std::dec << executions << "u)\n";
     }
     for (const auto &[from, to] : edges)
         output << "VU_NATIVE_EDGE(0x" << std::hex << std::setw(4) << std::setfill('0') << from

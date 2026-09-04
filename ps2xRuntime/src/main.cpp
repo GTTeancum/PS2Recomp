@@ -307,7 +307,18 @@ int main(int argc, char *argv[])
                      nativeLookup ? "native-with-fallback" : "interpreter",
                      PS2X_VU_NATIVE_FINGERPRINT);
 #endif
+#if defined(PS2X_ENABLE_VU_NATIVE_PAIRS)
+        const bool nativePairs = std::getenv("PS2X_VU_NATIVE_PAIRS") != nullptr;
+        runtime.vu1().setNativePairsEnabled(nativePairs);
+        std::fprintf(stderr, "[vu:pairs] mode=%s\n", nativePairs ? "native-with-fallback" : "interpreter");
+#endif
         runtime.run();
+#if defined(PS2X_ENABLE_VU_NATIVE_PAIRS)
+        const auto pairCounters = runtime.vu1().pairCounters();
+        std::fprintf(stderr, "[vu:pairs] stopped vu1=%llu/%llu (native/interpreted)\n",
+                     static_cast<unsigned long long>(pairCounters.native),
+                     static_cast<unsigned long long>(pairCounters.interpreted));
+#endif
 #if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
         // run() joins the game thread before these non-atomic counters are read.
         const auto vu0Counters = runtime.vu0().upperCounters();

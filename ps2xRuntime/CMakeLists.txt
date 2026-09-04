@@ -605,6 +605,7 @@ EnableFastReleaseMode(ps2_runtime)
 EnableFastReleaseMode(ps2EntryRunner)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VUNativeUpper.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VUNativePairs.cmake")
 
 if(WIN32 AND NOT PS2X_SHOW_WINDOWS_CONSOLE)
     if(MSVC)

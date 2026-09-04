@@ -23,7 +23,7 @@ namespace
 // ============================================================================
 // Upper instructions (FMAC pipeline)
 // ============================================================================
-#if defined(PS2X_BUILD_VU_NATIVE_UPPER)
+#if defined(PS2X_BUILD_VU_NATIVE_UPPER) || defined(PS2X_BUILD_VU_NATIVE_PAIRS)
 template <uint32_t Word> void VU1Interpreter::execUpperNative()
 {
     constexpr uint32_t instr = Word;

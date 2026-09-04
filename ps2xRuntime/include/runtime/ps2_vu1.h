@@ -83,6 +83,15 @@ public:
     struct UpperCounters { uint64_t native = 0; uint64_t interpreted = 0; };
     UpperCounters upperCounters() const { return m_upperCounters; }
 #endif
+#if defined(PS2X_ENABLE_VU_NATIVE_PAIRS)
+    void setNativePairsEnabled(bool enabled)
+    {
+        m_nativePairsEnabled = enabled;
+        m_decodedCodeCacheValid = false;
+    }
+    struct PairCounters { uint64_t native = 0; uint64_t interpreted = 0; };
+    PairCounters pairCounters() const { return m_pairCounters; }
+#endif
 
     struct DebugCounters
     {
@@ -106,6 +115,9 @@ private:
     friend class VUReplay;
 #if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
     friend struct VUNativeAccess;
+#endif
+#if defined(PS2X_ENABLE_VU_NATIVE_PAIRS)
+    friend struct VUNativePairAccess;
 #endif
 
     enum Pipeline : uint8_t
@@ -147,6 +159,10 @@ private:
         bool reserved = false;
     };
 
+#if defined(PS2X_ENABLE_VU_NATIVE_PAIRS)
+    using PairKernel = void (*)(VU1Interpreter *, const void *, uint8_t *, uint32_t, GS &, PS2Memory *);
+#endif
+
     struct DecodedInstructionPair
     {
         uint32_t lower = 0;
@@ -162,6 +178,9 @@ private:
         uint8_t suppressedLowerVf = 0;
 #if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
         UpperKernel upperKernel = nullptr;
+#endif
+#if defined(PS2X_ENABLE_VU_NATIVE_PAIRS)
+        PairKernel pairKernel = nullptr;
 #endif
     };
 
@@ -260,6 +279,10 @@ private:
     UpperLookup m_upperLookup = nullptr;
     UpperCounters m_upperCounters{};
 #endif
+#if defined(PS2X_ENABLE_VU_NATIVE_PAIRS)
+    PairCounters m_pairCounters{};
+    bool m_nativePairsEnabled = false;
+#endif
 
     std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
     ScalarPipelineEntry m_fdiv{};
@@ -316,8 +339,20 @@ private:
     void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory, uint64_t generation);
 
     PS2X_VU_ARITH_INLINE void execUpper(uint32_t instr);
-#if defined(PS2X_BUILD_VU_NATIVE_UPPER)
+#if defined(PS2X_BUILD_VU_NATIVE_UPPER) || defined(PS2X_BUILD_VU_NATIVE_PAIRS)
     template <uint32_t Word> void execUpperNative();
+#endif
+#if defined(PS2X_BUILD_VU_NATIVE_PAIRS)
+    template <uint32_t Word>
+    void execLowerNative(uint8_t *vuData, uint32_t dataSize, GS &gs,
+                         PS2Memory *memory, uint32_t upperInstr);
+    template <uint32_t Lower, uint32_t Upper>
+    void execPairNative(const DecodedInstructionPair &decoded,
+                        uint8_t *vuData, uint32_t dataSize,
+                        GS &gs, PS2Memory *memory);
+#endif
+#if defined(PS2X_ENABLE_VU_NATIVE_PAIRS)
+    static PairKernel lookupNativePair(uint64_t words);
 #endif
     void execDecodedUpper(const DecodedInstructionPair &decoded)
     {

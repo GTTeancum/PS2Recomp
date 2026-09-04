@@ -1,6 +1,7 @@
 // Shared arithmetic definitions for interpreted and native-specialized VU execution.
 // Include after the instruction-field and laneForComponent helpers.
 
+#if !defined(PS2X_VU_NATIVE_PAIR_USE_HOST_MATH)
 float VU1Interpreter::normalizeResult(float value, uint32_t &laneFlags) const
 {
     uint32_t bits = 0;
@@ -45,6 +46,7 @@ void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
 {
     applyDest(m_state.acc, result, dest);
 }
+#endif
 
 template <uint64_t Word>
 void VU1Interpreter::normalizeFmacResultFor(float *result, uint8_t dest,
@@ -253,6 +255,7 @@ bool VU1Interpreter::calculateFmacExactResultFor(uint32_t component,
     return true;
 }
 
+#if !defined(PS2X_VU_NATIVE_PAIR_USE_HOST_MATH)
 uint8_t VU1Interpreter::normalizeFmacExactResult(float &value,
                                                   long double exactResult) const
 {
@@ -282,6 +285,7 @@ uint8_t VU1Interpreter::normalizeFmacExactResult(float &value,
 
     return flags;
 }
+#endif
 
 template <uint64_t Word>
 uint32_t VU1Interpreter::calculateFmacProductStickyFor(uint8_t dest) const
@@ -361,6 +365,7 @@ void VU1Interpreter::applyFmacDestAccFor(float *result, uint8_t dest)
     applyDestAcc(result, dest);
 }
 
+#if !defined(PS2X_VU_NATIVE_PAIR_USE_HOST_MATH)
 void VU1Interpreter::applyFmacDest(float *dst, float *result, uint8_t dest)
 {
     applyFmacDestFor<kDynamicUpper>(dst, result, dest);
@@ -370,3 +375,4 @@ void VU1Interpreter::applyFmacDestAcc(float *result, uint8_t dest)
 {
     applyFmacDestAccFor<kDynamicUpper>(result, dest);
 }
+#endif

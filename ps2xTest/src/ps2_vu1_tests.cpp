@@ -382,6 +382,41 @@ void register_ps2_vu1_tests()
             vu.setUpperLookup(nullptr);
         });
 #endif
+#if defined(PS2X_ENABLE_VU_NATIVE_PAIRS)
+        tc.Run("native VU pairs preserve execution and interpreter fallback", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+            if (!fx.code || !fx.data)
+                return;
+            const uint32_t lower = makeVuLowerDirect(0x30u, 1u, 2u, 3u);
+            writeTrackedVuInstructionPair(fx, 0u, lower, kVuUpperNop);
+            writeTrackedVuInstructionPair(fx, 8u, 0u, kVuUpperNop | 0x40000000u);
+            writeTrackedVuInstructionPair(fx, 16u, 0u, kVuUpperNop);
+
+            VU1Interpreter vu;
+            vu.setNativePairsEnabled(true);
+            vu.state().vi[1] = 4;
+            vu.state().vi[2] = 7;
+            vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
+                       fx.gs, &fx.mem, 0u, 0u, 0u, 32u);
+            t.Equals(vu.state().vi[3], 11, "Native lower IADD must preserve the interpreted result");
+            const auto native = vu.pairCounters();
+            t.Equals(native.native, uint64_t{3}, "All three synthetic pairs must use native kernels");
+            t.Equals(native.interpreted, uint64_t{0}, "Synthetic native sequence must not fall back");
+
+            vu.setNativePairsEnabled(false);
+            vu.state().vi[1] = 9;
+            vu.state().vi[2] = 6;
+            vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
+                       fx.gs, &fx.mem, 0u, 0u, 0u, 32u);
+            t.Equals(vu.state().vi[3], 15, "Disabled provider must retain interpreter behavior");
+            const auto interpreted = vu.pairCounters();
+            t.Equals(interpreted.native, native.native, "Disabling must stop native pair execution");
+            t.Equals(interpreted.interpreted, native.interpreted + 3u,
+                     "Disabling must invalidate cached pair kernels");
+        });
+#endif
         if (const char *path = std::getenv("PS2X_VU_REPLAY_FILE"))
         {
             tc.Run("recorded VU slices reproduce state memory and graphics packets", [path = std::string(path)](TestCase &t)
@@ -434,6 +469,9 @@ void register_ps2_vu1_tests()
                 std::printf("[vu-replay:upper-coverage] native=%llu interpreted=%llu includes-cold-pass=1\n",
                             static_cast<unsigned long long>(result.nativeUpper),
                             static_cast<unsigned long long>(result.interpretedUpper));
+                std::printf("[vu-replay:pair-coverage] native=%llu interpreted=%llu includes-cold-pass=1\n",
+                            static_cast<unsigned long long>(result.nativePairs),
+                            static_cast<unsigned long long>(result.interpretedPairs));
                 if (exportPath && result.error.empty())
                 {
                     std::ofstream output(exportPath);
@@ -497,6 +535,8 @@ void register_ps2_vu1_tests()
                      "Pair recipe must partition a bounded straight-line block");
             t.IsTrue(pairKernels.str().find("VU_NATIVE_PAIR(0x0008u, 0x00000000u, 0x400002ffu)") != std::string::npos,
                      "Pair recipe must retain PC and both instruction words");
+            t.IsTrue(pairKernels.str().find("VU_NATIVE_PAIR_WORDS(0x00000000u, 0x400002ffu, ") != std::string::npos,
+                     "Pair recipe must rank unique words by retired execution count");
             t.IsTrue(pairKernels.str().find("VU_NATIVE_EDGE(0x0008u, 0x0010u)") != std::string::npos,
                      "Pair recipe must retain observed successors");
             t.IsTrue(!VUReplay::writeUpperKernels(kernels, upperSamples, 0u), "Zero kernel limit must be rejected");

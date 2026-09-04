@@ -33,6 +33,8 @@ public:
         uint64_t digest = 14695981039346656037ull;
         uint64_t nativeUpper = 0;
         uint64_t interpretedUpper = 0;
+        uint64_t nativePairs = 0;
+        uint64_t interpretedPairs = 0;
         std::string error;
         std::vector<CaseTiming> timings;
     };
