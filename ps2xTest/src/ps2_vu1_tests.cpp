@@ -1,4 +1,5 @@
 #include "MiniTest.h"
+#include "ReplaySampler.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
@@ -238,7 +239,11 @@ void register_ps2_vu1_tests()
                     repeats = static_cast<uint32_t>(parsed);
                 }
                 std::ifstream input(path, std::ios::binary);
-                const auto result = VUReplay::replay(input, repeats);
+                VUReplay::Result result;
+                {
+                    ReplaySampler sampler(std::getenv("PS2X_VU_REPLAY_PROFILE") != nullptr);
+                    result = VUReplay::replay(input, repeats);
+                }
                 t.IsTrue(result.error.empty(), result.error);
                 for (size_t index = 0; index < result.timings.size(); ++index)
                 {

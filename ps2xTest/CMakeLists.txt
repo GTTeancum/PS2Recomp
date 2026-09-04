@@ -52,6 +52,7 @@ add_library(ps2_test_lib STATIC
     src/ps2_runtime_interrupt_tests.cpp
     src/ps2_memory_tests.cpp
     src/ps2_vu1_tests.cpp
+    src/replay_sampler.cpp
     src/ps2_vu_tests.cpp
     src/ps2_gs_tests.cpp
     src/ps2_audio_vag_tests.cpp
@@ -122,7 +123,7 @@ target_link_libraries(ps2x_tests PRIVATE
 # Windows executables default to a much smaller stack than Linux, and
 # sanitizer/debug instrumentation can push these test frames over 1 MiB.
 if(MSVC)
-    target_link_options(ps2x_tests PRIVATE "/STACK:8388608")
+    target_link_options(ps2x_tests PRIVATE "/STACK:8388608" "/MAP:$<TARGET_FILE:ps2x_tests>.map")
 elseif(MINGW)
     target_link_options(ps2x_tests PRIVATE "--stack,8388608")
 endif()
