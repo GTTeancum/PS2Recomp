@@ -727,6 +727,93 @@ void register_ps2_vu1_tests()
             }
         });
 
+        tc.Run("native VU blocks schedule internal waits with exact budgets and PATH1", [](TestCase &t)
+        {
+            constexpr uint32_t startPc = 0x3300u;
+            for (uint32_t packetKind : {0u, 1u, 2u})
+            for (uint32_t loops : {1u, 3u})
+            for (uint32_t budget : {0u, 1u, 4u, 8u, 16u, 17u, 18u, 31u, 32u, 33u, 34u, 35u, 64u})
+            {
+                Vu1Fixture referenceFx;
+                Vu1Fixture nativeFx;
+                VU1Interpreter reference;
+                VU1Interpreter native;
+                const auto initialize = [&](Vu1Fixture &fx, VU1Interpreter &vu)
+                {
+                    if (!fx.initialize())
+                        return false;
+                    writeTrackedVuInstructionPair(fx, startPc - 8u,
+                        packetKind != 0u ? makeVuLowerSpecial(0x6Cu, 0u) : 0u, kVuUpperNop);
+                    writeTrackedVuInstructionPair(fx, startPc,
+                        makeVuLq(0xFu, 2u, 1u, 0), kVuUpperNop);
+                    writeTrackedVuInstructionPair(fx, startPc + 8u, 0u,
+                        makeVuUpper(0x28u, 0xFu, 1u, 2u, 3u));
+                    writeTrackedVuInstructionPair(fx, startPc + 16u,
+                        makeVuSq(0xFu, 3u, 3u, 0), kVuUpperNop);
+                    writeTrackedVuInstructionPair(fx, startPc + 24u, 0u,
+                        makeVuUpper(0x28u, 0xFu, 2u, 3u, 4u));
+                    writeTrackedVuInstructionPair(fx, startPc + 32u, 0u,
+                        makeVuUpper(0x2Au, 0xFu, 1u, 4u, 5u));
+                    writeTrackedVuInstructionPair(fx, startPc + 40u,
+                        makeVuIaddiu(4u, 4u, -1), kVuUpperNop);
+                    writeTrackedVuInstructionPair(fx, startPc + 48u,
+                        makeVuIbgtz(4u, -7), kVuUpperNop);
+                    writeTrackedVuInstructionPair(fx, startPc + 56u, 0u, kVuUpperNop);
+                    writeTrackedVuInstructionPair(fx, startPc + 64u, 0u, kVuUpperNop | 0x40000000u);
+                    writeTrackedVuInstructionPair(fx, startPc + 72u, 0u, kVuUpperNop);
+                    const uint64_t tag = makeGifTag(packetKind == 2u ? 4u : 32u,
+                        GIF_FMT_PACKED, 1u, packetKind != 2u);
+                    const uint64_t regs = 0xFu;
+                    std::memcpy(fx.data, &tag, sizeof(tag));
+                    std::memcpy(fx.data + 8u, &regs, sizeof(regs));
+                    if (packetKind == 2u)
+                    {
+                        const uint64_t tail = makeGifTag(16u, GIF_FMT_PACKED, 1u);
+                        std::memcpy(fx.data + 80u, &tail, sizeof(tail));
+                        std::memcpy(fx.data + 88u, &regs, sizeof(regs));
+                    }
+                    const float source[4] = {2.0f, -3.0f, 4.0f, -5.0f};
+                    writeVuQword(fx.data, 1u, source);
+                    vu.state().vi[1] = 1;
+                    vu.state().vi[3] = 4;
+                    vu.state().vi[4] = static_cast<int32_t>(loops);
+                    for (uint32_t lane = 0u; lane < 4u; ++lane)
+                        vu.state().vf[1][lane] = static_cast<float>(lane + 1u);
+                    vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
+                               fx.gs, &fx.mem, startPc - 8u, 0u, 0u, 1u);
+                    return true;
+                };
+                if (!initialize(referenceFx, reference) || !initialize(nativeFx, native))
+                {
+                    t.IsTrue(false, "Scheduled block fixtures must initialize");
+                    return;
+                }
+                native.setNativeBlocksEnabled(true);
+                const auto compareSlice = [&](uint32_t cycles)
+                {
+                    std::ostringstream expected(std::ios::binary);
+                    std::ostringstream actual(std::ios::binary);
+                    t.IsTrue(VUReplay::record(expected, reference, referenceFx.code,
+                        referenceFx.data, referenceFx.gs, &referenceFx.mem, cycles),
+                        "Reference scheduled slice must record");
+                    t.IsTrue(VUReplay::record(actual, native, nativeFx.code,
+                        nativeFx.data, nativeFx.gs, &nativeFx.mem, cycles),
+                        "Native scheduled slice must record");
+                    t.IsTrue(expected.str() == actual.str(),
+                        "Internal waits must preserve complete state and GIF emission cycles");
+                };
+                compareSlice(budget);
+                if (budget < 17u || (packetKind == 2u && budget == 17u))
+                    t.Equals(native.blockCounters().pairs, uint64_t{0},
+                        "Wait cycles and an unparsed GIFtag must prevent early block execution");
+                if (packetKind < 2u && budget >= 17u)
+                    t.IsTrue(native.blockCounters().pairs >= 8u,
+                        "A seventeen-cycle budget must execute the eight-pair block natively");
+                compareSlice(1u);
+                compareSlice(64u);
+            }
+        });
+
         tc.Run("native VU blocks preserve in-flight GIF bytes cycles and packet boundaries", [](TestCase &t)
         {
             constexpr uint32_t startPc = 0x3000u;

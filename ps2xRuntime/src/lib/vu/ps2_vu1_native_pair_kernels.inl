@@ -377,9 +377,17 @@ consteval VUNativeUpperUsage nativeUpperUsage()
 }
 
 template <typename... Words>
-consteval bool nativeBlockInternalHazardsSafe()
+consteval auto nativeBlockSchedule()
 {
     constexpr size_t Count = sizeof...(Words);
+    static_assert(Count > 0u && Count <= 32u);
+    struct Schedule
+    {
+        std::array<uint8_t, Count> issue{};
+        uint8_t cycles = 0u;
+        bool valid = true;
+    };
+    Schedule schedule;
     constexpr std::array<VUNativeUpperUsage, Count> upperUsages = {
         nativeUpperUsage<Words::upper>()...};
     constexpr std::array<VUNativeLowerUsage, Count> lowerUsages = {
@@ -387,45 +395,41 @@ consteval bool nativeBlockInternalHazardsSafe()
     std::array<std::array<uint8_t, 4>, 32> vfReady{};
     std::array<uint8_t, 4> accReady{};
     std::array<uint8_t, 16> viReady{};
+    uint8_t cycle = 0u;
     for (size_t index = 0u; index < Count; ++index)
     {
         const auto &upper = upperUsages[index];
         const auto &lower = lowerUsages[index];
         if (lower.kind == VUNativeLowerKind::Branch && index + 2u != Count)
-            return false;
+        {
+            schedule.valid = false;
+            return schedule;
+        }
         for (uint32_t readIndex = 0u; readIndex < upper.readCount; ++readIndex)
         {
             for (uint32_t component = 0u; component < 4u; ++component)
             {
-                if ((upper.readLanes[readIndex] & laneForComponent(component)) != 0u &&
-                    vfReady[upper.readRegs[readIndex]][component] > index)
-                {
-                    return false;
-                }
+                if ((upper.readLanes[readIndex] & laneForComponent(component)) != 0u)
+                    cycle = std::max(cycle, vfReady[upper.readRegs[readIndex]][component]);
             }
         }
         for (uint32_t component = 0u; component < 4u; ++component)
         {
-            if ((upper.accRead & laneForComponent(component)) != 0u &&
-                accReady[component] > index)
-            {
-                return false;
-            }
+            if ((upper.accRead & laneForComponent(component)) != 0u)
+                cycle = std::max(cycle, accReady[component]);
         }
         for (uint32_t component = 0u; component < 4u; ++component)
         {
-            if ((lower.vfReadLanes & laneForComponent(component)) != 0u &&
-                vfReady[lower.vfReadReg][component] > index)
-            {
-                return false;
-            }
+            if ((lower.vfReadLanes & laneForComponent(component)) != 0u)
+                cycle = std::max(cycle, vfReady[lower.vfReadReg][component]);
         }
         for (uint32_t regs = lower.viRead; regs != 0u; regs &= regs - 1u)
         {
             const uint32_t reg = static_cast<uint32_t>(std::countr_zero(regs));
-            if (viReady[reg] > index)
-                return false;
+            cycle = std::max(cycle, viReady[reg]);
         }
+
+        schedule.issue[index] = cycle;
 
         if (upper.writeReg != 0u)
         {
@@ -433,7 +437,7 @@ consteval bool nativeBlockInternalHazardsSafe()
             {
                 if ((upper.writeLanes & laneForComponent(component)) != 0u)
                     vfReady[upper.writeReg][component] =
-                        static_cast<uint8_t>(index + 4u);
+                        static_cast<uint8_t>(cycle + 4u);
             }
         }
         const bool lowerSuppressed = lower.vfWriteReg != 0u &&
@@ -444,24 +448,27 @@ consteval bool nativeBlockInternalHazardsSafe()
             {
                 if ((lower.vfWriteLanes & laneForComponent(component)) != 0u)
                     vfReady[lower.vfWriteReg][component] =
-                        static_cast<uint8_t>(index + 4u);
+                        static_cast<uint8_t>(cycle + 4u);
             }
         }
         for (uint32_t component = 0u; component < 4u; ++component)
         {
             if ((upper.accWrite & laneForComponent(component)) != 0u)
-                accReady[component] = static_cast<uint8_t>(index + 1u);
+                accReady[component] = static_cast<uint8_t>(cycle + 1u);
         }
         if (lower.viWriteReg != 0u)
-            viReady[lower.viWriteReg] = static_cast<uint8_t>(index + 1u);
+            viReady[lower.viWriteReg] = static_cast<uint8_t>(cycle + 1u);
+        ++cycle;
     }
-    return true;
+    schedule.cycles = cycle;
+    return schedule;
 }
 
 template <typename... Words>
 consteval auto nativeBlockEntryRequirements()
 {
     constexpr size_t Count = sizeof...(Words);
+    constexpr auto schedule = nativeBlockSchedule<Words...>();
     constexpr std::array<VUNativeUpperUsage, Count> upperUsages = {
         nativeUpperUsage<Words::upper>()...};
     constexpr std::array<VUNativeLowerUsage, Count> lowerUsages = {
@@ -485,7 +492,7 @@ consteval auto nativeBlockEntryRequirements()
         const auto &lower = lowerUsages[index];
         const auto read = [&](size_t field)
         {
-            firstRead[field] = std::min(firstRead[field], static_cast<uint8_t>(index));
+            firstRead[field] = std::min(firstRead[field], schedule.issue[index]);
         };
         for (uint32_t component = 0u; component < 4u; ++component)
         {
@@ -790,20 +797,32 @@ private:
             vu->progressXgkick();
     }
 
-    template <typename PairTuple, size_t... Index>
+    template <typename PairTuple, auto Schedule, size_t... Index>
     static void executeFastPairs(
         VU1Interpreter *vu, uint64_t blockEndCycle,
         const std::array<uint8_t, sizeof...(Index)> &upperVfSlots,
         const std::array<uint8_t, sizeof...(Index)> &lowerVfSlots,
                                  std::index_sequence<Index...>)
     {
-        (executeFastPair<Index, std::tuple_element_t<Index, PairTuple>>(
-             vu, blockEndCycle, upperVfSlots[Index], lowerVfSlots[Index]), ...);
+        const auto issuePair = [&]<size_t PairIndex>()
+        {
+            if constexpr (PairIndex != 0u)
+            {
+                if constexpr (Schedule.issue[PairIndex] > Schedule.issue[PairIndex - 1u] + 1u)
+                {
+                    // Preserve retirement and PATH1 visibility at every wait cycle.
+                    vu->advanceTo(blockEndCycle - Schedule.cycles + Schedule.issue[PairIndex]);
+                }
+            }
+            executeFastPair<PairIndex, std::tuple_element_t<PairIndex, PairTuple>>(
+                vu, blockEndCycle, upperVfSlots[PairIndex], lowerVfSlots[PairIndex]);
+        };
+        (issuePair.template operator()<Index>(), ...);
     }
 
     template <size_t Index, typename Words, size_t Count>
     static bool prepareFastPair(
-        VU1Interpreter *vu, uint64_t startCycle,
+        VU1Interpreter *vu, uint64_t issueCycle,
         uint32_t &virtualVfMask,
         std::array<uint64_t, VU1Interpreter::kMaxPendingVfWrites> &virtualVfReady,
         std::array<uint8_t, Count> &upperVfSlots,
@@ -814,8 +833,6 @@ private:
             nativeLowerUsage<Words::lower, Words::upper>();
         constexpr bool lowerSuppressed = lowerUsage.vfWriteReg != 0u &&
             lowerUsage.vfWriteReg == upperUsage.writeReg;
-        const uint64_t issueCycle = startCycle + Index;
-
         for (uint32_t slots = virtualVfMask; slots != 0u; slots &= slots - 1u)
         {
             const uint32_t slot = static_cast<uint32_t>(std::countr_zero(slots));
@@ -864,7 +881,7 @@ private:
     static bool entryRequirementsReady(const VU1Interpreter *vu)
     {
         // Each entry-state field needs only its earliest deadline. Internal
-        // dependencies are already proven by nativeBlockInternalHazardsSafe.
+        // dependencies are already included in nativeBlockSchedule.
         static constexpr auto plan = nativeBlockEntryRequirements<Words...>();
         return [&]<size_t... Index>(std::index_sequence<Index...>)
         {
@@ -901,7 +918,7 @@ private:
         return readyCycle;
     }
 
-    template <typename PairTuple, size_t Count, size_t... Index>
+    template <typename PairTuple, auto Schedule, size_t Count, size_t... Index>
     static bool prepareFastPairs(
         VU1Interpreter *vu, uint64_t startCycle,
         uint32_t &virtualVfMask,
@@ -911,7 +928,7 @@ private:
         std::index_sequence<Index...>)
     {
         return (prepareFastPair<Index, std::tuple_element_t<Index, PairTuple>>(
-                    vu, startCycle, virtualVfMask, virtualVfReady,
+                    vu, startCycle + Schedule.issue[Index], virtualVfMask, virtualVfReady,
                     upperVfSlots, lowerVfSlots) && ...);
     }
 
@@ -922,15 +939,16 @@ private:
         std::array<uint8_t, sizeof...(Words)> &lowerVfSlots)
     {
         static constexpr size_t Count = sizeof...(Words);
+        static constexpr auto schedule = nativeBlockSchedule<Words...>();
         upperVfSlots.fill(0xFFu);
         lowerVfSlots.fill(0xFFu);
         static_assert((nativeUpperUsage<Words::upper>().valid && ...));
         static_assert((nativeLowerUsage<Words::lower, Words::upper>().valid && ...));
-        if constexpr (!nativeBlockInternalHazardsSafe<Words...>())
+        if constexpr (!schedule.valid)
             return false;
         if constexpr ((((Words::upper & 0x58000000u) != 0u) || ...))
             return false;
-        if (budgetEnd - vu->m_cycle < Count || vu->m_accWritePipelineMask != 0u ||
+        if (budgetEnd - vu->m_cycle < schedule.cycles || vu->m_accWritePipelineMask != 0u ||
             vu->m_storePipelineMask != 0u ||
             vu->m_fdiv.valid || vu->m_efu[0].valid || vu->m_efu[1].valid ||
             vu->m_state.branchPending || vu->m_state.ebit ||
@@ -945,7 +963,7 @@ private:
             // an early stop cannot expose values committed ahead inside a block.
             const auto &kick = vu->m_xgkick;
             const uint64_t endBytes = kick.copiedBytes +
-                ((static_cast<uint64_t>(kick.cycleCredit) + Count) / 2u) * 16u;
+                ((static_cast<uint64_t>(kick.cycleCredit) + schedule.cycles) / 2u) * 16u;
             if (kick.currentTagEnd == 0u ||
                 kick.currentTagEnd > VU1Interpreter::XgkickPipeline::kBufferSize ||
                 (!kick.currentTagEop && endBytes > kick.currentTagEnd))
@@ -965,7 +983,7 @@ private:
             virtualVfReady[slot] = vu->m_vfWritePipeline[slot].readyCycle;
         }
         using PairTuple = std::tuple<Words...>;
-        return prepareFastPairs<PairTuple>(
+        return prepareFastPairs<PairTuple, schedule>(
             vu, vu->m_cycle, virtualVfMask, virtualVfReady,
             upperVfSlots, lowerVfSlots, std::make_index_sequence<Count>{});
     }
@@ -978,6 +996,7 @@ public:
                             PS2Memory *memory, uint64_t budgetEnd)
     {
         static constexpr size_t pairCount = sizeof...(PairWords);
+        static constexpr auto schedule = nativeBlockSchedule<PairWords...>();
         if (vu->m_state.pc != StartPc ||
             StartPc + pairCount * 8u > codeSize)
         {
@@ -1009,13 +1028,13 @@ public:
             {
                 break;
             }
-            const uint64_t blockEndCycle = vu->m_cycle + pairCount;
-            executeFastPairs<PairTuple>(vu, blockEndCycle, upperVfSlots,
+            const uint64_t blockEndCycle = vu->m_cycle + schedule.cycles;
+            executeFastPairs<PairTuple, schedule>(vu, blockEndCycle, upperVfSlots,
                                         lowerVfSlots,
                                         std::make_index_sequence<pairCount>{});
             executed += static_cast<uint32_t>(pairCount);
         } while (vu->m_state.pc == StartPc &&
-                 budgetEnd - vu->m_cycle >= pairCount);
+                 budgetEnd - vu->m_cycle >= schedule.cycles);
         return executed;
     }
 
