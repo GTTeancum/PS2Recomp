@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <vector>
@@ -1086,6 +1087,14 @@ void register_ps2_vu1_tests()
                      "Pair recipe must retain PC and both instruction words");
             t.IsTrue(pairKernels.str().find("VU_NATIVE_PAIR_WORDS(0x00000000u, 0x400002ffu, ") != std::string::npos,
                      "Pair recipe must rank unique words by retired execution count");
+            for (const auto &sample : pairSamples)
+            {
+                std::ostringstream hitLine;
+                hitLine << "VU_NATIVE_PC_HITS(0x" << std::hex << std::setw(4) << std::setfill('0')
+                        << sample.pc << "u, " << std::dec << sample.executions << "u)";
+                t.IsTrue(pairKernels.str().find(hitLine.str()) != std::string::npos,
+                         "Recipe must preserve exact per-PC retired counts");
+            }
             t.IsTrue(pairKernels.str().find("VU_NATIVE_EDGE(0x0008u, 0x0010u)") != std::string::npos,
                      "Pair recipe must retain observed successors");
             t.IsTrue(!VUReplay::writeUpperKernels(kernels, upperSamples, 0u), "Zero kernel limit must be rejected");

@@ -760,6 +760,8 @@ bool VUReplay::writePairKernels(std::ostream &output,
         output << "VU_NATIVE_PAIR(0x" << std::hex << std::setw(4) << std::setfill('0') << sample.pc
                << "u, 0x" << std::setw(8) << sample.lower
                << "u, 0x" << std::setw(8) << sample.upper << "u)\n";
+        output << "VU_NATIVE_PC_HITS(0x" << std::hex << std::setw(4) << std::setfill('0')
+               << sample.pc << "u, " << std::dec << sample.executions << "u)\n";
     }
     std::vector<std::pair<std::pair<uint32_t, uint32_t>, uint64_t>> rankedPairs(
         pairWordHits.begin(), pairWordHits.end());
