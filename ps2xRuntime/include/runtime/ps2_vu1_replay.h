@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <iosfwd>
 #include <string>
@@ -79,12 +80,14 @@ public:
                        PS2Memory *memory, uint32_t maxCycles);
     // Optional one-cycle cold pass. Upper fetches include dependency stalls;
     // pair executions are counted only when the instruction retires.
+    // Optional profiler flag covers warm execution only, not snapshot I/O or the cold pass.
     static Result replay(std::istream &input, uint32_t repeats,
                          std::vector<UpperSample> *upperSamples = nullptr,
                          std::vector<PairSample> *pairSamples = nullptr
 #if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
                          , VU1Interpreter::UpperLookup upperLookup = nullptr
 #endif
+                         , std::atomic_bool *executing = nullptr
                          );
     static bool writeUpperKernels(std::ostream &output,
                                   const std::vector<UpperSample> &samples, uint32_t limit);

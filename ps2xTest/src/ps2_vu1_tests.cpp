@@ -1006,6 +1006,7 @@ void register_ps2_vu1_tests()
 #if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
                                              , lookup
 #endif
+                                             , sampler.executionFlag()
                                              );
                 }
                 if (pairExportPath && result.error.empty())
@@ -1106,6 +1107,26 @@ void register_ps2_vu1_tests()
             truncated.pop_back();
             std::istringstream badInput(truncated, std::ios::binary);
             t.IsTrue(!VUReplay::replay(badInput, 1u).error.empty(), "Truncated captures must be rejected");
+
+            std::atomic_bool executing{true};
+            const auto replayObserved = [&](std::istream &stream)
+            {
+                return VUReplay::replay(stream, 3u, nullptr, nullptr
+#if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
+                                       , nullptr
+#endif
+                                       , &executing);
+            };
+            std::istringstream observedInput(output.str(), std::ios::binary);
+            const auto observed = replayObserved(observedInput);
+            t.IsTrue(observed.error.empty(), observed.error);
+            t.Equals(observed.digest, result.digest, "Profiling marker must not change replay output");
+            t.Equals(observed.cycles, result.cycles, "Profiling marker must not change cycles");
+            t.IsTrue(!executing.load(), "Execution marker must clear after successful replay");
+            executing.store(true);
+            std::istringstream observedBad(truncated, std::ios::binary);
+            t.IsTrue(!replayObserved(observedBad).error.empty(), "Observed truncated captures must fail");
+            t.IsTrue(!executing.load(), "Execution marker must clear on rejected input");
         });
 
         tc.Run("flag and VF deadlines preserve slot reuse across single-cycle slices", [](TestCase &t)

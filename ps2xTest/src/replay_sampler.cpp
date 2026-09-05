@@ -22,7 +22,9 @@ struct ReplaySampler::Impl
     std::unique_ptr<void, CloseThread> target;
     std::jthread worker;
     std::unordered_map<uintptr_t, uint32_t> hits;
-    uint32_t samples = 0, external = 0, dropped = 0, failures = 0;
+    std::atomic_bool executing{false};
+    uint32_t samples = 0, outside = 0, external = 0, dropped = 0, failures = 0;
+    static_assert(std::atomic_bool::is_always_lock_free);
 
     Impl()
     {
@@ -39,7 +41,7 @@ struct ReplaySampler::Impl
         std::printf("[vu-sampler:image] timestamp=0x%08x\n", static_cast<unsigned>(nt->FileHeader.TimeDateStamp));
         worker = std::jthread([this, base, end](std::stop_token stop)
         {
-            while (!stop.stop_requested() && samples < 8192u)
+            while (!stop.stop_requested() && samples + outside < 8192u)
             {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 if (stop.stop_requested())
@@ -53,6 +55,8 @@ struct ReplaySampler::Impl
                 CONTEXT context{};
                 context.ContextFlags = CONTEXT_CONTROL;
                 const bool captured = GetThreadContext(target.get(), &context) != FALSE;
+                // Read while suspended so the phase and instruction address describe the same instant.
+                const bool inExecution = executing.load(std::memory_order_relaxed);
                 if (ResumeThread(target.get()) == static_cast<DWORD>(-1))
                 {
                     // A broken profiler must never strand its own test thread.
@@ -62,6 +66,11 @@ struct ReplaySampler::Impl
                 if (!captured)
                 {
                     ++failures;
+                    continue;
+                }
+                if (!inExecution)
+                {
+                    ++outside;
                     continue;
                 }
                 ++samples;
@@ -87,8 +96,8 @@ struct ReplaySampler::Impl
     {
         worker.request_stop();
         worker.join();
-        std::printf("[vu-sampler:summary] samples=%u external=%u unique=%zu dropped=%u failures=%u timings-instrumented=1\n",
-                    samples, external, hits.size(), dropped, failures);
+        std::printf("[vu-sampler:summary] samples=%u external=%u unique=%zu dropped=%u failures=%u timings-instrumented=1 execution-only=1 outside=%u\n",
+                    samples, external, hits.size(), dropped, failures, outside);
         for (const auto &[rva, count] : hits)
             std::printf("[vu-sampler:ip] rva=0x%llx hits=%u\n", static_cast<unsigned long long>(rva), count);
     }
@@ -99,6 +108,11 @@ ReplaySampler::ReplaySampler(bool enabled)
     if (enabled)
         m_impl = std::make_unique<Impl>();
 }
+
+std::atomic_bool *ReplaySampler::executionFlag()
+{
+    return m_impl ? &m_impl->executing : nullptr;
+}
 #else
 struct ReplaySampler::Impl {};
 
@@ -107,6 +121,8 @@ ReplaySampler::ReplaySampler(bool enabled)
     if (enabled)
         std::fputs("[vu-sampler:unsupported] requires Windows x64\n", stderr);
 }
+
+std::atomic_bool *ReplaySampler::executionFlag() { return nullptr; }
 #endif
 
 ReplaySampler::~ReplaySampler() = default;

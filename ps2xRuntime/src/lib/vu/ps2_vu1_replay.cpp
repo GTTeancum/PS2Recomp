@@ -149,6 +149,19 @@ namespace
         ~ContextScope() { activeContext = previous; }
     };
 
+    struct ExecutionScope
+    {
+        std::atomic_bool *flag;
+        explicit ExecutionScope(std::atomic_bool *value) : flag(value)
+        {
+            if (flag) flag->store(true, std::memory_order_relaxed);
+        }
+        ~ExecutionScope()
+        {
+            if (flag) flag->store(false, std::memory_order_relaxed);
+        }
+    };
+
     struct Record
     {
         uint32_t maxCycles = 0;
@@ -403,8 +416,10 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
 #if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
                                  , VU1Interpreter::UpperLookup upperLookup
 #endif
+                                 , std::atomic_bool *executing
                                  )
 {
+    if (executing) executing->store(false, std::memory_order_relaxed);
     Result result;
     std::map<uint32_t, uint64_t> fetches;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t>, uint64_t> executedPairs;
@@ -493,6 +508,7 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
                 const auto start = std::chrono::steady_clock::now();
                 {
                     ContextScope scope(context);
+                    ExecutionScope execution(iteration != 0u ? executing : nullptr);
                     if ((upperSamples || pairSamples) && iteration == 0u && elapsedCycles != 0u)
                     {
                         const auto budgetEnd = initialCycle + record.maxCycles;
