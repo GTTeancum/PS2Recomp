@@ -565,7 +565,8 @@ private:
                 vu->m_state.status = (vu->m_state.status & 0x03Fu) | (entry.status & 0xFC0u);
             if (entry.writesClip)
                 vu->m_state.clip = entry.clip;
-            entry = {};
+            // All fields are integer/bool zeros; avoid MSVC's aggregate temporary and copy.
+            std::memset(&entry, 0, sizeof(entry));
             vu->m_flagPipelineMask &= ~(1u << slot);
         }
     }
