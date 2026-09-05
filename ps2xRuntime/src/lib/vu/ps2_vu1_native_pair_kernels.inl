@@ -630,9 +630,9 @@ private:
         }
     }
 
-    template <size_t Index, typename Words>
+    template <size_t Index, typename Words, uint8_t CyclesToEnd>
     static void executeFastPair(
-        VU1Interpreter *vu, uint64_t blockEndCycle,
+        VU1Interpreter *vu,
         uint8_t upperVfSlot, uint8_t lowerVfSlot)
     {
         constexpr VUNativeUpperUsage upperUsage = nativeUpperUsage<Words::upper>();
@@ -647,10 +647,9 @@ private:
             lowerUsage.vfReadReg == upperUsage.writeReg &&
             (lowerUsage.vfReadLanes & upperUsage.writeLanes) != 0u;
         constexpr bool upperShadowed = lowerSuppressed || lowerReadsUpper;
-        const bool deferUpper = upperUsage.writeReg != 0u &&
-            vu->m_cycle + upperLatency > blockEndCycle;
-        const bool deferLower = hasLowerWrite &&
-            vu->m_cycle + upperLatency > blockEndCycle;
+        constexpr bool deferUpper = upperUsage.writeReg != 0u &&
+            upperLatency > CyclesToEnd;
+        constexpr bool deferLower = hasLowerWrite && upperLatency > CyclesToEnd;
         float oldUpper[4]{};
         float oldLower[4]{};
         if (upperUsage.writeReg != 0u && (deferUpper || upperShadowed))
@@ -826,8 +825,9 @@ private:
                     vu->advanceTo(blockEndCycle - Schedule.cycles + Schedule.issue[PairIndex]);
                 }
             }
-            executeFastPair<PairIndex, std::tuple_element_t<PairIndex, PairTuple>>(
-                vu, blockEndCycle, upperVfSlots[PairIndex], lowerVfSlots[PairIndex]);
+            executeFastPair<PairIndex, std::tuple_element_t<PairIndex, PairTuple>,
+                           Schedule.cycles - Schedule.issue[PairIndex]>(
+                vu, upperVfSlots[PairIndex], lowerVfSlots[PairIndex]);
         };
         (issuePair.template operator()<Index>(), ...);
     }
