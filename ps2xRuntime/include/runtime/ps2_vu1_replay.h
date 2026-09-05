@@ -16,6 +16,18 @@ class VU1Interpreter;
 class VUReplay
 {
 public:
+    struct CaptureSchedule
+    {
+        uint32_t shortCases = 0u;
+        uint32_t longCases = 0u;
+        uint32_t random = 0x57C019ABu;
+        uint64_t nextShortTick = 1100u;
+        uint64_t nextLongTick = 1100u;
+
+        bool select(uint64_t tick, uint32_t maxCycles);
+        bool complete() const { return shortCases == 16u && longCases == 16u; }
+    };
+
     struct CaseTiming
     {
         uint32_t pc = 0;

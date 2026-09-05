@@ -617,6 +617,43 @@ void register_ps2_vu1_tests()
                      "The block should execute after the delayed VF source retires");
         });
 #endif
+        tc.Run("VU replay capture schedule spreads bounded deterministic quotas", [](TestCase &t)
+        {
+            VUReplay::CaptureSchedule schedule;
+            VUReplay::CaptureSchedule duplicate;
+            for (uint32_t index = 0u; index < 1024u; ++index)
+                t.IsTrue(!schedule.select(1099u, 64u), "Do not capture before gameplay");
+            t.IsTrue(!schedule.select(1100u, 0u), "Do not capture empty budgets");
+            t.IsTrue(!schedule.select(1100u, (1u << 20u) + 1u), "Reject oversized budgets");
+            t.Equals(schedule.random, duplicate.random, "Ineligible calls must not consume sampling state");
+            uint64_t lastShort = 0u, lastLong = 0u;
+            uint32_t shortCount = 0u, longCount = 0u;
+            bool deterministic = true, spaced = true;
+            for (uint64_t tick = 1100u; tick < 1180u; ++tick)
+            {
+                for (uint32_t index = 0u; index < 8192u; ++index)
+                {
+                    const uint32_t budget = (index & 1u) != 0u ? (1u << 20u) : 64u;
+                    const bool selected = schedule.select(tick, budget);
+                    deterministic &= selected == duplicate.select(tick, budget);
+                    if (!selected)
+                        continue;
+                    auto &last = budget > 64u ? lastLong : lastShort;
+                    auto &count = budget > 64u ? longCount : shortCount;
+                    spaced &= count == 0u || tick >= last + 4u;
+                    last = tick;
+                    ++count;
+                }
+            }
+            t.IsTrue(deterministic, "Identical call streams must select identical samples");
+            t.IsTrue(spaced, "Each quota must wait four ticks between captures");
+            t.Equals(shortCount, 16u, "Short capture quota must be bounded and fill");
+            t.Equals(longCount, 16u, "Long capture quota must be bounded and fill");
+            t.IsTrue(schedule.complete(), "Both capture quotas should complete");
+            t.IsTrue(lastShort >= 1160u && lastLong >= 1160u,
+                     "Captures must span at least sixty gameplay ticks");
+        });
+
 #if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
         tc.Run("native VU block entry deadlines preserve lane reads and overwritten VI", [](TestCase &t)
         {

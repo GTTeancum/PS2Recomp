@@ -341,6 +341,24 @@ bool VUReplay::record(std::ostream &output, VU1Interpreter &vu,
     return output.good();
 }
 
+bool VUReplay::CaptureSchedule::select(uint64_t tick, uint32_t maxCycles)
+{
+    if (tick < 1100u || maxCycles == 0u || maxCycles > (1u << 20u))
+        return false;
+    random ^= random << 13u;
+    random ^= random >> 17u;
+    random ^= random << 5u;
+    auto &count = maxCycles > 64u ? longCases : shortCases;
+    auto &nextTick = maxCycles > 64u ? nextLongTick : nextShortTick;
+    // Keep each quota spread over at least 61 frames, with a sampled entry
+    // inside each eligible frame instead of its first long VU submission.
+    if (count >= 16u || tick < nextTick || (random & 255u) != 0u)
+        return false;
+    ++count;
+    nextTick = tick <= UINT64_MAX - 4u ? tick + 4u : UINT64_MAX;
+    return true;
+}
+
 bool VUReplay::captureSlice(VU1Interpreter &vu, uint8_t *code, uint32_t codeSize,
                             uint8_t *data, uint32_t dataSize, GS &gs,
                             PS2Memory *memory, uint32_t maxCycles)
@@ -349,15 +367,10 @@ bool VUReplay::captureSlice(VU1Interpreter &vu, uint8_t *code, uint32_t codeSize
         codeSize != PS2_VU1_CODE_SIZE || dataSize != PS2_VU1_DATA_SIZE || maxCycles > (1u << 20u))
         return false;
     static std::ofstream output;
-    static uint32_t shortCases = 0, longCases = 0, random = 0x57C019ABu;
+    static CaptureSchedule schedule;
     static bool finished = false;
-    if (finished || memory->gs().vsyncTick.load(std::memory_order_relaxed) < 1100u)
-        return false;
-    random ^= random << 13u;
-    random ^= random >> 17u;
-    random ^= random << 5u;
-    auto &count = maxCycles > 64u ? longCases : shortCases;
-    if (count >= 16u || (maxCycles <= 64u && (random & 63u) != 0u))
+    const auto tick = memory->gs().vsyncTick.load(std::memory_order_relaxed);
+    if (finished || !schedule.select(tick, maxCycles))
         return false;
     if (!output.is_open())
     {
@@ -372,12 +385,11 @@ bool VUReplay::captureSlice(VU1Interpreter &vu, uint8_t *code, uint32_t codeSize
     const auto pc = vu.m_state.pc;
     const auto cycle = vu.m_cycle;
     const bool saved = record(output, vu, code, data, gs, memory, maxCycles);
-    ++count;
-    std::fprintf(stderr, "[vu-replay:capture] short=%u long=%u pc=0x%x budget=%u cycles=%llu saved=%u bytes=%lld\n",
-                 shortCases, longCases, pc, maxCycles,
+    std::fprintf(stderr, "[vu-replay:capture] short=%u long=%u pc=0x%x budget=%u cycles=%llu saved=%u bytes=%lld tick=%llu\n",
+                 schedule.shortCases, schedule.longCases, pc, maxCycles,
                  static_cast<unsigned long long>(vu.m_cycle - cycle), saved ? 1u : 0u,
-                 static_cast<long long>(output.tellp()));
-    if (!saved || (shortCases == 16u && longCases == 16u))
+                 static_cast<long long>(output.tellp()), static_cast<unsigned long long>(tick));
+    if (!saved || schedule.complete())
     {
         finished = true;
         output.close();
