@@ -312,7 +312,19 @@ int main(int argc, char *argv[])
         runtime.vu1().setNativePairsEnabled(nativePairs);
         std::fprintf(stderr, "[vu:pairs] mode=%s\n", nativePairs ? "native-with-fallback" : "interpreter");
 #endif
+#if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
+        const bool nativeBlocks = std::getenv("PS2X_VU_NATIVE_BLOCKS") != nullptr;
+        runtime.vu1().setNativeBlocksEnabled(nativeBlocks);
+        std::fprintf(stderr, "[vu:blocks] mode=%s\n", nativeBlocks ? "native-with-fallback" : "interpreter");
+#endif
         runtime.run();
+#if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
+        const auto blockCounters = runtime.vu1().blockCounters();
+        std::fprintf(stderr, "[vu:blocks] stopped vu1=%llu/%llu (executed/attempted) pairs=%llu\n",
+                     static_cast<unsigned long long>(blockCounters.executed),
+                     static_cast<unsigned long long>(blockCounters.attempted),
+                     static_cast<unsigned long long>(blockCounters.pairs));
+#endif
 #if defined(PS2X_ENABLE_VU_NATIVE_PAIRS)
         const auto pairCounters = runtime.vu1().pairCounters();
         std::fprintf(stderr, "[vu:pairs] stopped vu1=%llu/%llu (native/interpreted)\n",
