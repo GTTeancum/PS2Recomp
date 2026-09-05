@@ -226,7 +226,7 @@ if(PS2X_ENABLE_VU_NATIVE_BLOCKS)
                 math(EXPR lower_direct "${lower_value} & 0x3f")
                 math(EXPR lower_special
                     "(${lower_value} & 3) | ((${lower_value} >> 4) & 0x7c)")
-                if(lower_op EQUAL 0x00 OR lower_op EQUAL 0x01 OR
+                if(lower_op EQUAL 0x00 OR lower_op EQUAL 0x01 OR lower_op EQUAL 0x04 OR
                    lower_op EQUAL 0x05 OR lower_op EQUAL 0x08 OR
                    lower_op EQUAL 0x09 OR lower_op EQUAL 0x20 OR
                    lower_op EQUAL 0x21 OR lower_op EQUAL 0x24 OR

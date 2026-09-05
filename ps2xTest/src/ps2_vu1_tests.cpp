@@ -814,6 +814,72 @@ void register_ps2_vu1_tests()
             }
         });
 
+        tc.Run("native VU integer loads preserve delayed results and branch-slot tails", [](TestCase &t)
+        {
+            constexpr uint32_t startPc = 0x3400u;
+            for (int32_t base : {1, 1023, -1})
+            for (uint32_t value : {0u, 0x12347FFFu, 0xABCDFFFFu})
+            for (bool pending : {false, true})
+            for (uint32_t budget : {0u, 1u, 4u, 7u, 10u, 11u, 12u, 13u, 14u, 15u, 32u})
+            {
+                Vu1Fixture referenceFx, nativeFx;
+                VU1Interpreter reference, native;
+                const auto initialize = [&](Vu1Fixture &fx, VU1Interpreter &vu)
+                {
+                    if (!fx.initialize())
+                        return false;
+                    const uint32_t words[] = {
+                        makeVuIlw(8u, 2u, 1u, 0), makeVuIaddiu(3u, 2u, 1),
+                        makeVuIlw(4u, 2u, 1u, 1), makeVuIaddiu(2u, 0u, 9),
+                        makeVuIlw(1u, 5u, 1u, -1), makeVuIlw(15u, 0u, 1u, 0),
+                        makeVuIbgtz(3u, 3), makeVuIlw(2u, 6u, 1u, 0)};
+                    for (uint32_t index = 0u; index < 8u; ++index)
+                        writeTrackedVuInstructionPair(fx, startPc + index * 8u, words[index], kVuUpperNop);
+                    for (uint32_t offset : {64u, 80u})
+                    {
+                        writeTrackedVuInstructionPair(fx, startPc + offset, 0u, kVuUpperNop | 0x40000000u);
+                        writeTrackedVuInstructionPair(fx, startPc + offset + 8u, 0u, kVuUpperNop);
+                    }
+                    writeTrackedVuInstructionPair(fx, startPc - 8u,
+                        pending ? makeVuIlw(8u, 6u, 1u, 1) : 0u, kVuUpperNop);
+                    for (int32_t offset : {-1, 0, 1})
+                    {
+                        const uint32_t address = (static_cast<uint32_t>(base + offset) * 16u) &
+                            (PS2_VU1_DATA_SIZE - 1u);
+                        const uint32_t data[] = {value, 0x56788000u, 0x1234FEDCu, 0x12348001u};
+                        std::memcpy(fx.data + address, data, sizeof(data));
+                    }
+                    vu.state().vi[1] = base;
+                    vu.state().vi[2] = 17;
+                    vu.state().vi[3] = 23;
+                    vu.state().vi[5] = 29;
+                    vu.state().vi[6] = 31;
+                    vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
+                               fx.gs, &fx.mem, startPc - 8u, 0u, 0u, 1u);
+                    return true;
+                };
+                if (!initialize(referenceFx, reference) || !initialize(nativeFx, native))
+                {
+                    t.IsTrue(false, "Integer-load fixtures must initialize");
+                    return;
+                }
+                native.setNativeBlocksEnabled(true);
+                for (uint32_t cycles : {budget, 1u, 1u, 1u, 32u})
+                {
+                    std::ostringstream expected(std::ios::binary), actual(std::ios::binary);
+                    t.IsTrue(VUReplay::record(expected, reference, referenceFx.code,
+                        referenceFx.data, referenceFx.gs, &referenceFx.mem, cycles), "Reference ILW slice must record");
+                    t.IsTrue(VUReplay::record(actual, native, nativeFx.code,
+                        nativeFx.data, nativeFx.gs, &nativeFx.mem, cycles), "Native ILW slice must record");
+                    t.IsTrue(expected.str() == actual.str(),
+                        "Integer-load stalls, cancellation, and pending tails must preserve complete state");
+                }
+                if (budget >= 11u)
+                    t.IsTrue(native.blockCounters().pairs >= 8u,
+                        "Integer loads must execute inside the native block");
+            }
+        });
+
         tc.Run("native VU blocks preserve in-flight GIF bytes cycles and packet boundaries", [](TestCase &t)
         {
             constexpr uint32_t startPc = 0x3000u;

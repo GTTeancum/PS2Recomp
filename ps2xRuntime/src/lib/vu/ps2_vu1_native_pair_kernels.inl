@@ -100,6 +100,7 @@ struct VUNativeLowerUsage
     VUNativeLowerKind kind = VUNativeLowerKind::Invalid;
     uint16_t viRead = 0u;
     uint8_t viWriteReg = 0u;
+    uint8_t viLatency = 1u;
     uint8_t vfReadReg = 0u;
     uint8_t vfReadLanes = 0u;
     uint8_t vfWriteReg = 0u;
@@ -172,6 +173,12 @@ consteval VUNativeLowerUsage nativeLowerUsage()
         readVi(viT);
         readVf(vfS, dest);
         usage.queuesStore = true;
+    }
+    else if constexpr (op == 0x04u) // ILW
+    {
+        readVi(viS);
+        writeVi(viT);
+        usage.viLatency = 4u;
     }
     else if constexpr (op == 0x05u) // ISW
     {
@@ -457,7 +464,7 @@ consteval auto nativeBlockSchedule()
                 accReady[component] = static_cast<uint8_t>(cycle + 1u);
         }
         if (lower.viWriteReg != 0u)
-            viReady[lower.viWriteReg] = static_cast<uint8_t>(cycle + 1u);
+            viReady[lower.viWriteReg] = static_cast<uint8_t>(cycle + lower.viLatency);
         ++cycle;
     }
     schedule.cycles = cycle;
@@ -756,9 +763,14 @@ private:
         {
             newVi = vu->m_state.vi[lowerUsage.viWriteReg];
             vu->m_state.vi[lowerUsage.viWriteReg] = oldVi;
-            viSequence = ++vu->m_nextWriteSequence;
-            vu->m_viLatestWrite[lowerUsage.viWriteReg] = viSequence;
-            vu->m_viReady[lowerUsage.viWriteReg] = vu->m_cycle + 1u;
+            vu->m_viReady[lowerUsage.viWriteReg] = vu->m_cycle + lowerUsage.viLatency;
+            if constexpr (lowerUsage.viLatency > 1u)
+                vu->queueViWrite(lowerUsage.viWriteReg, newVi, lowerUsage.viLatency);
+            else
+            {
+                viSequence = ++vu->m_nextWriteSequence;
+                vu->m_viLatestWrite[lowerUsage.viWriteReg] = viSequence;
+            }
             if (lowerUsage.delaysNextBranchRead)
                 vu->recordViWriteForBranch(lowerUsage.viWriteReg, oldVi);
         }
@@ -788,7 +800,7 @@ private:
             retireReadyStores(vu);
         retireReadyVf(vu);
         retireReadyVi(vu);
-        if (lowerUsage.viWriteReg != 0u &&
+        if (lowerUsage.viWriteReg != 0u && lowerUsage.viLatency == 1u &&
             vu->m_viLatestWrite[lowerUsage.viWriteReg] == viSequence)
         {
             vu->m_state.vi[lowerUsage.viWriteReg] = static_cast<int16_t>(newVi);
@@ -955,6 +967,14 @@ private:
             vu->m_state.haltAfterDelaySlot)
         {
             return false;
+        }
+        if constexpr (((nativeLowerUsage<Words::lower, Words::upper>().viLatency > 1u) || ...))
+        {
+            // At most four one-per-cycle integer loads can await retirement.
+            // Reserve those slots in addition to every live entry-state write.
+            if (std::popcount(vu->m_viWritePipelineMask) >
+                VU1Interpreter::kMaxPendingViWrites - 4u)
+                return false;
         }
 
         if (vu->m_xgkick.active)
