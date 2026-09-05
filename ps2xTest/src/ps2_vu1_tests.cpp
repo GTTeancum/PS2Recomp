@@ -426,6 +426,93 @@ void register_ps2_vu1_tests()
         });
 #endif
 #if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
+        tc.Run("native VU simple arithmetic preserves normal and boundary flags", [](TestCase &t)
+        {
+            Vu1Fixture referenceFx;
+            Vu1Fixture nativeFx;
+            if (!referenceFx.initialize() || !nativeFx.initialize())
+            {
+                t.IsTrue(false, "Arithmetic fixtures must initialize");
+                return;
+            }
+            constexpr uint32_t words[] = {
+                0x010208c0u, 0x00a208c5u, 0x01e208dau, 0x01e208e0u,
+                0x01e208e6u, 0x01e208dcu, 0x01e208e8u, 0x01e208ecu,
+                0x01e2083cu, 0x01e2087cu, 0x01e209bcu, 0x01e209fcu,
+                0x01e209feu, 0x01e20a3cu, 0x01e20a7eu, 0x01e20abeu
+            };
+            for (auto *fx : {&referenceFx, &nativeFx})
+            {
+                for (uint32_t index = 0; index < std::size(words); ++index)
+                    writeTrackedVuInstructionPair(*fx, 0x3500u + index * 8u, 0u, words[index]);
+                writeTrackedVuInstructionPair(*fx, 0x3580u, 0u, kVuUpperNop | 0x40000000u);
+                writeTrackedVuInstructionPair(*fx, 0x3588u, 0u, kVuUpperNop);
+            }
+            constexpr uint32_t values[] = {
+                0u, 0x80000000u, 1u, 0x807fffffu, 0x007fffffu, 0x00800000u,
+                0x80800000u, 0x00800001u, 0x80800001u, 0x00800002u,
+                0x7f7ffffdu, 0xff7ffffdu, 0x7f7ffffeu, 0xff7ffffeu,
+                0x7f7fffffu, 0xff7fffffu, 0x7f800000u, 0xff800000u,
+                0x7fc01234u, 0x3f800000u, 0xbf800000u, 0x3f800001u,
+                0x3f7fffffu, 0x3f000000u, 0x40000000u, 0xc0000000u
+            };
+            uint32_t random = 0x94e6c217u;
+            const uint32_t boundaryCases = static_cast<uint32_t>(std::size(values) * std::size(values));
+            for (uint32_t sample = 0u; sample < boundaryCases + 128u; ++sample)
+            for (const uint32_t startPc : {0x3500u, 0x3540u})
+            {
+                VU1Interpreter reference;
+                VU1Interpreter native;
+                for (uint32_t lane = 0u; lane < 4u; ++lane)
+                {
+                    const auto next = [&]() { random ^= random << 13u; random ^= random >> 17u;
+                                             random ^= random << 5u; return random; };
+                    const uint32_t left = sample < boundaryCases
+                        ? values[(sample / std::size(values) + lane) % std::size(values)] : next();
+                    const uint32_t right = sample < boundaryCases
+                        ? values[(sample % std::size(values) + lane * 3u) % std::size(values)] : next();
+                    for (auto *vu : {&reference, &native})
+                    {
+                        std::memcpy(&vu->state().vf[1][lane], &left, sizeof(left));
+                        std::memcpy(&vu->state().vf[2][lane], &right, sizeof(right));
+                    }
+                }
+                for (auto *vu : {&reference, &native})
+                {
+                    vu->state().q = vu->state().vf[2][0];
+                    vu->state().i = vu->state().vf[1][0];
+                    vu->state().status = 0xA50u;
+                }
+                reference.execute(referenceFx.code, PS2_VU1_CODE_SIZE, referenceFx.data,
+                    PS2_VU1_DATA_SIZE, referenceFx.gs, &referenceFx.mem, startPc, 0u, 0u, 0u);
+                native.execute(nativeFx.code, PS2_VU1_CODE_SIZE, nativeFx.data,
+                    PS2_VU1_DATA_SIZE, nativeFx.gs, &nativeFx.mem, startPc, 0u, 0u, 0u);
+                native.setNativeBlocksEnabled(true);
+                for (uint32_t budget : {8u, 1u, 16u})
+                {
+                    std::ostringstream expected(std::ios::binary), actual(std::ios::binary);
+                    t.IsTrue(VUReplay::record(expected, reference, referenceFx.code, referenceFx.data,
+                        referenceFx.gs, &referenceFx.mem, budget), "Arithmetic reference must record");
+                    t.IsTrue(VUReplay::record(actual, native, nativeFx.code, nativeFx.data,
+                        nativeFx.gs, &nativeFx.mem, budget), "Native arithmetic must record");
+                    const auto expectedBytes = expected.str();
+                    const auto actualBytes = actual.str();
+                    if (expectedBytes != actualBytes)
+                    {
+                        size_t offset = 0u;
+                        while (offset < expectedBytes.size() && offset < actualBytes.size() &&
+                               expectedBytes[offset] == actualBytes[offset]) ++offset;
+                        std::fprintf(stderr, "[vu-normal-case] sample=%u start=0x%x budget=%u offset=%zu bytes=%zu/%zu status=%x/%x mac=%x/%x\n",
+                            sample, startPc, budget, offset, expectedBytes.size(), actualBytes.size(),
+                            reference.state().status, native.state().status, reference.state().mac, native.state().mac);
+                        t.IsTrue(false, "Arithmetic state/pipeline mismatch at sample " + std::to_string(sample));
+                        return;
+                    }
+                }
+                t.IsTrue(native.blockCounters().pairs >= 8u, "Arithmetic case must execute a compiled block");
+            }
+        });
+
         tc.Run("native VU blocks preserve loops stores and budget fallback", [](TestCase &t)
         {
             constexpr uint32_t startPc = 0x3000u;
