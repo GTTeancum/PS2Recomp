@@ -525,6 +525,21 @@ private:
         }
     }
 
+    static void retireReadyVi(VU1Interpreter *vu)
+    {
+        for (uint32_t slots = vu->m_viWritePipelineMask; slots != 0u; slots &= slots - 1u)
+        {
+            const uint32_t slot = static_cast<uint32_t>(std::countr_zero(slots));
+            auto &write = vu->m_viWritePipeline[slot];
+            if (write.readyCycle > vu->m_cycle)
+                continue;
+            if (vu->m_viLatestWrite[write.reg] == write.sequence)
+                vu->m_state.vi[write.reg] = static_cast<int16_t>(write.value);
+            write = {};
+            vu->m_viWritePipelineMask &= ~(1u << slot);
+        }
+    }
+
     static void retireReadyStores(VU1Interpreter *vu)
     {
         for (uint32_t slots = vu->m_storePipelineMask; slots != 0u; slots &= slots - 1u)
@@ -713,6 +728,7 @@ private:
         if constexpr (lowerUsage.queuesStore)
             retireReadyStores(vu);
         retireReadyVf(vu);
+        retireReadyVi(vu);
         if (lowerUsage.viWriteReg != 0u &&
             vu->m_viLatestWrite[lowerUsage.viWriteReg] == viSequence)
         {
@@ -850,7 +866,7 @@ private:
         if constexpr ((((Words::upper & 0x58000000u) != 0u) || ...))
             return false;
         if (budgetEnd - vu->m_cycle < Count || vu->m_accWritePipelineMask != 0u ||
-            vu->m_storePipelineMask != 0u || vu->m_viWritePipelineMask != 0u ||
+            vu->m_storePipelineMask != 0u ||
             vu->m_fdiv.valid || vu->m_efu[0].valid || vu->m_efu[1].valid ||
             vu->m_state.branchPending || vu->m_state.ebit ||
             vu->m_state.haltAfterDelaySlot)

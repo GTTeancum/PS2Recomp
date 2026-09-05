@@ -523,6 +523,46 @@ void register_ps2_vu1_tests()
                      "A short budget should fall back before partial execution");
             t.Equals(budgetCounters.pairs, uint64_t{0},
                      "Budget fallback must not report native pairs");
+
+            Vu1Fixture pendingInterpretedFx;
+            Vu1Fixture pendingNativeFx;
+            VU1Interpreter pendingInterpreted;
+            VU1Interpreter pendingNative;
+            t.IsTrue(initialize(pendingInterpretedFx, pendingInterpreted),
+                     "Pending-VI reference fixture should initialize");
+            t.IsTrue(initialize(pendingNativeFx, pendingNative),
+                     "Pending-VI native fixture should initialize");
+            const auto stagePendingVi = [&](Vu1Fixture &fx, VU1Interpreter &vu)
+            {
+                writeTrackedVuInstructionPair(fx, startPc - 8u,
+                                               makeVuIlw(0x8u, 3u, 5u, 0),
+                                               kVuUpperNop);
+                const uint32_t loadedVi = 6u;
+                std::memcpy(fx.data + 2u * 16u, &loadedVi, sizeof(loadedVi));
+                vu.state().vi[5] = 2;
+                vu.execute(fx.code, PS2_VU1_CODE_SIZE,
+                           fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+                           startPc - 8u, 0u, 0u, 1u);
+                t.Equals(vu.state().vi[3], int32_t{4},
+                         "Four-cycle ILW must still be pending at block entry");
+            };
+            stagePendingVi(pendingInterpretedFx, pendingInterpreted);
+            stagePendingVi(pendingNativeFx, pendingNative);
+            pendingNative.setNativeBlocksEnabled(true);
+            pendingInterpreted.resume(pendingInterpretedFx.code, PS2_VU1_CODE_SIZE,
+                                      pendingInterpretedFx.data, PS2_VU1_DATA_SIZE,
+                                      pendingInterpretedFx.gs, &pendingInterpretedFx.mem,
+                                      0u, 0u, 16u);
+            pendingNative.resume(pendingNativeFx.code, PS2_VU1_CODE_SIZE,
+                                 pendingNativeFx.data, PS2_VU1_DATA_SIZE,
+                                 pendingNativeFx.gs, &pendingNativeFx.mem,
+                                 0u, 0u, 16u);
+            compare(pendingInterpretedFx, pendingInterpreted,
+                    pendingNativeFx, pendingNative);
+            t.Equals(pendingNative.state().vi[3], int32_t{6},
+                     "Pending VI value must retire before its in-block read");
+            t.Equals(pendingNative.blockCounters().pairs, uint64_t{16},
+                     "A safe pending VI write must not force block fallback");
         });
 #endif
 #if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
