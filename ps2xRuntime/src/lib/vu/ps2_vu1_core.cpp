@@ -786,7 +786,8 @@ void VU1Interpreter::commitReadyPipelines()
         }
         if (entry.writesClip)
             m_state.clip = entry.clip;
-        entry = {};
+        // All fields are integer/bool zeros; avoid MSVC's aggregate temporary and copy.
+        std::memset(&entry, 0, sizeof(entry));
         m_flagPipelineMask &= ~(1u << slot);
     }
 
