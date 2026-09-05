@@ -8,6 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(PS2X_ENABLE_RUNNER_UNITY_BUILD "Build ps2EntryRunner with CMake unity build" ON)
 set(PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE 32 CACHE STRING "Unity build batch size for ps2EntryRunner")
 option(PS2X_ENABLE_RUNNER_PCH "Precompile the heavy runtime headers for ps2EntryRunner" ON)
+option(PS2X_ENABLE_RUNNER_IPO "Allow link-time optimization of the generated game target when IPO is enabled" ON)
 option(PS2X_ENABLE_SCCACHE "Use sccache as compiler launcher when available" ON)
 
 option(PS2X_ENABLE_RUNTIME_LOGS "Enable PS2 runtime logs" OFF)
@@ -603,6 +604,12 @@ EnableX86SimdBaseline(ps2_runtime)
 
 EnableFastReleaseMode(ps2_runtime)
 EnableFastReleaseMode(ps2EntryRunner)
+if(NOT PS2X_ENABLE_RUNNER_IPO)
+    # Large generated games can exceed linker memory limits even with one worker.
+    set_target_properties(ps2EntryRunner PROPERTIES
+        INTERPROCEDURAL_OPTIMIZATION_RELEASE FALSE
+        INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO FALSE)
+endif()
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VUNativeUpper.cmake")
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VUNativePairs.cmake")
