@@ -513,6 +513,81 @@ void register_ps2_vu1_tests()
             }
         });
 
+        tc.Run("native VU blocks retire overlapping VF writes at their scheduled cycles", [](TestCase &t)
+        {
+            Vu1Fixture referenceFx;
+            Vu1Fixture nativeFx;
+            if (!referenceFx.initialize() || !nativeFx.initialize())
+            {
+                t.IsTrue(false, "Overlapping-write fixtures must initialize");
+                return;
+            }
+            constexpr uint32_t startPc = 0x3600u;
+            constexpr uint32_t lower[] = {
+                0x01840000u, 0x00640001u, 0x01e30002u, 0x00430003u,
+                0x00840004u, 0x00440005u, 0x01030006u, 0x00830007u
+            };
+            constexpr uint32_t upper[] = {
+                0x010208c0u, 0x008208c0u, 0x018208c0u, 0x01020900u,
+                kVuUpperNop, 0x002208c0u, 0x00220900u, kVuUpperNop
+            };
+            for (auto *fx : {&referenceFx, &nativeFx})
+            {
+                for (uint32_t index = 0u; index < 8u; ++index)
+                {
+                    writeTrackedVuInstructionPair(*fx, startPc + index * 8u, lower[index], upper[index]);
+                    for (uint32_t lane = 0u; lane < 4u; ++lane)
+                    {
+                        const float value = static_cast<float>(100u + index * 4u + lane);
+                        std::memcpy(fx->data + index * 16u + lane * 4u, &value, sizeof(value));
+                    }
+                }
+                writeTrackedVuInstructionPair(*fx, startPc + 64u, 0u, kVuUpperNop | 0x40000000u);
+                writeTrackedVuInstructionPair(*fx, startPc + 72u, 0u, kVuUpperNop);
+            }
+            for (uint32_t prelude = 0u; prelude < 4u; ++prelude)
+            for (const uint32_t budget : {0u, 1u, 2u, 3u, 4u, 7u, 8u, 9u, 10u, 11u, 12u, 16u})
+            {
+                VU1Interpreter reference;
+                VU1Interpreter native;
+                for (auto *vu : {&reference, &native})
+                    for (uint32_t reg = 1u; reg <= 4u; ++reg)
+                        for (uint32_t lane = 0u; lane < 4u; ++lane)
+                            vu->state().vf[reg][lane] = static_cast<float>(reg * reg * 7u + 1u + lane);
+                for (auto *fx : {&referenceFx, &nativeFx})
+                    writeTrackedVuInstructionPair(*fx, startPc - 8u,
+                        (prelude & 2u) != 0u ? makeVuLq(0xFu, 4u, 0u, 7) : 0u,
+                        (prelude & 1u) != 0u ? makeVuUpper(0x00u, 0xFu, 2u, 1u, 3u) : kVuUpperNop);
+                const uint32_t entry = prelude != 0u ? startPc - 8u : startPc;
+                const uint32_t initialCycles = prelude != 0u ? 1u : 0u;
+                reference.execute(referenceFx.code, PS2_VU1_CODE_SIZE, referenceFx.data,
+                    PS2_VU1_DATA_SIZE, referenceFx.gs, &referenceFx.mem, entry, 0u, 0u, initialCycles);
+                native.execute(nativeFx.code, PS2_VU1_CODE_SIZE, nativeFx.data,
+                    PS2_VU1_DATA_SIZE, nativeFx.gs, &nativeFx.mem, entry, 0u, 0u, initialCycles);
+                t.Equals(reference.state().pc, startPc, "Prelude must stop at the block entry");
+                t.Equals(native.state().pc, startPc, "Native prelude must stop at the block entry");
+                t.Equals(native.state().vf[3][0], 64.0f, "Prelude arithmetic must still be pending");
+                t.Equals(native.state().vf[4][0], 113.0f, "Prelude load must still be pending");
+                native.setNativeBlocksEnabled(true);
+                for (const uint32_t slice : {budget, 1u, 1u, 1u, 1u, 16u})
+                {
+                    std::ostringstream expected(std::ios::binary), actual(std::ios::binary);
+                    t.IsTrue(VUReplay::record(expected, reference, referenceFx.code, referenceFx.data,
+                        referenceFx.gs, &referenceFx.mem, slice), "Overlapping reference must record");
+                    t.IsTrue(VUReplay::record(actual, native, nativeFx.code, nativeFx.data,
+                        nativeFx.gs, &nativeFx.mem, slice), "Overlapping native block must record");
+                    if (expected.str() != actual.str())
+                    {
+                        t.IsTrue(false, "VF retirement mismatch: prelude=" + std::to_string(prelude) +
+                            " budget=" + std::to_string(budget) + " slice=" + std::to_string(slice));
+                        return;
+                    }
+                }
+                if (budget >= 8u)
+                    t.IsTrue(native.blockCounters().pairs >= 8u, "Full budget must exercise native block");
+            }
+        });
+
         tc.Run("native VU blocks preserve loops stores and budget fallback", [](TestCase &t)
         {
             constexpr uint32_t startPc = 0x3000u;

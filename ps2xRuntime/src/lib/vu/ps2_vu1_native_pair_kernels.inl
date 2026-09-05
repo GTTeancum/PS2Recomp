@@ -391,6 +391,7 @@ consteval auto nativeBlockSchedule()
     struct Schedule
     {
         std::array<uint8_t, Count> issue{};
+        std::array<uint8_t, Count> queuedVf{};
         uint8_t cycles = 0u;
         bool valid = true;
     };
@@ -468,6 +469,31 @@ consteval auto nativeBlockSchedule()
         ++cycle;
     }
     schedule.cycles = cycle;
+    for (size_t index = 0u; index < Count; ++index)
+    {
+        const auto mustQueue = [&](uint8_t reg)
+        {
+            if (reg == 0u)
+                return false;
+            const uint32_t ready = schedule.issue[index] + 4u;
+            if (ready > schedule.cycles)
+                return true;
+            // A later write may cancel this result, or capture its still-old
+            // inactive lanes in a pending write. Preserve actual retirement
+            // for same-register writes issued before this result is ready.
+            for (size_t next = index + 1u; next < Count && schedule.issue[next] < ready; ++next)
+            {
+                if (upperUsages[next].writeReg == reg || lowerUsages[next].vfWriteReg == reg)
+                    return true;
+            }
+            return false;
+        };
+        if (mustQueue(upperUsages[index].writeReg))
+            schedule.queuedVf[index] |= 1u;
+        if (lowerUsages[index].vfWriteReg != upperUsages[index].writeReg &&
+            mustQueue(lowerUsages[index].vfWriteReg))
+            schedule.queuedVf[index] |= 2u;
+    }
     return schedule;
 }
 
@@ -631,7 +657,7 @@ private:
         }
     }
 
-    template <size_t Index, typename Words, uint8_t CyclesToEnd>
+    template <size_t Index, typename Words, uint8_t QueuedVf>
     static void executeFastPair(
         VU1Interpreter *vu,
         uint8_t upperVfSlot, uint8_t lowerVfSlot)
@@ -648,9 +674,8 @@ private:
             lowerUsage.vfReadReg == upperUsage.writeReg &&
             (lowerUsage.vfReadLanes & upperUsage.writeLanes) != 0u;
         constexpr bool upperShadowed = lowerSuppressed || lowerReadsUpper;
-        constexpr bool deferUpper = upperUsage.writeReg != 0u &&
-            upperLatency > CyclesToEnd;
-        constexpr bool deferLower = hasLowerWrite && upperLatency > CyclesToEnd;
+        constexpr bool deferUpper = (QueuedVf & 1u) != 0u;
+        constexpr bool deferLower = (QueuedVf & 2u) != 0u;
         float oldUpper[4]{};
         float oldLower[4]{};
         if (upperUsage.writeReg != 0u && (deferUpper || upperShadowed))
@@ -827,7 +852,7 @@ private:
                 }
             }
             executeFastPair<PairIndex, std::tuple_element_t<PairIndex, PairTuple>,
-                           Schedule.cycles - Schedule.issue[PairIndex]>(
+                           Schedule.queuedVf[PairIndex]>(
                 vu, upperVfSlots[PairIndex], lowerVfSlots[PairIndex]);
         };
         (issuePair.template operator()<Index>(), ...);

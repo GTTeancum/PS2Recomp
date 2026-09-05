@@ -52,34 +52,11 @@ template <uint64_t Word>
 void VU1Interpreter::normalizeFmacResultFor(float *result, uint8_t dest,
                                           uint8_t laneFlags[4])
 {
-    constexpr uint8_t opcode = static_cast<uint8_t>(Word & 0x3Fu);
-    constexpr uint8_t arithmetic = opcode < 0x3Cu ? opcode
-        : static_cast<uint8_t>((Word & 3u) | ((Word >> 4u) & 0x7Cu));
-    constexpr bool simpleArithmetic = arithmetic <= 0x07u ||
-        (arithmetic >= 0x18u && arithmetic <= 0x1Cu) || arithmetic == 0x1Eu ||
-        arithmetic == 0x20u || arithmetic == 0x22u || arithmetic == 0x24u ||
-        arithmetic == 0x26u || arithmetic == 0x28u || arithmetic == 0x2Au ||
-        arithmetic == 0x2Cu;
     for (uint32_t component = 0; component < 4u; ++component)
     {
         laneFlags[component] = 0u;
         if ((dest & laneForComponent(component)) == 0u)
             continue;
-
-        if constexpr (Word != kDynamicUpper && simpleArithmetic)
-        {
-            uint32_t bits = 0u;
-            std::memcpy(&bits, &result[component], sizeof(bits));
-            const uint32_t magnitude = bits & 0x7FFFFFFFu;
-            // For one rounded ADD/SUB/MUL, an interior normal result cannot hide
-            // zero, underflow, overflow, or a different exact sign. Keep both
-            // boundary floats and all product-sum operations on the exact path.
-            if (magnitude > 0x00800000u && magnitude < 0x7F7FFFFFu)
-            {
-                laneFlags[component] = static_cast<uint8_t>((bits >> 30u) & 0x2u);
-                continue;
-            }
-        }
 
         long double exactResult = 0.0L;
         if (calculateFmacExactResultFor<Word>(component, exactResult))
