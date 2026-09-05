@@ -718,6 +718,8 @@ private:
         {
             vu->m_state.vi[lowerUsage.viWriteReg] = static_cast<int16_t>(newVi);
         }
+        if (vu->m_xgkick.active)
+            vu->progressXgkick();
     }
 
     template <typename PairTuple, size_t... Index>
@@ -850,10 +852,25 @@ private:
         if (budgetEnd - vu->m_cycle < Count || vu->m_accWritePipelineMask != 0u ||
             vu->m_storePipelineMask != 0u || vu->m_viWritePipelineMask != 0u ||
             vu->m_fdiv.valid || vu->m_efu[0].valid || vu->m_efu[1].valid ||
-            vu->m_xgkick.active || vu->m_state.branchPending || vu->m_state.ebit ||
+            vu->m_state.branchPending || vu->m_state.ebit ||
             vu->m_state.haltAfterDelaySlot)
         {
             return false;
+        }
+
+        if (vu->m_xgkick.active)
+        {
+            // A new GIFtag can fault. Keep that boundary in the interpreter so
+            // an early stop cannot expose values committed ahead inside a block.
+            const auto &kick = vu->m_xgkick;
+            const uint64_t endBytes = kick.copiedBytes +
+                ((static_cast<uint64_t>(kick.cycleCredit) + Count) / 2u) * 16u;
+            if (kick.currentTagEnd == 0u ||
+                kick.currentTagEnd > VU1Interpreter::XgkickPipeline::kBufferSize ||
+                (!kick.currentTagEop && endBytes > kick.currentTagEnd))
+            {
+                return false;
+            }
         }
 
         uint32_t virtualVfMask = vu->m_vfWritePipelineMask;

@@ -525,6 +525,93 @@ void register_ps2_vu1_tests()
                      "Budget fallback must not report native pairs");
         });
 #endif
+#if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
+        tc.Run("native VU blocks preserve in-flight GIF bytes cycles and packet boundaries", [](TestCase &t)
+        {
+            constexpr uint32_t startPc = 0x3000u;
+            for (uint32_t packetKind = 0u; packetKind < 5u; ++packetKind)
+            {
+                for (uint32_t budget : {0u, 1u, 7u, 8u, 9u, 16u, 64u})
+                {
+                    Vu1Fixture referenceFx;
+                    Vu1Fixture nativeFx;
+                    VU1Interpreter reference;
+                    VU1Interpreter native;
+                    const auto initialize = [&](Vu1Fixture &fx, VU1Interpreter &vu)
+                    {
+                        if (!fx.initialize())
+                            return false;
+                        writeTrackedVuInstructionPair(fx, startPc - 8u,
+                            makeVuLowerSpecial(0x6Cu, 0u), kVuUpperNop);
+                        writeTrackedVuInstructionPair(fx, startPc,
+                            makeVuLq(0xFu, 2u, 1u, 0), kVuUpperNop);
+                        for (uint32_t offset : {8u, 16u, 24u, 56u})
+                            writeTrackedVuInstructionPair(fx, startPc + offset, 0u, kVuUpperNop);
+                        writeTrackedVuInstructionPair(fx, startPc + 32u,
+                            makeVuSq(0xFu, 2u, 3u, 0), kVuUpperNop);
+                        writeTrackedVuInstructionPair(fx, startPc + 40u,
+                            makeVuIaddiu(4u, 4u, -1), kVuUpperNop);
+                        writeTrackedVuInstructionPair(fx, startPc + 48u,
+                            makeVuIbgtz(4u, -7), kVuUpperNop);
+                        writeTrackedVuInstructionPair(fx, startPc + 64u,
+                            0u, kVuUpperNop | 0x40000000u);
+                        writeTrackedVuInstructionPair(fx, startPc + 72u, 0u, kVuUpperNop);
+
+                        const uint16_t loops = packetKind == 0u ? 1u : packetKind == 1u ? 4u : 16u;
+                        const uint64_t tag = makeGifTag(packetKind >= 3u ? 1u : loops,
+                                                       GIF_FMT_PACKED, 1u, packetKind < 3u);
+                        const uint64_t regs = 0xFu;
+                        std::memcpy(fx.data, &tag, sizeof(tag));
+                        std::memcpy(fx.data + 8u, &regs, sizeof(regs));
+                        std::memset(fx.data + 16u, 0x5Au, 16u * 20u);
+                        const float source[4] = {1.25f, -2.5f, 3.75f, 1.0f};
+                        writeVuQword(fx.data, 1u, source);
+                        if (packetKind >= 3u)
+                        {
+                            const uint64_t nextTag = makeGifTag(packetKind == 3u ? 16u : 0x7FFFu,
+                                                               GIF_FMT_PACKED, 1u);
+                            std::memcpy(fx.data + 32u, &nextTag, sizeof(nextTag));
+                            std::memcpy(fx.data + 40u, &regs, sizeof(regs));
+                        }
+                        vu.state().vi[1] = 1;
+                        vu.state().vi[3] = 4;
+                        vu.state().vi[4] = 2;
+                        vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
+                                   fx.gs, &fx.mem, startPc - 8u, 0u, 0u, 1u);
+                        return true;
+                    };
+                    if (!initialize(referenceFx, reference) || !initialize(nativeFx, native))
+                    {
+                        t.IsTrue(false, "In-flight transfer fixtures must initialize");
+                        return;
+                    }
+                    native.setNativeBlocksEnabled(true);
+                    const auto compareSlice = [&](uint32_t cycles)
+                    {
+                        std::ostringstream expected(std::ios::binary);
+                        std::ostringstream actual(std::ios::binary);
+                        t.IsTrue(VUReplay::record(expected, reference, referenceFx.code,
+                            referenceFx.data, referenceFx.gs, &referenceFx.mem, cycles),
+                            "Reference slice must record");
+                        t.IsTrue(VUReplay::record(actual, native, nativeFx.code,
+                            nativeFx.data, nativeFx.gs, &nativeFx.mem, cycles),
+                            "Native slice must record");
+                        t.IsTrue(expected.str() == actual.str(),
+                            "Complete state, memory, partial GIF bytes, and emission cycles must match");
+                    };
+                    compareSlice(budget);
+                    if (packetKind < 3u && budget >= 8u)
+                        t.IsTrue(native.blockCounters().pairs >= 8u,
+                                 "A known packet must permit native block execution");
+                    if (packetKind >= 3u && budget == 8u)
+                        t.Equals(native.blockCounters().pairs, uint64_t{0u},
+                                 "An unparsed GIFtag must keep the first block interpreted");
+                    compareSlice(1u);
+                    compareSlice(64u);
+                }
+            }
+        });
+#endif
         if (const char *path = std::getenv("PS2X_VU_REPLAY_FILE"))
         {
             tc.Run("recorded VU slices reproduce state memory and graphics packets", [path = std::string(path)](TestCase &t)
