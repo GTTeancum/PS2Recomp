@@ -398,6 +398,7 @@ private:
     template <uint64_t Word> void normalizeFmacResultFor(float *result, uint8_t dest, uint8_t laneFlags[4]);
     template <uint64_t Word> bool calculateFmacExactResultFor(uint32_t component, long double &result) const;
     template <uint64_t Word> uint32_t calculateFmacProductStickyFor(uint8_t dest) const;
+    template <uint8_t Dest> void updateFmacFlagsFor(const uint8_t laneFlags[4], uint32_t extraSticky);
     template <uint64_t Word> void applyFmacDestFor(float *dst, float *result, uint8_t dest);
     template <uint64_t Word> void applyFmacDestAccFor(float *result, uint8_t dest);
     void updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky);
