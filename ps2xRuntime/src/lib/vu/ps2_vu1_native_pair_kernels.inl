@@ -731,6 +731,107 @@ private:
              vu, blockEndCycle, upperVfSlots[Index], lowerVfSlots[Index]), ...);
     }
 
+    template <size_t Index, typename Words, size_t Count>
+    static bool prepareFastPair(
+        VU1Interpreter *vu, uint64_t startCycle,
+        uint32_t &virtualVfMask,
+        std::array<uint64_t, VU1Interpreter::kMaxPendingVfWrites> &virtualVfReady,
+        std::array<uint64_t, 16> &virtualViReady,
+        std::array<uint8_t, Count> &upperVfSlots,
+        std::array<uint8_t, Count> &lowerVfSlots)
+    {
+        constexpr VUNativeUpperUsage upperUsage = nativeUpperUsage<Words::upper>();
+        constexpr VUNativeLowerUsage lowerUsage =
+            nativeLowerUsage<Words::lower, Words::upper>();
+        constexpr bool lowerSuppressed = lowerUsage.vfWriteReg != 0u &&
+            lowerUsage.vfWriteReg == upperUsage.writeReg;
+        const uint64_t issueCycle = startCycle + Index;
+
+        for (uint32_t slots = virtualVfMask; slots != 0u; slots &= slots - 1u)
+        {
+            const uint32_t slot = static_cast<uint32_t>(std::countr_zero(slots));
+            if (virtualVfReady[slot] <= issueCycle)
+                virtualVfMask &= ~(1u << slot);
+        }
+        const auto reserveVfSlot = [&](uint8_t &result)
+        {
+            constexpr uint32_t validSlots =
+                (1u << VU1Interpreter::kMaxPendingVfWrites) - 1u;
+            const uint32_t available = (~virtualVfMask) & validSlots;
+            if (available == 0u)
+                return false;
+            const uint32_t slot = static_cast<uint32_t>(std::countr_zero(available));
+            result = static_cast<uint8_t>(slot);
+            virtualVfMask |= 1u << slot;
+            virtualVfReady[slot] = issueCycle + VU1Interpreter::kFmacLatency;
+            return true;
+        };
+        if constexpr (upperUsage.writeReg != 0u)
+        {
+            if (!reserveVfSlot(upperVfSlots[Index]))
+                return false;
+        }
+        if constexpr (lowerUsage.vfWriteReg != 0u && !lowerSuppressed)
+        {
+            if (!reserveVfSlot(lowerVfSlots[Index]))
+                return false;
+        }
+        for (uint32_t readIndex = 0u; readIndex < upperUsage.readCount; ++readIndex)
+        {
+            constexpr uint32_t componentCount = 4u;
+            const uint8_t readReg = upperUsage.readRegs[readIndex];
+            const uint8_t readLanes = upperUsage.readLanes[readIndex];
+            for (uint32_t component = 0u; component < componentCount; ++component)
+            {
+                if ((readLanes & laneForComponent(component)) != 0u &&
+                    vu->m_vfReady[readReg][component] > issueCycle)
+                {
+                    return false;
+                }
+            }
+        }
+        for (uint32_t component = 0u; component < 4u; ++component)
+        {
+            if ((lowerUsage.vfReadLanes & laneForComponent(component)) != 0u &&
+                vu->m_vfReady[lowerUsage.vfReadReg][component] > issueCycle)
+            {
+                return false;
+            }
+        }
+        for (uint32_t component = 0u; component < 4u; ++component)
+        {
+            if ((upperUsage.accRead & laneForComponent(component)) != 0u &&
+                vu->m_accReady[component] > issueCycle)
+            {
+                return false;
+            }
+        }
+        for (uint32_t regs = lowerUsage.viRead; regs != 0u; regs &= regs - 1u)
+        {
+            const uint32_t reg = static_cast<uint32_t>(std::countr_zero(regs));
+            if (virtualViReady[reg] > issueCycle)
+                return false;
+        }
+        if constexpr (lowerUsage.viWriteReg != 0u)
+            virtualViReady[lowerUsage.viWriteReg] = issueCycle + 1u;
+        return true;
+    }
+
+    template <typename PairTuple, size_t Count, size_t... Index>
+    static bool prepareFastPairs(
+        VU1Interpreter *vu, uint64_t startCycle,
+        uint32_t &virtualVfMask,
+        std::array<uint64_t, VU1Interpreter::kMaxPendingVfWrites> &virtualVfReady,
+        std::array<uint64_t, 16> &virtualViReady,
+        std::array<uint8_t, Count> &upperVfSlots,
+        std::array<uint8_t, Count> &lowerVfSlots,
+        std::index_sequence<Index...>)
+    {
+        return (prepareFastPair<Index, std::tuple_element_t<Index, PairTuple>>(
+                    vu, startCycle, virtualVfMask, virtualVfReady,
+                    virtualViReady, upperVfSlots, lowerVfSlots) && ...);
+    }
+
     template <typename... Words>
     static bool canExecuteFast(
         VU1Interpreter *vu, uint64_t budgetEnd,
@@ -738,16 +839,13 @@ private:
         std::array<uint8_t, sizeof...(Words)> &lowerVfSlots)
     {
         static constexpr size_t Count = sizeof...(Words);
-        static constexpr std::array<VUNativeUpperUsage, Count> upperUsages = {
-            nativeUpperUsage<Words::upper>()...};
-        static constexpr std::array<VUNativeLowerUsage, Count> lowerUsages = {
-            nativeLowerUsage<Words::lower, Words::upper>()...};
-        static constexpr std::array<uint32_t, Count> upperWords = {Words::upper...};
         upperVfSlots.fill(0xFFu);
         lowerVfSlots.fill(0xFFu);
         static_assert((nativeUpperUsage<Words::upper>().valid && ...));
         static_assert((nativeLowerUsage<Words::lower, Words::upper>().valid && ...));
         if constexpr (!nativeBlockInternalHazardsSafe<Words...>())
+            return false;
+        if constexpr ((((Words::upper & 0x58000000u) != 0u) || ...))
             return false;
         if (budgetEnd - vu->m_cycle < Count || vu->m_accWritePipelineMask != 0u ||
             vu->m_storePipelineMask != 0u || vu->m_viWritePipelineMask != 0u ||
@@ -766,94 +864,10 @@ private:
             virtualVfReady[slot] = vu->m_vfWritePipeline[slot].readyCycle;
         }
         std::array<uint64_t, 16> virtualViReady = vu->m_viReady;
-        for (size_t index = 0u; index < Count; ++index)
-        {
-            const auto &upperUsage = upperUsages[index];
-            const auto &lowerUsage = lowerUsages[index];
-            if ((upperWords[index] & 0x58000000u) != 0u)
-            {
-                return false;
-            }
-            const uint64_t issueCycle = vu->m_cycle + index;
-            for (uint32_t slots = virtualVfMask; slots != 0u; slots &= slots - 1u)
-            {
-                const uint32_t slot = static_cast<uint32_t>(std::countr_zero(slots));
-                if (virtualVfReady[slot] <= issueCycle)
-                    virtualVfMask &= ~(1u << slot);
-            }
-            if (upperUsage.writeReg != 0u)
-            {
-                uint32_t slot = 0u;
-                while (slot < VU1Interpreter::kMaxPendingVfWrites &&
-                       (virtualVfMask & (1u << slot)) != 0u)
-                {
-                    ++slot;
-                }
-                if (slot == VU1Interpreter::kMaxPendingVfWrites)
-                    return false;
-                upperVfSlots[index] = static_cast<uint8_t>(slot);
-                virtualVfMask |= 1u << slot;
-                virtualVfReady[slot] = issueCycle + VU1Interpreter::kFmacLatency;
-            }
-            const bool lowerSuppressed = lowerUsage.vfWriteReg != 0u &&
-                lowerUsage.vfWriteReg == upperUsage.writeReg;
-            if (lowerUsage.vfWriteReg != 0u && !lowerSuppressed)
-            {
-                uint32_t slot = 0u;
-                while (slot < VU1Interpreter::kMaxPendingVfWrites &&
-                       (virtualVfMask & (1u << slot)) != 0u)
-                {
-                    ++slot;
-                }
-                if (slot == VU1Interpreter::kMaxPendingVfWrites)
-                    return false;
-                lowerVfSlots[index] = static_cast<uint8_t>(slot);
-                virtualVfMask |= 1u << slot;
-                virtualVfReady[slot] = issueCycle + VU1Interpreter::kFmacLatency;
-            }
-            for (uint32_t readIndex = 0u; readIndex < upperUsage.readCount; ++readIndex)
-            {
-                const uint8_t readReg = upperUsage.readRegs[readIndex];
-                const uint8_t readLanes = upperUsage.readLanes[readIndex];
-                for (uint32_t component = 0u; component < 4u; ++component)
-                {
-                    if ((readLanes & laneForComponent(component)) != 0u &&
-                        vu->m_vfReady[readReg][component] > issueCycle)
-                    {
-                        return false;
-                    }
-                    if ((readLanes & laneForComponent(component)) == 0u)
-                        continue;
-                }
-            }
-            for (uint32_t component = 0u; component < 4u; ++component)
-            {
-                if ((lowerUsage.vfReadLanes & laneForComponent(component)) != 0u &&
-                    vu->m_vfReady[lowerUsage.vfReadReg][component] > issueCycle)
-                {
-                    return false;
-                }
-            }
-            for (uint32_t component = 0u; component < 4u; ++component)
-            {
-                if ((upperUsage.accRead & laneForComponent(component)) != 0u &&
-                    vu->m_accReady[component] > issueCycle)
-                {
-                    return false;
-                }
-                if ((upperUsage.accRead & laneForComponent(component)) == 0u)
-                    continue;
-            }
-            for (uint32_t regs = lowerUsage.viRead; regs != 0u; regs &= regs - 1u)
-            {
-                const uint32_t reg = static_cast<uint32_t>(std::countr_zero(regs));
-                if (virtualViReady[reg] > issueCycle)
-                    return false;
-            }
-            if (lowerUsage.viWriteReg != 0u)
-                virtualViReady[lowerUsage.viWriteReg] = issueCycle + 1u;
-        }
-        return true;
+        using PairTuple = std::tuple<Words...>;
+        return prepareFastPairs<PairTuple>(
+            vu, vu->m_cycle, virtualVfMask, virtualVfReady, virtualViReady,
+            upperVfSlots, lowerVfSlots, std::make_index_sequence<Count>{});
     }
 
 public:
