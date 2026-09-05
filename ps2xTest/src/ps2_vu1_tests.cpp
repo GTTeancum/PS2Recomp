@@ -563,6 +563,58 @@ void register_ps2_vu1_tests()
                      "Pending VI value must retire before its in-block read");
             t.Equals(pendingNative.blockCounters().pairs, uint64_t{16},
                      "A safe pending VI write must not force block fallback");
+
+            constexpr uint32_t vfBlockPc = 0x3100u;
+            const auto runPendingVf = [&](Vu1Fixture &fx, VU1Interpreter &vu,
+                                          bool nativeBlocks)
+            {
+                writeTrackedVuInstructionPair(fx, vfBlockPc - 24u,
+                                               makeVuLq(0xFu, 2u, 1u, 0),
+                                               kVuUpperNop);
+                writeTrackedVuInstructionPair(fx, vfBlockPc - 16u, 0u,
+                                               kVuUpperNop);
+                writeTrackedVuInstructionPair(fx, vfBlockPc - 8u, 0u,
+                                               kVuUpperNop);
+                writeTrackedVuInstructionPair(
+                    fx, vfBlockPc, 0u,
+                    makeVuUpper(0x28u, 0xFu, 2u, 1u, 3u));
+                writeTrackedVuInstructionPair(fx, vfBlockPc + 8u, 0u,
+                                               kVuUpperNop);
+                const float source[4] = {2.0f, 4.0f, 6.0f, 8.0f};
+                writeVuQword(fx.data, 1u, source);
+                vu.state().vi[1] = 1;
+                vu.state().vf[1][0] = 1.0f;
+                vu.state().vf[1][1] = 2.0f;
+                vu.state().vf[1][2] = 3.0f;
+                vu.state().vf[1][3] = 4.0f;
+                vu.execute(fx.code, PS2_VU1_CODE_SIZE,
+                           fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+                           vfBlockPc - 24u, 0u, 0u, 3u);
+                vu.setNativeBlocksEnabled(nativeBlocks);
+                vu.resume(fx.code, PS2_VU1_CODE_SIZE,
+                          fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+                          0u, 0u, 3u);
+            };
+            Vu1Fixture pendingVfInterpretedFx;
+            Vu1Fixture pendingVfNativeFx;
+            VU1Interpreter pendingVfInterpreted;
+            VU1Interpreter pendingVfNative;
+            t.IsTrue(pendingVfInterpretedFx.initialize(),
+                     "Pending-VF reference fixture should initialize");
+            t.IsTrue(pendingVfNativeFx.initialize(),
+                     "Pending-VF native fixture should initialize");
+            runPendingVf(pendingVfInterpretedFx, pendingVfInterpreted, false);
+            runPendingVf(pendingVfNativeFx, pendingVfNative, true);
+            compare(pendingVfInterpretedFx, pendingVfInterpreted,
+                    pendingVfNativeFx, pendingVfNative);
+            t.IsTrue(std::memcmp(pendingVfNative.state().vf[3],
+                                 pendingVfInterpreted.state().vf[3],
+                                 sizeof(pendingVfNative.state().vf[3])) == 0,
+                     "Native block must wait for its first VF source");
+            t.Equals(pendingVfNative.blockCounters().attempted, uint64_t{1},
+                     "The delayed VF source should stall inside one block attempt");
+            t.Equals(pendingVfNative.blockCounters().pairs, uint64_t{2},
+                     "The block should execute after the delayed VF source retires");
         });
 #endif
 #if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)

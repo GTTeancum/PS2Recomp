@@ -835,6 +835,34 @@ private:
         return true;
     }
 
+    template <typename Words>
+    static uint64_t firstPairVfReadyCycle(const VU1Interpreter *vu)
+    {
+        constexpr VUNativeUpperUsage upperUsage = nativeUpperUsage<Words::upper>();
+        constexpr VUNativeLowerUsage lowerUsage =
+            nativeLowerUsage<Words::lower, Words::upper>();
+        uint64_t readyCycle = vu->m_cycle;
+        for (uint32_t readIndex = 0u; readIndex < upperUsage.readCount; ++readIndex)
+        {
+            const uint8_t readReg = upperUsage.readRegs[readIndex];
+            const uint8_t readLanes = upperUsage.readLanes[readIndex];
+            for (uint32_t component = 0u; component < 4u; ++component)
+            {
+                if ((readLanes & laneForComponent(component)) != 0u)
+                    readyCycle = std::max(readyCycle,
+                                          vu->m_vfReady[readReg][component]);
+            }
+        }
+        for (uint32_t component = 0u; component < 4u; ++component)
+        {
+            if ((lowerUsage.vfReadLanes & laneForComponent(component)) != 0u)
+                readyCycle = std::max(
+                    readyCycle,
+                    vu->m_vfReady[lowerUsage.vfReadReg][component]);
+        }
+        return readyCycle;
+    }
+
     template <typename PairTuple, size_t Count, size_t... Index>
     static bool prepareFastPairs(
         VU1Interpreter *vu, uint64_t startCycle,
@@ -921,9 +949,20 @@ public:
             return 0u;
 
         using PairTuple = std::tuple<PairWords...>;
+        using FirstWords = std::tuple_element_t<0u, PairTuple>;
         uint32_t executed = 0u;
         do
         {
+            const uint64_t firstReadyCycle = firstPairVfReadyCycle<FirstWords>(vu);
+            if (firstReadyCycle > vu->m_cycle)
+            {
+                if (firstReadyCycle >= budgetEnd)
+                {
+                    vu->advanceTo(budgetEnd);
+                    break;
+                }
+                vu->advanceTo(firstReadyCycle);
+            }
             std::array<uint8_t, pairCount> upperVfSlots{};
             std::array<uint8_t, pairCount> lowerVfSlots{};
             if (!canExecuteFast<PairWords...>(
