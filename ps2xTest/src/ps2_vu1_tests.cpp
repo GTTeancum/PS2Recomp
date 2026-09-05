@@ -618,6 +618,78 @@ void register_ps2_vu1_tests()
         });
 #endif
 #if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
+        tc.Run("native VU block entry deadlines preserve lane reads and overwritten VI", [](TestCase &t)
+        {
+            constexpr uint32_t startPc = 0x3200u;
+            for (uint32_t source : {2u, 4u, 32u})
+            for (uint32_t lane : {0x8u, 0x4u, 0x2u, 0x1u, 0xFu})
+            for (uint32_t elapsed : {1u, 2u, 3u})
+            for (uint32_t budget : {0u, 1u, 7u, 8u, 9u, 16u})
+            {
+                Vu1Fixture referenceFx;
+                Vu1Fixture nativeFx;
+                VU1Interpreter reference;
+                VU1Interpreter native;
+                const auto initialize = [&](Vu1Fixture &fx, VU1Interpreter &vu)
+                {
+                    if (!fx.initialize())
+                        return false;
+                    writeTrackedVuInstructionPair(fx, startPc,
+                        makeVuIaddiu(2u, 0u, 1), kVuUpperNop);
+                    for (uint32_t index = 1u; index <= 4u; ++index)
+                        writeTrackedVuInstructionPair(fx, startPc + index * 8u,
+                            index == 1u ? makeVuSq(0x8u, 4u, 2u, 0) : 0u,
+                            makeVuUpper(0x28u, 0x10u >> index, 2u, 1u, 4u + index));
+                    for (uint32_t index = 5u; index < 8u; ++index)
+                        writeTrackedVuInstructionPair(fx, startPc + index * 8u, 0u, kVuUpperNop);
+                    const uint32_t preludePc = startPc - elapsed * 8u;
+                    writeTrackedVuInstructionPair(fx, preludePc,
+                        source == 32u ? makeVuIlw(lane, 2u, 1u, 0) :
+                                        makeVuLq(lane, source, 1u, 0), kVuUpperNop);
+                    for (uint32_t pc = preludePc + 8u; pc < startPc; pc += 8u)
+                        writeTrackedVuInstructionPair(fx, pc, 0u, kVuUpperNop);
+                    const float loaded[4] = {2.0f, -4.0f, 6.0f, -8.0f};
+                    writeVuQword(fx.data, 3u, loaded);
+                    vu.state().vi[1] = 3;
+                    vu.state().vi[2] = 7;
+                    for (uint32_t component = 0u; component < 4u; ++component)
+                    {
+                        vu.state().vf[1][component] = 1.0f;
+                        vu.state().vf[2][component] = 10.0f;
+                        vu.state().vf[4][component] = 20.0f;
+                    }
+                    vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
+                               fx.gs, &fx.mem, preludePc, 0u, 0u, elapsed);
+                    return true;
+                };
+                if (!initialize(referenceFx, reference) || !initialize(nativeFx, native))
+                {
+                    t.IsTrue(false, "Block deadline fixtures must initialize");
+                    return;
+                }
+                native.setNativeBlocksEnabled(true);
+                for (uint32_t cycles : {budget, 1u, 16u})
+                {
+                    std::ostringstream expected(std::ios::binary);
+                    std::ostringstream actual(std::ios::binary);
+                    t.IsTrue(VUReplay::record(expected, reference, referenceFx.code,
+                        referenceFx.data, referenceFx.gs, &referenceFx.mem, cycles),
+                        "Reference deadline slice must record");
+                    t.IsTrue(VUReplay::record(actual, native, nativeFx.code,
+                        nativeFx.data, nativeFx.gs, &nativeFx.mem, cycles),
+                        "Native deadline slice must record");
+                    t.IsTrue(expected.str() == actual.str(),
+                        "Lane deadlines and VI replacement must preserve full resumed state");
+                }
+                if (source == 32u && budget >= 8u)
+                    t.IsTrue(native.blockCounters().pairs >= 8u,
+                        "An overwritten entry VI deadline must permit native execution");
+                if (source == 2u && lane == 0x1u && budget >= 8u)
+                    t.IsTrue(native.blockCounters().pairs >= 8u,
+                        "A later lane read must use its own deadline");
+            }
+        });
+
         tc.Run("native VU blocks preserve in-flight GIF bytes cycles and packet boundaries", [](TestCase &t)
         {
             constexpr uint32_t startPc = 0x3000u;

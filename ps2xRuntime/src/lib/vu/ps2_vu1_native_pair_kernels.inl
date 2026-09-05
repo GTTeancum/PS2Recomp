@@ -458,6 +458,58 @@ consteval bool nativeBlockInternalHazardsSafe()
     return true;
 }
 
+template <typename... Words>
+consteval auto nativeBlockEntryRequirements()
+{
+    constexpr size_t Count = sizeof...(Words);
+    constexpr std::array<VUNativeUpperUsage, Count> upperUsages = {
+        nativeUpperUsage<Words::upper>()...};
+    constexpr std::array<VUNativeLowerUsage, Count> lowerUsages = {
+        nativeLowerUsage<Words::lower, Words::upper>()...};
+    struct Requirement
+    {
+        uint8_t field;
+        uint8_t offset;
+    };
+    struct Plan
+    {
+        std::array<Requirement, 148> reads{};
+        size_t count = 0u;
+    };
+    std::array<uint8_t, 148> firstRead;
+    firstRead.fill(0xFFu);
+    uint32_t writtenVi = 0u;
+    for (size_t index = 0u; index < Count; ++index)
+    {
+        const auto &upper = upperUsages[index];
+        const auto &lower = lowerUsages[index];
+        const auto read = [&](size_t field)
+        {
+            firstRead[field] = std::min(firstRead[field], static_cast<uint8_t>(index));
+        };
+        for (uint32_t component = 0u; component < 4u; ++component)
+        {
+            const uint8_t lane = laneForComponent(component);
+            for (uint32_t source = 0u; source < upper.readCount; ++source)
+                if ((upper.readLanes[source] & lane) != 0u)
+                    read(upper.readRegs[source] * 4u + component);
+            if ((lower.vfReadLanes & lane) != 0u)
+                read(lower.vfReadReg * 4u + component);
+            if ((upper.accRead & lane) != 0u)
+                read(128u + component);
+        }
+        for (uint32_t regs = lower.viRead & ~writtenVi; regs != 0u; regs &= regs - 1u)
+            read(132u + static_cast<uint32_t>(std::countr_zero(regs)));
+        if (lower.viWriteReg != 0u)
+            writtenVi |= 1u << lower.viWriteReg;
+    }
+    Plan plan;
+    for (size_t field = 0u; field < firstRead.size(); ++field)
+        if (firstRead[field] != 0xFFu)
+            plan.reads[plan.count++] = {static_cast<uint8_t>(field), firstRead[field]};
+    return plan;
+}
+
 struct VUNativeBlockAccess
 {
 private:
@@ -754,7 +806,6 @@ private:
         VU1Interpreter *vu, uint64_t startCycle,
         uint32_t &virtualVfMask,
         std::array<uint64_t, VU1Interpreter::kMaxPendingVfWrites> &virtualVfReady,
-        std::array<uint64_t, 16> &virtualViReady,
         std::array<uint8_t, Count> &upperVfSlots,
         std::array<uint8_t, Count> &lowerVfSlots)
     {
@@ -794,45 +845,32 @@ private:
             if (!reserveVfSlot(lowerVfSlots[Index]))
                 return false;
         }
-        for (uint32_t readIndex = 0u; readIndex < upperUsage.readCount; ++readIndex)
-        {
-            constexpr uint32_t componentCount = 4u;
-            const uint8_t readReg = upperUsage.readRegs[readIndex];
-            const uint8_t readLanes = upperUsage.readLanes[readIndex];
-            for (uint32_t component = 0u; component < componentCount; ++component)
-            {
-                if ((readLanes & laneForComponent(component)) != 0u &&
-                    vu->m_vfReady[readReg][component] > issueCycle)
-                {
-                    return false;
-                }
-            }
-        }
-        for (uint32_t component = 0u; component < 4u; ++component)
-        {
-            if ((lowerUsage.vfReadLanes & laneForComponent(component)) != 0u &&
-                vu->m_vfReady[lowerUsage.vfReadReg][component] > issueCycle)
-            {
-                return false;
-            }
-        }
-        for (uint32_t component = 0u; component < 4u; ++component)
-        {
-            if ((upperUsage.accRead & laneForComponent(component)) != 0u &&
-                vu->m_accReady[component] > issueCycle)
-            {
-                return false;
-            }
-        }
-        for (uint32_t regs = lowerUsage.viRead; regs != 0u; regs &= regs - 1u)
-        {
-            const uint32_t reg = static_cast<uint32_t>(std::countr_zero(regs));
-            if (virtualViReady[reg] > issueCycle)
-                return false;
-        }
-        if constexpr (lowerUsage.viWriteReg != 0u)
-            virtualViReady[lowerUsage.viWriteReg] = issueCycle + 1u;
         return true;
+    }
+
+    template <uint8_t Field, uint8_t Offset>
+    static bool entryRequirementReady(const VU1Interpreter *vu)
+    {
+        const uint64_t deadline = vu->m_cycle + Offset;
+        if constexpr (Field < 128u)
+            return vu->m_vfReady[Field / 4u][Field % 4u] <= deadline;
+        else if constexpr (Field < 132u)
+            return vu->m_accReady[Field - 128u] <= deadline;
+        else
+            return vu->m_viReady[Field - 132u] <= deadline;
+    }
+
+    template <typename... Words>
+    static bool entryRequirementsReady(const VU1Interpreter *vu)
+    {
+        // Each entry-state field needs only its earliest deadline. Internal
+        // dependencies are already proven by nativeBlockInternalHazardsSafe.
+        static constexpr auto plan = nativeBlockEntryRequirements<Words...>();
+        return [&]<size_t... Index>(std::index_sequence<Index...>)
+        {
+            return (entryRequirementReady<plan.reads[Index].field,
+                                          plan.reads[Index].offset>(vu) && ...);
+        }(std::make_index_sequence<plan.count>{});
     }
 
     template <typename Words>
@@ -868,14 +906,13 @@ private:
         VU1Interpreter *vu, uint64_t startCycle,
         uint32_t &virtualVfMask,
         std::array<uint64_t, VU1Interpreter::kMaxPendingVfWrites> &virtualVfReady,
-        std::array<uint64_t, 16> &virtualViReady,
         std::array<uint8_t, Count> &upperVfSlots,
         std::array<uint8_t, Count> &lowerVfSlots,
         std::index_sequence<Index...>)
     {
         return (prepareFastPair<Index, std::tuple_element_t<Index, PairTuple>>(
                     vu, startCycle, virtualVfMask, virtualVfReady,
-                    virtualViReady, upperVfSlots, lowerVfSlots) && ...);
+                    upperVfSlots, lowerVfSlots) && ...);
     }
 
     template <typename... Words>
@@ -917,6 +954,9 @@ private:
             }
         }
 
+        if (!entryRequirementsReady<Words...>(vu))
+            return false;
+
         uint32_t virtualVfMask = vu->m_vfWritePipelineMask;
         std::array<uint64_t, VU1Interpreter::kMaxPendingVfWrites> virtualVfReady{};
         for (uint32_t slots = virtualVfMask; slots != 0u; slots &= slots - 1u)
@@ -924,10 +964,9 @@ private:
             const uint32_t slot = static_cast<uint32_t>(std::countr_zero(slots));
             virtualVfReady[slot] = vu->m_vfWritePipeline[slot].readyCycle;
         }
-        std::array<uint64_t, 16> virtualViReady = vu->m_viReady;
         using PairTuple = std::tuple<Words...>;
         return prepareFastPairs<PairTuple>(
-            vu, vu->m_cycle, virtualVfMask, virtualVfReady, virtualViReady,
+            vu, vu->m_cycle, virtualVfMask, virtualVfReady,
             upperVfSlots, lowerVfSlots, std::make_index_sequence<Count>{});
     }
 
