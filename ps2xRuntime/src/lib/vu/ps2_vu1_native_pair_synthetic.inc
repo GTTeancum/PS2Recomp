@@ -102,6 +102,11 @@ VU_NATIVE_PAIR(0x3628u, 0x00440005u, 0x002208c0u)
 VU_NATIVE_PAIR(0x3630u, 0x01030006u, 0x00220900u)
 VU_NATIVE_PAIR(0x3638u, 0x00830007u, 0x000002ffu)
 
+// Deferred upper results coexist with an old-value store and a suppressed LQI.
+VU_NATIVE_BLOCK(0x3700u, 2u)
+VU_NATIVE_PAIR(0x3700u, 0x03e11800u, 0x010208e8u)
+VU_NATIVE_PAIR(0x3708u, 0x81e3137cu, 0x0083117du)
+
 // Public synthetic pairs used to validate native pair selection and fallback.
 VU_NATIVE_PAIR_WORDS(0x00000000u, 0x000002ffu, 3u)
 VU_NATIVE_PAIR_WORDS(0x800208f0u, 0x000002ffu, 2u)

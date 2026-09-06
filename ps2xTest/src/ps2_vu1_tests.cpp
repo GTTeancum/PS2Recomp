@@ -752,6 +752,69 @@ void register_ps2_vu1_tests()
             }
         });
 
+        tc.Run("native VU deferred outputs preserve old reads and suppressed load side effects", [](TestCase &t)
+        {
+            Vu1Fixture referenceFx, nativeFx;
+            if (!referenceFx.initialize() || !nativeFx.initialize())
+            {
+                t.IsTrue(false, "Deferred output fixtures must initialize");
+                return;
+            }
+            constexpr uint32_t startPc = 0x3700u;
+            for (auto *fx : {&referenceFx, &nativeFx})
+            {
+                writeTrackedVuInstructionPair(*fx, startPc,
+                    makeVuSq(15u, 3u, 1u, 0), makeVuUpper(0x28u, 8u, 2u, 1u, 3u));
+                writeTrackedVuInstructionPair(*fx, startPc + 8u,
+                    makeVuLowerSpecial(0x34u, 2u, 3u, 0u, 15u),
+                    makeVuUpperSpecial(0x15u, 4u, 3u, 2u));
+                writeTrackedVuInstructionPair(*fx, startPc + 16u, 0u, kVuUpperNop | 0x40000000u);
+                writeTrackedVuInstructionPair(*fx, startPc + 24u, 0u, kVuUpperNop);
+            }
+            for (uint32_t sample = 0u; sample < 16u; ++sample)
+            for (uint32_t budget : {0u, 1u, 2u, 3u, 4u, 5u, 8u})
+            {
+                VU1Interpreter reference, native;
+                const float left[] = {static_cast<float>(sample + 1u), -2.0f, 3.0f, 4.0f};
+                const float right[] = {sample * 0.5f, sample * -1.25f, 2.0f, 5.0f};
+                const float previous[] = {sample * -7.0f, sample * 11.0f, sample * 13.0f, sample * 17.0f};
+                std::memset(referenceFx.data, 0xA5, PS2_VU1_DATA_SIZE);
+                std::memset(nativeFx.data, 0xA5, PS2_VU1_DATA_SIZE);
+                for (auto *vu : {&reference, &native})
+                {
+                    std::memcpy(vu->state().vf[1], left, sizeof(left));
+                    std::memcpy(vu->state().vf[2], right, sizeof(right));
+                    std::memcpy(vu->state().vf[3], previous, sizeof(previous));
+                    vu->state().vi[2] = 1;
+                }
+                reference.execute(referenceFx.code, PS2_VU1_CODE_SIZE, referenceFx.data,
+                    PS2_VU1_DATA_SIZE, referenceFx.gs, &referenceFx.mem, startPc, 0u, 0u, 0u);
+                native.execute(nativeFx.code, PS2_VU1_CODE_SIZE, nativeFx.data,
+                    PS2_VU1_DATA_SIZE, nativeFx.gs, &nativeFx.mem, startPc, 0u, 0u, 0u);
+                native.setNativeBlocksEnabled(true);
+                for (uint32_t slice : {budget, 1u, 1u, 1u, 16u})
+                {
+                    std::ostringstream expected(std::ios::binary), actual(std::ios::binary);
+                    t.IsTrue(VUReplay::record(expected, reference, referenceFx.code,
+                        referenceFx.data, referenceFx.gs, &referenceFx.mem, slice), "Reference slice must record");
+                    t.IsTrue(VUReplay::record(actual, native, nativeFx.code,
+                        nativeFx.data, nativeFx.gs, &nativeFx.mem, slice), "Native slice must record");
+                    t.IsTrue(expected.str() == actual.str(), "Deferred values and complete pending state must match");
+                }
+                if (budget >= 2u)
+                    t.IsTrue(native.blockCounters().pairs >= 2u, "The deferred-output block must execute natively");
+                t.IsTrue(std::memcmp(nativeFx.data, previous, sizeof(previous)) == 0,
+                    "The same-pair store must observe the old VF3 value");
+                t.Equals(native.state().vi[2], 2, "A suppressed LQI must still increment its base register");
+                t.Equals(native.state().vf[3][0], left[0] + right[0], "ADD.x must retire into VF3.x");
+                int32_t converted = 0;
+                std::memcpy(&converted, &native.state().vf[3][1], sizeof(converted));
+                t.Equals(converted, -20 * static_cast<int32_t>(sample), "FTOI4.y must preserve integer bits");
+                t.Equals(native.state().vf[3][2], previous[2], "Suppressed LQI must not overwrite VF3.z");
+                t.Equals(native.state().vf[3][3], previous[3], "Suppressed LQI must not overwrite VF3.w");
+            }
+        });
+
         tc.Run("native VU blocks preserve loops stores and budget fallback", [](TestCase &t)
         {
             constexpr uint32_t startPc = 0x3000u;
