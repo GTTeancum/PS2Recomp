@@ -657,6 +657,7 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
                 const bool traceMemory = iteration == 0u && result.cases == memoryTraceCase;
                 auto previousData = traceMemory ? record.data : std::vector<uint8_t>{};
                 uint32_t traceWrites = 0;
+                uint32_t traceSteps = 0;
                 const auto start = std::chrono::steady_clock::now();
                 {
                     ContextScope scope(context);
@@ -685,6 +686,11 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
                                     memory->getVU1Data(), PS2_VU1_DATA_SIZE, gs, memory.get(), 1u);
                             if (traceMemory)
                             {
+                                if (traceSteps++ < 256u)
+                                    std::printf("[vu-step] pc=%04x next=%04x cycle=%llu/%llu running=%u\n",
+                                        pairPc, vu->m_state.pc,
+                                        static_cast<unsigned long long>(beforeCycle - initialCycle),
+                                        static_cast<unsigned long long>(vu->m_cycle - initialCycle), unsigned(vu->m_running));
                                 const auto *data = memory->getVU1Data();
                                 for (uint32_t offset = 0; offset < PS2_VU1_DATA_SIZE; offset += 16u)
                                 {
