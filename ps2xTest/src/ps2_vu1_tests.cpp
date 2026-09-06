@@ -9,6 +9,7 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_vu1_replay.h"
+#include "runtime/ps2_vu_flags.h"
 
 #include <cmath>
 #include <chrono>
@@ -234,6 +235,54 @@ void register_ps2_vu1_tests()
 {
     MiniTest::Case("PS2VU1", [](TestCase &tc)
     {
+        tc.Run("VU FMAC packing preserves every flag combination and destination", [](TestCase &t)
+        {
+            const auto check = [&](const uint8_t *flags, uint8_t dest)
+            {
+                uint32_t mac = 0u;
+                uint32_t status = 0u;
+                for (uint32_t component = 0u; component < 4u; ++component)
+                {
+                    const uint32_t lane = 8u >> component;
+                    if ((dest & lane) == 0u)
+                        continue;
+                    status |= flags[component];
+                    for (uint32_t flag = 0u; flag < 4u; ++flag)
+                        if ((flags[component] & (1u << flag)) != 0u)
+                            mac |= lane << (flag * 4u);
+                }
+                const auto result = VUFlags::packFmac(flags, dest);
+                return result.mac == mac && result.status == status;
+            };
+            for (uint32_t pattern = 0u; pattern < 65536u; ++pattern)
+            {
+                const uint8_t flags[4] = {
+                    static_cast<uint8_t>(pattern & 0xFu),
+                    static_cast<uint8_t>((pattern >> 4u) & 0xFu),
+                    static_cast<uint8_t>((pattern >> 8u) & 0xFu),
+                    static_cast<uint8_t>((pattern >> 12u) & 0xFu)};
+                for (uint8_t dest = 0u; dest < 16u; ++dest)
+                    if (!check(flags, dest))
+                    {
+                        t.IsTrue(false, "FMAC packing mismatch: flags=" + std::to_string(pattern) +
+                            " dest=" + std::to_string(dest));
+                        return;
+                    }
+            }
+            for (uint32_t value = 0u; value < 256u; ++value)
+            {
+                const uint8_t flags[4] = {static_cast<uint8_t>(value),
+                    static_cast<uint8_t>(value ^ 0xA5u), static_cast<uint8_t>(value ^ 0x5Au),
+                    static_cast<uint8_t>(~value)};
+                for (uint8_t dest = 0u; dest < 16u; ++dest)
+                    if (!check(flags, static_cast<uint8_t>(dest | 0xF0u)))
+                    {
+                        t.IsTrue(false, "Inactive high flag/destination bits changed packing");
+                        return;
+                    }
+            }
+            t.IsTrue(true, "All 1,048,576 canonical combinations and high-bit cases match");
+        });
 #if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
         tc.Run("native VU upper module rejects incompatible hosts and reloads", [](TestCase &t)
         {

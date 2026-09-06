@@ -1,6 +1,8 @@
 // Shared arithmetic definitions for interpreted and native-specialized VU execution.
 // Include after the instruction-field and laneForComponent helpers.
 
+#include "runtime/ps2_vu_flags.h"
+
 #if !defined(PS2X_VU_NATIVE_PAIR_USE_HOST_MATH)
 float VU1Interpreter::normalizeResult(float value, uint32_t &laneFlags) const
 {
@@ -355,24 +357,7 @@ void VU1Interpreter::updateFmacFlagsFor(const uint8_t laneFlags[4],
     if constexpr (Dest == 0u)
         return;
 
-    uint32_t mac = 0u;
-    uint32_t status = 0u;
-    const auto packLane = [&](uint32_t flags, uint32_t lane)
-    {
-        mac |= (flags & 0x1u) * lane;
-        mac |= ((flags >> 1u) & 0x1u) * (lane << 4u);
-        mac |= ((flags >> 2u) & 0x1u) * (lane << 8u);
-        mac |= ((flags >> 3u) & 0x1u) * (lane << 12u);
-        status |= flags;
-    };
-    if constexpr ((Dest & 0x8u) != 0u)
-        packLane(laneFlags[0], 0x8u);
-    if constexpr ((Dest & 0x4u) != 0u)
-        packLane(laneFlags[1], 0x4u);
-    if constexpr ((Dest & 0x2u) != 0u)
-        packLane(laneFlags[2], 0x2u);
-    if constexpr ((Dest & 0x1u) != 0u)
-        packLane(laneFlags[3], 0x1u);
+    const auto flags = VUFlags::packFmac(laneFlags, Dest);
 
     const uint32_t available =
         (~m_flagPipelineMask) & ((1u << kMaxFlagEntries) - 1u);
@@ -386,12 +371,12 @@ void VU1Interpreter::updateFmacFlagsFor(const uint8_t laneFlags[4],
     }
 
     FlagPipelineEntry &entry = m_flagPipeline[slot];
-    entry = {};
+    std::memset(&entry, 0, sizeof(entry));
     entry.valid = true;
     entry.issueCycle = m_cycle;
     entry.readyCycle = m_cycle + kFmacLatency;
-    entry.mac = mac;
-    entry.status = status;
+    entry.mac = flags.mac;
+    entry.status = flags.status;
     entry.extraSticky = extraSticky;
     entry.writesMac = true;
     entry.writesStatus = true;
