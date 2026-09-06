@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include "runtime/vu_pair_profile.h"
+#include "runtime/ps2_vu_compiled_state.h"
 #if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
 #include "runtime/ps2_vu1.h"
 #endif
@@ -75,6 +76,11 @@ public:
                              uint8_t *data, uint32_t dataSize, GS &gs,
                              PS2Memory *memory, uint32_t maxCycles);
     static bool observeGif(const uint8_t *packet, uint32_t bytes, uint64_t cycle);
+    // Diagnostic only: private reference execution, no live state or GS writes.
+    // On mismatch, optionally writes one ordinary baseline replay record.
+    static bool verifyCompiledDrain(VU1Interpreter &vu, const VUCompiledState::Input &input,
+        const VUCompiledState::Output &output, const uint8_t *code, const uint8_t *data,
+        GS &gs, uint64_t tick, std::ostream *failure, std::string &reason);
 
     // Executes the slice even if appending exceeds the file/output limit.
     static bool record(std::ostream &output, VU1Interpreter &vu,
@@ -103,4 +109,5 @@ private:
     template <class Archive> static void visitState(Archive &archive, VU1Interpreter &vu);
     static std::vector<uint8_t> saveState(VU1Interpreter &vu);
     static void loadState(const std::vector<uint8_t> &bytes, VU1Interpreter &vu);
+    static std::vector<uint8_t> completedState(const VU1Interpreter &vu);
 };

@@ -305,6 +305,116 @@ bool VUReplay::captureRequested()
     return requested && activeContext == nullptr;
 }
 
+std::vector<uint8_t> VUReplay::completedState(const VU1Interpreter &v)
+{
+    require(v.m_unit == VU1Interpreter::Unit::VU1 && !v.m_running &&
+        !v.m_stopRequested && !v.m_pendingHaltD && !v.m_pendingHaltT &&
+        !v.m_state.ebit && !v.m_state.haltAfterDelaySlot && !v.m_state.branchPending &&
+        !v.m_state.dBitEnabled && !v.m_state.tBitEnabled &&
+        !v.m_state.stoppedByD && !v.m_state.stoppedByT &&
+        !v.m_xgkick.active && !v.m_fdiv.valid && !v.m_viBranchBackupValid &&
+        !v.m_flagPipelineMask && !v.m_storePipelineMask && !v.m_vfWritePipelineMask &&
+        !v.m_viWritePipelineMask && !v.m_accWritePipelineMask &&
+        v.m_cycle == v.m_state.cycles && v.m_efuResourceReady <= v.m_cycle &&
+        v.m_workingClip == v.m_state.clip, "Hybrid result is not fully drained");
+    const auto empty = [](const auto &queue) {
+        return std::none_of(queue.begin(), queue.end(), [](const auto &e) { return e.valid; });
+    };
+    require(empty(v.m_efu) && empty(v.m_flagPipeline) && empty(v.m_storePipeline) &&
+        empty(v.m_vfWritePipeline) && empty(v.m_viWritePipeline) && empty(v.m_accWritePipeline),
+        "Hybrid drain retains a live pipeline slot");
+    for (const auto &reg : v.m_vfReady)
+        for (const auto ready : reg) require(ready <= v.m_cycle, "Hybrid VF deadline remains pending");
+    for (const auto ready : v.m_viReady) require(ready <= v.m_cycle, "Hybrid VI deadline remains pending");
+    for (const auto ready : v.m_accReady) require(ready <= v.m_cycle, "Hybrid ACC deadline remains pending");
+    auto s = v.m_state;
+    Writer w;
+    w(s.vf, s.acc, s.q, s.p, s.i, s.r, s.pc, s.mac, s.clip, s.status, s.cycles, s.top, s.itop);
+    for (const auto value : s.vi) { auto bits = static_cast<uint16_t>(value); w(bits); }
+    return w.bytes;
+}
+
+bool VUReplay::verifyCompiledDrain(VU1Interpreter &vu, const VUCompiledState::Input &input,
+    const VUCompiledState::Output &output, const uint8_t *code, const uint8_t *data,
+    GS &gs, uint64_t tick, std::ostream *failure, std::string &reason)
+{
+    reason.clear();
+#if !defined(PS2X_ENABLE_VU_COMPILED_ENGINE)
+    reason = "Compiled VU audit requires the optional engine extension";
+    return false;
+#else
+    require(code && data, "Invalid compiled VU audit memory");
+    Record record;
+    record.maxCycles = input.budget;
+    record.tick = tick;
+    record.before = saveState(vu);
+    record.code.assign(code, code + PS2_VU1_CODE_SIZE);
+    record.data.assign(data, data + PS2_VU1_DATA_SIZE);
+    record.afterData = record.data;
+    auto reference = std::make_unique<VU1Interpreter>();
+    auto candidate = std::make_unique<VU1Interpreter>();
+    loadState(record.before, *reference);
+    loadState(record.before, *candidate);
+#if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
+    reference->setUpperLookup(vu.m_upperLookup);
+#endif
+#if defined(PS2X_ENABLE_VU_NATIVE_PAIRS)
+    reference->setNativePairsEnabled(vu.m_nativePairsEnabled);
+#endif
+#if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
+    reference->setNativeBlocksEnabled(vu.m_nativeBlocksEnabled);
+#endif
+    Context baseline;
+    baseline.replay = true;
+    {
+        ScopedCompiledVuMode disabled(false);
+        ContextScope scope(baseline);
+        reference->run(record.code.data(), PS2_VU1_CODE_SIZE, record.afterData.data(),
+            PS2_VU1_DATA_SIZE, gs, nullptr, input.budget);
+    }
+    record.after = saveState(*reference);
+    record.gifs = std::move(baseline.gifs.bytes);
+    auto candidateData = record.data;
+    Context staged;
+    staged.replay = true;
+    bool committed;
+    {
+        ContextScope scope(staged);
+        committed = VUCompiledState::commit(*candidate, input, output,
+            candidateData.data(), PS2_VU1_DATA_SIZE, gs, nullptr);
+    }
+    if (!committed) reason = "compiled output rejected by private commit";
+    else if (baseline.overflow || staged.overflow) reason = "audit packet quota exceeded";
+    else
+    {
+        try
+        {
+            if (completedState(*reference) != completedState(*candidate))
+                reason = "architectural state or completed cycles differ";
+        }
+        catch (const std::exception &e) { reason = e.what(); }
+        if (reason.empty() && record.afterData != candidateData) reason = "data memory differs";
+        if (reason.empty() && record.gifs != staged.gifs.bytes) reason = "timed graphics packets differ";
+    }
+    if (reason.empty()) return true;
+    if (failure && !baseline.overflow)
+    {
+        Writer body;
+        record.visit(body);
+        Writer header;
+        auto magic = kMagic;
+        auto size = static_cast<uint32_t>(body.bytes.size());
+        require(size <= kMaxRecord, "Audit failure record exceeds quota");
+        header(magic, size);
+        failure->write(reinterpret_cast<const char *>(header.bytes.data()), header.bytes.size());
+        failure->write(reinterpret_cast<const char *>(body.bytes.data()), body.bytes.size());
+        failure->flush();
+        if (!failure->good()) reason += "; could not save failure replay";
+    }
+    return false;
+#endif
+}
+
 bool VUReplay::observeGif(const uint8_t *packet, uint32_t bytes, uint64_t cycle)
 {
     if (!activeContext)
@@ -476,36 +586,6 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
 #if defined(PS2X_ENABLE_VU_COMPILED_ENGINE)
         auto expected = hybrid ? std::make_unique<VU1Interpreter>() : nullptr;
         uint64_t compiledCases = 0, compiledCalls = 0;
-        // Completed drains may have different inert queue slots and sequence
-        // numbers. Require identical architectural values and no live work on
-        // either side; fallback results still require the original exact state.
-        const auto completedState = [](const VU1Interpreter &v) {
-            require(v.m_unit == VU1Interpreter::Unit::VU1 && !v.m_running &&
-                !v.m_stopRequested && !v.m_pendingHaltD && !v.m_pendingHaltT &&
-                !v.m_state.ebit && !v.m_state.haltAfterDelaySlot && !v.m_state.branchPending &&
-                !v.m_state.dBitEnabled && !v.m_state.tBitEnabled &&
-                !v.m_state.stoppedByD && !v.m_state.stoppedByT &&
-                !v.m_xgkick.active && !v.m_fdiv.valid && !v.m_viBranchBackupValid &&
-                !v.m_flagPipelineMask && !v.m_storePipelineMask && !v.m_vfWritePipelineMask &&
-                !v.m_viWritePipelineMask && !v.m_accWritePipelineMask &&
-                v.m_cycle == v.m_state.cycles && v.m_efuResourceReady <= v.m_cycle &&
-                v.m_workingClip == v.m_state.clip, "Hybrid result is not fully drained");
-            const auto empty = [](const auto &queue) {
-                return std::none_of(queue.begin(), queue.end(), [](const auto &e) { return e.valid; });
-            };
-            require(empty(v.m_efu) && empty(v.m_flagPipeline) && empty(v.m_storePipeline) &&
-                empty(v.m_vfWritePipeline) && empty(v.m_viWritePipeline) && empty(v.m_accWritePipeline),
-                "Hybrid drain retains a live pipeline slot");
-            for (const auto &reg : v.m_vfReady)
-                for (const auto ready : reg) require(ready <= v.m_cycle, "Hybrid VF deadline remains pending");
-            for (const auto ready : v.m_viReady) require(ready <= v.m_cycle, "Hybrid VI deadline remains pending");
-            for (const auto ready : v.m_accReady) require(ready <= v.m_cycle, "Hybrid ACC deadline remains pending");
-            auto s = v.m_state;
-            Writer w;
-            w(s.vf, s.acc, s.q, s.p, s.i, s.r, s.pc, s.mac, s.clip, s.status, s.cycles, s.top, s.itop);
-            for (const auto value : s.vi) { auto bits = static_cast<uint16_t>(value); w(bits); }
-            return w.bytes;
-        };
 #endif
 #if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
         vu->setUpperLookup(upperLookup);
