@@ -545,7 +545,9 @@ void register_ps2_vu1_tests()
                 writeTrackedVuInstructionPair(*fx, startPc + 64u, 0u, kVuUpperNop | 0x40000000u);
                 writeTrackedVuInstructionPair(*fx, startPc + 72u, 0u, kVuUpperNop);
             }
-            for (uint32_t prelude = 0u; prelude < 4u; ++prelude)
+            // Three incoming pairs vary occupancy and per-slot deadlines
+            // independently across fresh interpreter instances.
+            for (uint32_t prelude = 0u; prelude < 64u; ++prelude)
             for (const uint32_t budget : {0u, 1u, 2u, 3u, 4u, 7u, 8u, 9u, 10u, 11u, 12u, 16u})
             {
                 VU1Interpreter reference;
@@ -555,11 +557,15 @@ void register_ps2_vu1_tests()
                         for (uint32_t lane = 0u; lane < 4u; ++lane)
                             vu->state().vf[reg][lane] = static_cast<float>(reg * reg * 7u + 1u + lane);
                 for (auto *fx : {&referenceFx, &nativeFx})
-                    writeTrackedVuInstructionPair(*fx, startPc - 8u,
-                        (prelude & 2u) != 0u ? makeVuLq(0xFu, 4u, 0u, 7) : 0u,
-                        (prelude & 1u) != 0u ? makeVuUpper(0x00u, 0xFu, 2u, 1u, 3u) : kVuUpperNop);
-                const uint32_t entry = prelude != 0u ? startPc - 8u : startPc;
-                const uint32_t initialCycles = prelude != 0u ? 1u : 0u;
+                    for (uint32_t pair = 0u; pair < 3u; ++pair)
+                    {
+                        const uint32_t writes = (prelude >> (pair * 2u)) & 3u;
+                        writeTrackedVuInstructionPair(*fx, startPc - 24u + pair * 8u,
+                            (writes & 2u) != 0u ? makeVuLq(0xFu, 4u, 0u, 7) : 0u,
+                            (writes & 1u) != 0u ? makeVuUpper(0x00u, 0xFu, 2u, 1u, 3u) : kVuUpperNop);
+                    }
+                const uint32_t entry = prelude != 0u ? startPc - 24u : startPc;
+                const uint32_t initialCycles = prelude != 0u ? 3u : 0u;
                 reference.execute(referenceFx.code, PS2_VU1_CODE_SIZE, referenceFx.data,
                     PS2_VU1_DATA_SIZE, referenceFx.gs, &referenceFx.mem, entry, 0u, 0u, initialCycles);
                 native.execute(nativeFx.code, PS2_VU1_CODE_SIZE, nativeFx.data,
