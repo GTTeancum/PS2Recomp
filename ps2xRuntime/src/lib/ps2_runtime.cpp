@@ -368,6 +368,56 @@ namespace
         ~GuestHeapCallScope() { if (enabled) g_guestHeapCall = previous; }
     };
     thread_local uint64_t g_guestDispatchYieldGeneration = 0u;
+    // Called only while the compatibility-heap mutex is held. A failure footer
+    // distinguishes a complete prefix from a capped, interrupted or failed write.
+    void recordGuestHeapEvent(uint32_t op, uint32_t address, uint32_t size, uint32_t alignment)
+    {
+        struct Trace
+        {
+            std::FILE *file = nullptr;
+            uint32_t count = 0;
+            static constexpr uint32_t cap() { return 262144u; }
+            Trace()
+            {
+                const char *path = std::getenv("PS2X_GUEST_HEAP_TRACE");
+                if (!path || !*path) return;
+                file = std::fopen(path, "wb");
+                if (!file) { std::fprintf(stderr, "[heap:trace-error] open failed\n"); return; }
+                const uint32_t header[] = {0x58325350u, 0x50414548u, 1u, 32u,
+                    kGuestBumpAllocatorBase, kGuestBumpAllocatorLimit, cap(), 16u};
+                write(header);
+            }
+            void close() { if (file) { std::fclose(file); file = nullptr; } }
+            void write(const uint32_t *words)
+            {
+                if (file && std::fwrite(words, 32u, 1u, file) != 1u)
+                { std::fprintf(stderr, "[heap:trace-error] write failed\n"); close(); }
+            }
+            ~Trace() { close(); }
+        };
+        static Trace trace;
+        if (!trace.file) return;
+        if (trace.count == Trace::cap())
+        {
+            const uint32_t footer[] = {6u, trace.count, 0u, 0u, 0u, 0u, 0u, 0u};
+            trace.write(footer);
+            trace.close();
+            return;
+        }
+        const auto *call = g_guestHeapCall;
+        const auto *parent = call ? call->previous : nullptr;
+        const uint32_t event[] = {op, address, size, alignment,
+            call ? call->source : 0u, call ? call->target : 0u,
+            parent ? parent->source : 0u, parent ? parent->entryA1 : 0u};
+        trace.write(event);
+        ++trace.count;
+        if (op == 4u)
+        {
+            const uint32_t footer[] = {5u, trace.count, 0u, 0u, 0u, 0u, 0u, 0u};
+            trace.write(footer);
+            trace.close();
+        }
+    }
     thread_local uint32_t g_xmenPendingFastCheckpointCycles = 0u;
     struct XmenPacingProfile
     {
@@ -910,6 +960,8 @@ extern "C" void ps2xDumpDispatchHistoryToStderr()
     dumpDispatchHistoryToStderr();
 }
 
+static void insertGuestBumpFreeBlockLocked(uint32_t address, uint32_t paddedSize);
+
 extern "C" uint32_t ps2xGuestBumpAlloc(uint8_t *rdram, uint32_t size, uint32_t alignment)
 {
     static std::atomic<uint32_t> s_bump{kGuestBumpAllocatorBase};
@@ -980,10 +1032,17 @@ extern "C" uint32_t ps2xGuestBumpAlloc(uint8_t *rdram, uint32_t size, uint32_t a
 
             const uint32_t suffixAddress = aligned + paddedSize;
             const uint32_t suffixSize = blockSize - prefix - paddedSize;
-            g_guestBumpFreeBlocks.erase(g_guestBumpFreeBlocks.begin() + static_cast<std::ptrdiff_t>(i));
-            if (prefix != 0u) g_guestBumpFreeBlocks.emplace_back(blockAddress, prefix);
-            if (suffixSize != 0u) g_guestBumpFreeBlocks.emplace_back(suffixAddress, suffixSize);
+            if (prefix != 0u)
+            {
+                g_guestBumpFreeBlocks[i] = {blockAddress, prefix};
+                if (suffixSize != 0u)
+                    g_guestBumpFreeBlocks.insert(g_guestBumpFreeBlocks.begin() + static_cast<std::ptrdiff_t>(i + 1u),
+                        {suffixAddress, suffixSize});
+            }
+            else if (suffixSize != 0u) g_guestBumpFreeBlocks[i] = {suffixAddress, suffixSize};
+            else g_guestBumpFreeBlocks.erase(g_guestBumpFreeBlocks.begin() + static_cast<std::ptrdiff_t>(i));
             g_guestBumpAllocationSizes[aligned] = size;
+            recordGuestHeapEvent(1u, aligned, size, alignment);
             std::memset(rdram + aligned, 0, paddedSize);
             traceXmenOverlapAllocation(aligned, "free-list");
             return aligned;
@@ -993,33 +1052,40 @@ extern "C" uint32_t ps2xGuestBumpAlloc(uint8_t *rdram, uint32_t size, uint32_t a
     uint32_t current = s_bump.load(std::memory_order_relaxed);
     for (;;)
     {
+        // Reuse the freed frontier before advancing into untouched space.
+        // Waiting until exhaustion strands each shrunken command buffer.
+        bool retry = false;
+        {
+            std::lock_guard<std::mutex> lock(g_guestBumpAllocationMutex);
+            for (size_t i = 0; i < g_guestBumpFreeBlocks.size(); ++i)
+            {
+                const auto [address, bytes] = g_guestBumpFreeBlocks[i];
+                if (address + bytes != current) continue;
+                const uint32_t joined = (address + mask) & ~mask;
+                const uint64_t joinedEnd = uint64_t{joined} + paddedSize;
+                if (joined < address || joinedEnd >= kGuestBumpAllocatorLimit) break;
+                const uint32_t frontier = std::max(current, static_cast<uint32_t>(joinedEnd));
+                if (!s_bump.compare_exchange_strong(current, frontier,
+                        std::memory_order_acq_rel, std::memory_order_relaxed)) { retry = true; break; }
+                g_guestBumpFreeBlocks.erase(g_guestBumpFreeBlocks.begin() + static_cast<std::ptrdiff_t>(i));
+                if (joined != address) g_guestBumpFreeBlocks.emplace_back(address, joined - address);
+                if (joinedEnd < current)
+                    g_guestBumpFreeBlocks.emplace_back(static_cast<uint32_t>(joinedEnd), current - static_cast<uint32_t>(joinedEnd));
+                g_guestBumpAllocationSizes[joined] = size;
+                recordGuestHeapEvent(1u, joined, size, alignment);
+                std::memset(rdram + joined, 0, paddedSize);
+                traceXmenOverlapAllocation(joined, "joined-tail");
+                return joined;
+            }
+        }
+        if (retry) continue;
         const uint32_t aligned = (current + mask) & ~mask;
         const uint32_t next = aligned + paddedSize;
         if (next >= kGuestBumpAllocatorLimit || next < aligned)
         {
-            // A free extent ending at the frontier and the untouched tail are
-            // one contiguous range, even when neither can satisfy this request.
             {
                 std::lock_guard<std::mutex> lock(g_guestBumpAllocationMutex);
-                for (size_t i = 0; i < g_guestBumpFreeBlocks.size(); ++i)
-                {
-                    const auto [address, bytes] = g_guestBumpFreeBlocks[i];
-                    if (address + bytes != current) continue;
-                    const uint32_t joined = (address + mask) & ~mask;
-                    const uint64_t joinedEnd = uint64_t{joined} + paddedSize;
-                    if (joined < address || joinedEnd >= kGuestBumpAllocatorLimit) break;
-                    const uint32_t frontier = std::max(current, static_cast<uint32_t>(joinedEnd));
-                    if (!s_bump.compare_exchange_strong(current, frontier,
-                            std::memory_order_acq_rel, std::memory_order_relaxed)) break;
-                    g_guestBumpFreeBlocks.erase(g_guestBumpFreeBlocks.begin() + static_cast<std::ptrdiff_t>(i));
-                    if (joined != address) g_guestBumpFreeBlocks.emplace_back(address, joined - address);
-                    if (joinedEnd < current)
-                        g_guestBumpFreeBlocks.emplace_back(static_cast<uint32_t>(joinedEnd), current - static_cast<uint32_t>(joinedEnd));
-                    g_guestBumpAllocationSizes[joined] = size;
-                    std::memset(rdram + joined, 0, paddedSize);
-                    traceXmenOverlapAllocation(joined, "joined-tail");
-                    return joined;
-                }
+                recordGuestHeapEvent(4u, 0u, size, alignment);
             }
             static const bool diagnostics = std::getenv("PS2X_GUEST_BUMP_DIAGNOSTICS") != nullptr;
             if (diagnostics)
@@ -1075,7 +1141,9 @@ extern "C" uint32_t ps2xGuestBumpAlloc(uint8_t *rdram, uint32_t size, uint32_t a
             std::memset(rdram + aligned, 0, paddedSize);
             {
                 std::lock_guard<std::mutex> lock(g_guestBumpAllocationMutex);
+                if (aligned != current) insertGuestBumpFreeBlockLocked(current, aligned - current);
                 g_guestBumpAllocationSizes[aligned] = size;
+                recordGuestHeapEvent(1u, aligned, size, alignment);
             }
             traceXmenOverlapAllocation(aligned, "bump");
             return aligned;
@@ -1116,6 +1184,7 @@ extern "C" bool ps2xGuestBumpFree(uint32_t address)
     const auto allocation = g_guestBumpAllocationSizes.find(address);
     if (allocation == g_guestBumpAllocationSizes.end()) return false;
     const uint32_t paddedSize = (allocation->second + 0xfu) & ~0xfu;
+    recordGuestHeapEvent(2u, address, allocation->second, 0u);
     g_guestBumpAllocationSizes.erase(allocation);
     insertGuestBumpFreeBlockLocked(address, paddedSize);
     return true;
@@ -1161,6 +1230,7 @@ extern "C" uint32_t ps2xGuestBumpRealloc(uint8_t *rdram, uint32_t address,
             if (padded <= oldPadded)
             {
                 allocation->second = size;
+                recordGuestHeapEvent(3u, address, size, alignment);
                 if (padded < oldPadded)
                     insertGuestBumpFreeBlockLocked(address + padded, oldPadded - padded);
                 if (size > oldSize) std::memset(rdram + address + oldSize, 0, size - oldSize);
@@ -1174,6 +1244,7 @@ extern "C" uint32_t ps2xGuestBumpRealloc(uint8_t *rdram, uint32_t address,
                 if (block->second == extra) g_guestBumpFreeBlocks.erase(block);
                 else { block->first += extra; block->second -= extra; }
                 allocation->second = size;
+                recordGuestHeapEvent(3u, address, size, alignment);
                 std::memset(rdram + address + oldSize, 0, size - oldSize);
                 reportInPlace();
                 return address;

@@ -183,6 +183,56 @@ static void checkCompatibilityHeapReallocation(TestCase &t)
     for (uint32_t block : fillers) t.IsTrue(ps2xGuestBumpFree(block), "release filler");
 }
 
+static void checkCompatibilityHeapAlignmentGap(TestCase &t)
+{
+    std::vector<uint8_t> ram(PS2_RAM_SIZE, 0);
+    const uint32_t first = ps2xGuestBumpAlloc(ram.data(), 16u, 16u);
+    ram[first] = 0x7Bu;
+    const uint32_t aligned = ps2xGuestBumpAlloc(ram.data(), 16u, 256u);
+    const uint32_t gap = ps2xGuestBumpAlloc(ram.data(), 208u, 16u);
+    t.Equals(aligned, first + 256u, "create alignment gap");
+    t.Equals(gap, first + 16u, "alignment gap remains reusable");
+    t.Equals(ram[first], uint8_t{0x7B}, "gap reuse preserves earlier allocation");
+    t.Equals(ps2xGuestBumpAllocationSize(aligned), 16u, "aligned allocation remains owned");
+    t.IsTrue(ps2xGuestBumpFree(gap), "release gap");
+    t.IsTrue(ps2xGuestBumpFree(aligned), "release aligned block");
+    t.IsTrue(ps2xGuestBumpFree(first), "release first block");
+}
+
+static void checkCompatibilityHeapFrontierFirst(TestCase &t)
+{
+    std::vector<uint8_t> ram(PS2_RAM_SIZE, 0);
+    const uint32_t head = ps2xGuestBumpAlloc(ram.data(), 16u, 16u);
+    const uint32_t tail = ps2xGuestBumpAlloc(ram.data(), 64u, 16u);
+    t.IsTrue(ps2xGuestBumpFree(tail), "release frontier before exhaustion");
+    const uint32_t expanded = ps2xGuestBumpAlloc(ram.data(), 96u, 16u);
+    t.Equals(expanded, tail, "reuse frontier even when untouched tail alone could fit");
+    const uint32_t next = ps2xGuestBumpAlloc(ram.data(), 16u, 16u);
+    t.Equals(next, expanded + 96u, "frontier advances only by the consumed extension");
+    t.IsTrue(ps2xGuestBumpFree(next), "release next");
+    t.IsTrue(ps2xGuestBumpFree(expanded), "release expanded");
+    t.IsTrue(ps2xGuestBumpFree(head), "release head");
+}
+
+static void checkCompatibilityHeapSplitOrder(TestCase &t)
+{
+    std::vector<uint8_t> ram(PS2_RAM_SIZE, 0);
+    const uint32_t first = ps2xGuestBumpAlloc(ram.data(), 1024u, 16u);
+    const uint32_t guard = ps2xGuestBumpAlloc(ram.data(), 16u, 16u);
+    const uint32_t second = ps2xGuestBumpAlloc(ram.data(), 1024u, 16u);
+    const uint32_t end = ps2xGuestBumpAlloc(ram.data(), 16u, 16u);
+    t.IsTrue(ps2xGuestBumpFree(first), "release lower hole");
+    t.IsTrue(ps2xGuestBumpFree(second), "release upper hole");
+    const uint32_t a = ps2xGuestBumpAlloc(ram.data(), 16u, 16u);
+    const uint32_t b = ps2xGuestBumpAlloc(ram.data(), 16u, 16u);
+    t.Equals(a, first, "use lower equal-sized hole");
+    t.Equals(b, first + 16u, "split remainder stays before higher-address holes");
+    t.IsTrue(ps2xGuestBumpFree(a), "release a");
+    t.IsTrue(ps2xGuestBumpFree(b), "release b");
+    t.IsTrue(ps2xGuestBumpFree(guard), "release guard");
+    t.IsTrue(ps2xGuestBumpFree(end), "release end");
+}
+
 static void checkCompatibilityHeapTailJoin(TestCase &t)
 {
     std::vector<uint8_t> ram(PS2_RAM_SIZE, 0xA5);
@@ -391,6 +441,9 @@ void register_ps2_memory_tests()
         tc.Run("reallocation preserves ownership and resizes safely", checkCompatibilityHeapReallocation);
         tc.Run("public allocator dispatch preserves heap ownership", checkCompatibilityHeapDispatch);
         tc.Run("free frontier joins untouched tail", checkCompatibilityHeapTailJoin);
+        tc.Run("reuse free frontier before exhaustion", checkCompatibilityHeapFrontierFirst);
+        tc.Run("split free extent retains address order", checkCompatibilityHeapSplitOrder);
+        tc.Run("bump alignment gap remains reusable", checkCompatibilityHeapAlignmentGap);
     });
     MiniTest::Case("PS2Memory", [](TestCase &tc)
     {
