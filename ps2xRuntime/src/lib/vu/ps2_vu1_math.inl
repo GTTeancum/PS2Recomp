@@ -3,6 +3,12 @@
 
 #include "runtime/ps2_vu_flags.h"
 
+#if defined(_MSC_VER) && (defined(PS2X_BUILD_VU_NATIVE_UPPER) || defined(PS2X_BUILD_VU_NATIVE_PAIRS))
+// Fast-math may narrow arithmetic on widened prepared floats back to float,
+// erasing underflow/overflow information needed by the flag calculation.
+#pragma float_control(precise, on, push)
+#endif
+
 #if !defined(PS2X_VU_NATIVE_PAIR_USE_HOST_MATH)
 float VU1Interpreter::normalizeResult(float value, uint32_t &laneFlags) const
 {
@@ -52,7 +58,7 @@ void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
 
 template <uint64_t Word>
 void VU1Interpreter::normalizeFmacResultFor(float *result, uint8_t dest,
-                                          uint8_t laneFlags[4])
+                                          uint8_t laneFlags[4], const FmacOperands *prepared)
 {
     for (uint32_t component = 0; component < 4u; ++component)
     {
@@ -61,7 +67,7 @@ void VU1Interpreter::normalizeFmacResultFor(float *result, uint8_t dest,
             continue;
 
         long double exactResult = 0.0L;
-        if (calculateFmacExactResultFor<Word>(component, exactResult))
+        if (calculateFmacExactResultFor<Word>(component, exactResult, prepared))
         {
             laneFlags[component] = normalizeFmacExactResult(result[component], exactResult);
             continue;
@@ -75,7 +81,7 @@ void VU1Interpreter::normalizeFmacResultFor(float *result, uint8_t dest,
 
 template <uint64_t Word>
 bool VU1Interpreter::calculateFmacExactResultFor(uint32_t component,
-                                                long double &result) const
+                                                long double &result, const FmacOperands *prepared) const
 {
     const uint32_t upper = Word == kDynamicUpper ? m_currentUpperInstruction : static_cast<uint32_t>(Word);
     const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
@@ -91,19 +97,28 @@ bool VU1Interpreter::calculateFmacExactResultFor(uint32_t component,
     };
     const auto vs = [&](uint32_t lane)
     {
-        return operand(m_state.vf[fs][lane]);
+        if constexpr (Word == kDynamicUpper)
+            return operand(m_state.vf[fs][lane]);
+        else
+            return static_cast<long double>(prepared->vs[lane]);
     };
     const auto vt = [&](uint32_t lane)
     {
-        return operand(m_state.vf[ft][lane]);
+        if constexpr (Word == kDynamicUpper)
+            return operand(m_state.vf[ft][lane]);
+        else
+            return static_cast<long double>(prepared->vt[lane]);
     };
     const auto acc = [&](uint32_t lane)
     {
-        return operand(m_state.acc[lane]);
+        if constexpr (Word == kDynamicUpper)
+            return operand(m_state.acc[lane]);
+        else
+            return static_cast<long double>(prepared->acc[lane]);
     };
 
-    const long double q = operand(m_state.q);
-    const long double i = operand(m_state.i);
+    const long double q = Word == kDynamicUpper ? operand(m_state.q) : static_cast<long double>(prepared->q);
+    const long double i = Word == kDynamicUpper ? operand(m_state.i) : static_cast<long double>(prepared->i);
 
     if (op < 0x3Cu)
     {
@@ -290,7 +305,7 @@ uint8_t VU1Interpreter::normalizeFmacExactResult(float &value,
 #endif
 
 template <uint64_t Word>
-uint32_t VU1Interpreter::calculateFmacProductStickyFor(uint8_t dest) const
+uint32_t VU1Interpreter::calculateFmacProductStickyFor(uint8_t dest, const FmacOperands *prepared) const
 {
     uint32_t extraSticky = 0u;
     const uint32_t upper = Word == kDynamicUpper ? m_currentUpperInstruction : static_cast<uint32_t>(Word);
@@ -315,27 +330,28 @@ uint32_t VU1Interpreter::calculateFmacProductStickyFor(uint8_t dest) const
         static constexpr uint8_t crossLeft[4] = {1u, 2u, 0u, 3u};
         static constexpr uint8_t crossRight[4] = {2u, 0u, 1u, 3u};
         const uint8_t leftComponent = op == 0x2Eu ? crossLeft[component] : static_cast<uint8_t>(component);
-        const float left = normalizeOperand(m_state.vf[fs][leftComponent]);
+        const float left = Word == kDynamicUpper ? normalizeOperand(m_state.vf[fs][leftComponent]) : prepared->vs[leftComponent];
         float right = 0.0f;
         if ((op >= 0x08u && op <= 0x0Fu) || (special >= 0x08u && special <= 0x0Fu))
         {
-            right = normalizeOperand(m_state.vf[ft][(op >= 0x08u && op <= 0x0Fu ? op : special) & 3u]);
+            const uint8_t bc = (op >= 0x08u && op <= 0x0Fu ? op : special) & 3u;
+            right = Word == kDynamicUpper ? normalizeOperand(m_state.vf[ft][bc]) : prepared->vt[bc];
         }
         else if (op == 0x21u || op == 0x25u || special == 0x21u || special == 0x25u)
         {
-            right = normalizeOperand(m_state.q);
+            right = Word == kDynamicUpper ? normalizeOperand(m_state.q) : prepared->q;
         }
         else if (op == 0x23u || op == 0x27u || special == 0x23u || special == 0x27u)
         {
-            right = normalizeOperand(m_state.i);
+            right = Word == kDynamicUpper ? normalizeOperand(m_state.i) : prepared->i;
         }
         else if (op == 0x2Eu)
         {
-            right = normalizeOperand(m_state.vf[ft][crossRight[component]]);
+            right = Word == kDynamicUpper ? normalizeOperand(m_state.vf[ft][crossRight[component]]) : prepared->vt[crossRight[component]];
         }
         else
         {
-            right = normalizeOperand(m_state.vf[ft][component]);
+            right = Word == kDynamicUpper ? normalizeOperand(m_state.vf[ft][component]) : prepared->vt[component];
         }
 
         float product = left * right;
@@ -384,11 +400,11 @@ void VU1Interpreter::updateFmacFlagsFor(const uint8_t laneFlags[4],
 }
 
 template <uint64_t Word>
-void VU1Interpreter::applyFmacDestFor(float *dst, float *result, uint8_t dest)
+void VU1Interpreter::applyFmacDestFor(float *dst, float *result, uint8_t dest, const FmacOperands *prepared)
 {
     uint8_t laneFlags[4]{};
-    normalizeFmacResultFor<Word>(result, dest, laneFlags);
-    const uint32_t extraSticky = calculateFmacProductStickyFor<Word>(dest);
+    normalizeFmacResultFor<Word>(result, dest, laneFlags, prepared);
+    const uint32_t extraSticky = calculateFmacProductStickyFor<Word>(dest, prepared);
     if constexpr (Word == kDynamicUpper)
         updateFmacFlags(laneFlags, dest, extraSticky);
     else
@@ -398,11 +414,11 @@ void VU1Interpreter::applyFmacDestFor(float *dst, float *result, uint8_t dest)
 }
 
 template <uint64_t Word>
-void VU1Interpreter::applyFmacDestAccFor(float *result, uint8_t dest)
+void VU1Interpreter::applyFmacDestAccFor(float *result, uint8_t dest, const FmacOperands *prepared)
 {
     uint8_t laneFlags[4]{};
-    normalizeFmacResultFor<Word>(result, dest, laneFlags);
-    const uint32_t extraSticky = calculateFmacProductStickyFor<Word>(dest);
+    normalizeFmacResultFor<Word>(result, dest, laneFlags, prepared);
+    const uint32_t extraSticky = calculateFmacProductStickyFor<Word>(dest, prepared);
     if constexpr (Word == kDynamicUpper)
         updateFmacFlags(laneFlags, dest, extraSticky);
     else
@@ -421,4 +437,8 @@ void VU1Interpreter::applyFmacDestAcc(float *result, uint8_t dest)
 {
     applyFmacDestAccFor<kDynamicUpper>(result, dest);
 }
+#endif
+
+#if defined(_MSC_VER) && (defined(PS2X_BUILD_VU_NATIVE_UPPER) || defined(PS2X_BUILD_VU_NATIVE_PAIRS))
+#pragma float_control(pop)
 #endif

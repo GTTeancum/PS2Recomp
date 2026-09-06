@@ -27,15 +27,6 @@ namespace
 template <uint32_t Word> void VU1Interpreter::execUpperNative()
 {
     constexpr uint32_t instr = Word;
-    // Bind the existing write sites to the same arithmetic with a known opcode.
-    const auto applyFmacDest = [this](float *dst, float *result, uint8_t dest)
-    {
-        applyFmacDestFor<Word>(dst, result, dest);
-    };
-    const auto applyFmacDestAcc = [this](float *result, uint8_t dest)
-    {
-        applyFmacDestAccFor<Word>(result, dest);
-    };
 #else
 void VU1Interpreter::execUpper(uint32_t instr)
 {
@@ -68,6 +59,19 @@ void VU1Interpreter::execUpper(uint32_t instr)
     const float q = normalizeOperand(m_state.q);
     const float i = normalizeOperand(m_state.i);
     float result[4];
+
+#if defined(PS2X_BUILD_VU_NATIVE_UPPER) || defined(PS2X_BUILD_VU_NATIVE_PAIRS)
+    // Flags use the same normalized inputs as the native arithmetic operation.
+    const FmacOperands prepared{vs, vt, acc, q, i};
+    const auto applyFmacDest = [this, &prepared](float *dst, float *result, uint8_t dest)
+    {
+        applyFmacDestFor<Word>(dst, result, dest, &prepared);
+    };
+    const auto applyFmacDestAcc = [this, &prepared](float *result, uint8_t dest)
+    {
+        applyFmacDestAccFor<Word>(result, dest, &prepared);
+    };
+#endif
 
     // Upper opcode decoding (bits 5:0 of upper word)
     switch (op)

@@ -475,7 +475,7 @@ void register_ps2_vu1_tests()
         });
 #endif
 #if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
-        tc.Run("native VU simple arithmetic preserves normal and boundary flags", [](TestCase &t)
+        tc.Run("native VU arithmetic preserves normal and boundary flags", [](TestCase &t)
         {
             Vu1Fixture referenceFx;
             Vu1Fixture nativeFx;
@@ -488,14 +488,18 @@ void register_ps2_vu1_tests()
                 0x010208c0u, 0x00a208c5u, 0x01e208dau, 0x01e208e0u,
                 0x01e208e6u, 0x01e208dcu, 0x01e208e8u, 0x01e208ecu,
                 0x01e2083cu, 0x01e2087cu, 0x01e209bcu, 0x01e209fcu,
-                0x01e209feu, 0x01e20a3cu, 0x01e20a7eu, 0x01e20abeu
+                0x01e209feu, 0x01e20a3cu, 0x01e20a7eu, 0x01e20abeu,
+                0x01e20848u, 0x01e2088du, 0x01e208e1u, 0x01e208e5u,
+                0x01e208e3u, 0x01e208e7u, 0x01e208e9u, 0x01e208edu,
+                0x01e208bcu, 0x01e208fdu, 0x01e20a3du, 0x01e20a7du,
+                0x01e20a3fu, 0x01e20a7fu, 0x01e20abdu, 0x01e20afdu
             };
             for (auto *fx : {&referenceFx, &nativeFx})
             {
                 for (uint32_t index = 0; index < std::size(words); ++index)
                     writeTrackedVuInstructionPair(*fx, 0x3500u + index * 8u, 0u, words[index]);
-                writeTrackedVuInstructionPair(*fx, 0x3580u, 0u, kVuUpperNop | 0x40000000u);
-                writeTrackedVuInstructionPair(*fx, 0x3588u, 0u, kVuUpperNop);
+                writeTrackedVuInstructionPair(*fx, 0x3600u, 0u, kVuUpperNop | 0x40000000u);
+                writeTrackedVuInstructionPair(*fx, 0x3608u, 0u, kVuUpperNop);
             }
             constexpr uint32_t values[] = {
                 0u, 0x80000000u, 1u, 0x807fffffu, 0x007fffffu, 0x00800000u,
@@ -508,7 +512,7 @@ void register_ps2_vu1_tests()
             uint32_t random = 0x94e6c217u;
             const uint32_t boundaryCases = static_cast<uint32_t>(std::size(values) * std::size(values));
             for (uint32_t sample = 0u; sample < boundaryCases + 128u; ++sample)
-            for (const uint32_t startPc : {0x3500u, 0x3540u})
+            for (const uint32_t startPc : {0x3500u, 0x3540u, 0x3580u, 0x35c0u})
             {
                 VU1Interpreter reference;
                 VU1Interpreter native;
@@ -520,10 +524,13 @@ void register_ps2_vu1_tests()
                         ? values[(sample / std::size(values) + lane) % std::size(values)] : next();
                     const uint32_t right = sample < boundaryCases
                         ? values[(sample % std::size(values) + lane * 3u) % std::size(values)] : next();
+                    const uint32_t accumulator = sample < boundaryCases
+                        ? values[(sample / std::size(values) + lane * 5u) % std::size(values)] : next();
                     for (auto *vu : {&reference, &native})
                     {
                         std::memcpy(&vu->state().vf[1][lane], &left, sizeof(left));
                         std::memcpy(&vu->state().vf[2][lane], &right, sizeof(right));
+                        std::memcpy(&vu->state().acc[lane], &accumulator, sizeof(accumulator));
                     }
                 }
                 for (auto *vu : {&reference, &native})
@@ -537,7 +544,8 @@ void register_ps2_vu1_tests()
                 native.execute(nativeFx.code, PS2_VU1_CODE_SIZE, nativeFx.data,
                     PS2_VU1_DATA_SIZE, nativeFx.gs, &nativeFx.mem, startPc, 0u, 0u, 0u);
                 native.setNativeBlocksEnabled(true);
-                for (uint32_t budget : {8u, 1u, 16u})
+                const uint32_t firstBudget = startPc >= 0x3580u ? 16u : 8u;
+                for (uint32_t budget : {firstBudget, 1u, 32u})
                 {
                     std::ostringstream expected(std::ios::binary), actual(std::ios::binary);
                     t.IsTrue(VUReplay::record(expected, reference, referenceFx.code, referenceFx.data,

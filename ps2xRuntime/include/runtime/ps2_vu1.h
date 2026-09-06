@@ -395,12 +395,20 @@ private:
     PS2X_VU_ARITH_INLINE void applyFmacDestAcc(float *result, uint8_t dest);
     PS2X_VU_ARITH_INLINE uint8_t normalizeFmacExactResult(float &value, long double exactResult) const;
     static constexpr uint64_t kDynamicUpper = uint64_t{1} << 32u;
-    template <uint64_t Word> void normalizeFmacResultFor(float *result, uint8_t dest, uint8_t laneFlags[4]);
-    template <uint64_t Word> bool calculateFmacExactResultFor(uint32_t component, long double &result) const;
-    template <uint64_t Word> uint32_t calculateFmacProductStickyFor(uint8_t dest) const;
+    struct FmacOperands
+    {
+        const float *vs;
+        const float *vt;
+        const float *acc;
+        float q;
+        float i;
+    };
+    template <uint64_t Word> void normalizeFmacResultFor(float *result, uint8_t dest, uint8_t laneFlags[4], const FmacOperands *prepared);
+    template <uint64_t Word> bool calculateFmacExactResultFor(uint32_t component, long double &result, const FmacOperands *prepared) const;
+    template <uint64_t Word> uint32_t calculateFmacProductStickyFor(uint8_t dest, const FmacOperands *prepared) const;
     template <uint8_t Dest> void updateFmacFlagsFor(const uint8_t laneFlags[4], uint32_t extraSticky);
-    template <uint64_t Word> void applyFmacDestFor(float *dst, float *result, uint8_t dest);
-    template <uint64_t Word> void applyFmacDestAccFor(float *result, uint8_t dest);
+    template <uint64_t Word> void applyFmacDestFor(float *dst, float *result, uint8_t dest, const FmacOperands *prepared = nullptr);
+    template <uint64_t Word> void applyFmacDestAccFor(float *result, uint8_t dest, const FmacOperands *prepared = nullptr);
     void updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky);
     void queueFsset(uint16_t immediate);
     void queueClip(uint32_t clip);
