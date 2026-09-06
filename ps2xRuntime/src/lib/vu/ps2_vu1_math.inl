@@ -9,6 +9,43 @@
 #pragma float_control(precise, on, push)
 #endif
 
+namespace
+{
+#if defined(_MSC_VER)
+    __forceinline
+#else
+    inline
+#endif
+    uint8_t normalizeFmacExactValue(float &value, long double exactResult)
+    {
+        const bool negative = std::signbit(exactResult);
+        const long double magnitude = std::fabs(exactResult);
+        const long double maximum = static_cast<long double>(std::numeric_limits<float>::max());
+        const long double minimum = static_cast<long double>(std::numeric_limits<float>::min());
+        uint8_t flags = negative ? 0x2u : 0u;
+
+        uint32_t bits = negative ? 0x80000000u : 0u;
+        if (magnitude == 0.0L)
+        {
+            flags |= 0x1u;
+            std::memcpy(&value, &bits, sizeof(value));
+        }
+        else if (magnitude > maximum)
+        {
+            flags |= 0x8u;
+            bits |= 0x7F7FFFFFu;
+            std::memcpy(&value, &bits, sizeof(value));
+        }
+        else if (magnitude < minimum)
+        {
+            flags |= 0x5u;
+            std::memcpy(&value, &bits, sizeof(value));
+        }
+
+        return flags;
+    }
+}
+
 #if !defined(PS2X_VU_NATIVE_PAIR_USE_HOST_MATH)
 float VU1Interpreter::normalizeResult(float value, uint32_t &laneFlags) const
 {
@@ -69,7 +106,7 @@ void VU1Interpreter::normalizeFmacResultFor(float *result, uint8_t dest,
         long double exactResult = 0.0L;
         if (calculateFmacExactResultFor<Word>(component, exactResult, prepared))
         {
-            laneFlags[component] = normalizeFmacExactResult(result[component], exactResult);
+            laneFlags[component] = normalizeFmacExactValue(result[component], exactResult);
             continue;
         }
 
@@ -276,31 +313,7 @@ bool VU1Interpreter::calculateFmacExactResultFor(uint32_t component,
 uint8_t VU1Interpreter::normalizeFmacExactResult(float &value,
                                                   long double exactResult) const
 {
-    const bool negative = std::signbit(exactResult);
-    const long double magnitude = std::fabs(exactResult);
-    const long double maximum = static_cast<long double>(std::numeric_limits<float>::max());
-    const long double minimum = static_cast<long double>(std::numeric_limits<float>::min());
-    uint8_t flags = negative ? 0x2u : 0u;
-
-    uint32_t bits = negative ? 0x80000000u : 0u;
-    if (magnitude == 0.0L)
-    {
-        flags |= 0x1u;
-        std::memcpy(&value, &bits, sizeof(value));
-    }
-    else if (magnitude > maximum)
-    {
-        flags |= 0x8u;
-        bits |= 0x7F7FFFFFu;
-        std::memcpy(&value, &bits, sizeof(value));
-    }
-    else if (magnitude < minimum)
-    {
-        flags |= 0x5u;
-        std::memcpy(&value, &bits, sizeof(value));
-    }
-
-    return flags;
+    return normalizeFmacExactValue(value, exactResult);
 }
 #endif
 
@@ -356,7 +369,7 @@ uint32_t VU1Interpreter::calculateFmacProductStickyFor(uint8_t dest, const FmacO
 
         float product = left * right;
         const long double exactProduct = static_cast<long double>(left) * static_cast<long double>(right);
-        const uint8_t productFlags = normalizeFmacExactResult(product, exactProduct);
+        const uint8_t productFlags = normalizeFmacExactValue(product, exactProduct);
         // Product-sum instructions report Z/S/U/O from the add/subtract result
         // as current flags, while every product condition accumulates into the
         // corresponding sticky flag.
