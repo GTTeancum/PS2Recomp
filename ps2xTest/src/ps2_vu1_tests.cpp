@@ -844,6 +844,77 @@ void register_ps2_vu1_tests()
             }
         });
 
+        tc.Run("native VU stores preserve every mask wraparound and PATH1 visibility", [](TestCase &t)
+        {
+            for (uint32_t form = 0u; form < 5u; ++form)
+            for (int32_t base : {4, 1023, 32767, -32768})
+            for (bool packet : {false, true})
+            for (uint32_t budget : {0u, 1u, 8u, 16u, 18u, 19u, 20u, 32u})
+            {
+                const uint32_t startPc = 0x3800u + form * 0x100u;
+                Vu1Fixture referenceFx, nativeFx;
+                VU1Interpreter reference, native;
+                const auto initialize = [&](Vu1Fixture &fx, VU1Interpreter &vu)
+                {
+                    if (!fx.initialize()) return false;
+                    writeTrackedVuInstructionPair(fx, startPc - 16u,
+                        packet ? makeVuLowerSpecial(0x6Cu, 0u) : 0u, kVuUpperNop);
+                    writeTrackedVuInstructionPair(fx, startPc - 8u, 0u, kVuUpperNop);
+                    for (uint8_t mask = 0u; mask < 16u; ++mask)
+                    {
+                        uint32_t lower;
+                        if (form == 0u)
+                            lower = makeVuSq(mask, 1u, 2u, static_cast<int16_t>(mask - 8));
+                        else if (form == 1u)
+                            lower = (5u << 25u) | (static_cast<uint32_t>(mask) << 21u) |
+                                (3u << 16u) | (2u << 11u) | (static_cast<uint32_t>(mask - 8) & 0x7FFu);
+                        else
+                            lower = makeVuLowerSpecial(form == 2u ? 0x35u : form == 3u ? 0x37u : 0x3Fu,
+                                form == 4u ? 2u : 1u, form == 4u ? 3u : 2u, 0u, mask);
+                        writeTrackedVuInstructionPair(fx, startPc + mask * 8u, lower,
+                            mask == 8u ? makeVuUpper(0x28u, 8u, 4u, 1u, 1u) : kVuUpperNop);
+                    }
+                    writeTrackedVuInstructionPair(fx, startPc + 128u, 0u, kVuUpperNop | 0x40000000u);
+                    writeTrackedVuInstructionPair(fx, startPc + 136u, 0u, kVuUpperNop);
+                    std::memset(fx.data, 0xA5, PS2_VU1_DATA_SIZE);
+                    const uint64_t tag = makeGifTag(32u, GIF_FMT_PACKED, 1u);
+                    const uint64_t regs = 0xFu;
+                    std::memcpy(fx.data, &tag, sizeof(tag));
+                    std::memcpy(fx.data + 8u, &regs, sizeof(regs));
+                    const uint32_t bits[] = {0x80000000u, 0x7FC01234u, 1u, 0xFF800000u};
+                    std::memcpy(vu.state().vf[1], bits, sizeof(bits));
+                    vu.state().vf[4][0] = 2.0f;
+                    vu.state().vi[2] = base;
+                    vu.state().vi[3] = -12345;
+                    vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
+                        fx.gs, &fx.mem, startPc - 16u, 0u, 0u, 2u);
+                    return true;
+                };
+                if (!initialize(referenceFx, reference) || !initialize(nativeFx, native))
+                {
+                    t.IsTrue(false, "Store fixtures must initialize");
+                    return;
+                }
+                native.setNativeBlocksEnabled(true);
+                for (uint32_t cycles : {budget, 1u, 64u})
+                {
+                    std::ostringstream expected(std::ios::binary), actual(std::ios::binary);
+                    t.IsTrue(VUReplay::record(expected, reference, referenceFx.code, referenceFx.data,
+                        referenceFx.gs, &referenceFx.mem, cycles), "Store reference must record");
+                    t.IsTrue(VUReplay::record(actual, native, nativeFx.code, nativeFx.data,
+                        nativeFx.gs, &nativeFx.mem, cycles), "Native stores must record");
+                    if (expected.str() != actual.str())
+                    {
+                        t.IsTrue(false, "Store state/memory/packet mismatch: form=" + std::to_string(form) +
+                            " base=" + std::to_string(base) + " budget=" + std::to_string(budget));
+                        return;
+                    }
+                }
+                if (budget >= 19u)
+                    t.IsTrue(native.blockCounters().pairs >= 16u, "Store test must execute a native block");
+            }
+        });
+
         tc.Run("native VU blocks preserve loops stores and budget fallback", [](TestCase &t)
         {
             constexpr uint32_t startPc = 0x3000u;
