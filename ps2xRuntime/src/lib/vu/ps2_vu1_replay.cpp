@@ -441,6 +441,15 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
                 "Residual profiling cannot use the one-cycle instruction export pass");
         require(repeats > 0u && repeats <= 4096u, "Invalid VU replay repetition count");
         uint32_t replaySliceCycles = 0u;
+        uint32_t memoryTraceCase = 64u;
+        if (const char *value = std::getenv("PS2X_VU_REPLAY_MEMORY_TRACE_CASE"))
+        {
+            char *end = nullptr;
+            const auto parsed = std::strtoul(value, &end, 10);
+            require(end != value && *end == '\0' && parsed < 64u, "Invalid VU memory trace case");
+            memoryTraceCase = static_cast<uint32_t>(parsed);
+            require(!residualPairs && !executing, "Memory tracing cannot accompany timing/profiling");
+        }
         if (const char *value = std::getenv("PS2X_VU_REPLAY_SLICE_CYCLES"))
         {
             char *end = nullptr;
@@ -513,6 +522,9 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
                 Context context;
                 context.replay = true;
                 context.gifs.bytes.reserve(record.gifs.size());
+                const bool traceMemory = iteration == 0u && result.cases == memoryTraceCase;
+                auto previousData = traceMemory ? record.data : std::vector<uint8_t>{};
+                uint32_t traceWrites = 0;
                 const auto start = std::chrono::steady_clock::now();
                 {
                     ContextScope scope(context);
@@ -520,7 +532,7 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
 #if defined(PS2X_ENABLE_VU_PAIR_PROFILE)
                     VUPairProfile::Scope pairProfile(iteration == 0u ? residualPairs : nullptr, vu.get());
 #endif
-                    if ((upperSamples || pairSamples) && iteration == 0u && elapsedCycles != 0u)
+                    if ((upperSamples || pairSamples || traceMemory) && iteration == 0u && elapsedCycles != 0u)
                     {
                         const auto budgetEnd = initialCycle + record.maxCycles;
                         do
@@ -539,6 +551,21 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
                             const auto beforeCycle = vu->m_cycle;
                             vu->run(memory->getVU1Code(), PS2_VU1_CODE_SIZE,
                                     memory->getVU1Data(), PS2_VU1_DATA_SIZE, gs, memory.get(), 1u);
+                            if (traceMemory)
+                            {
+                                const auto *data = memory->getVU1Data();
+                                for (uint32_t offset = 0; offset < PS2_VU1_DATA_SIZE; offset += 16u)
+                                {
+                                    if (!std::memcmp(data + offset, previousData.data() + offset, 16u)) continue;
+                                    require(++traceWrites <= 4096u, "VU memory trace exceeds its output limit");
+                                    uint32_t words[4];
+                                    std::memcpy(words, data + offset, sizeof(words));
+                                    std::memcpy(previousData.data() + offset, words, sizeof(words));
+                                    std::printf("[vu-memory] pc=%04x cycle=%llu offset=%04x words=%08x,%08x,%08x,%08x\n",
+                                        pairPc, static_cast<unsigned long long>(vu->m_cycle - initialCycle), offset,
+                                        words[0], words[1], words[2], words[3]);
+                                }
+                            }
                             if (pairSamples && vu->m_state.pc != pairPc)
                             {
                                 ++executedPairs[{pairPc, lower, upper}];
