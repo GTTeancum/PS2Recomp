@@ -11,7 +11,7 @@ namespace RuntimeProfile
     enum class Phase : size_t
     {
         Scheduler, Guest, Events, Wait, Transfers, Vu, Gs,
-        VuSample, VuDecode, VuHazard, VuUpper, VuLower, VuRetire, VuWriteback, Count
+        VuSample, VuDecode, VuHazard, VuUpper, VuLower, VuRetire, VuWriteback, VuReset, Count
     };
     struct Totals
     {
@@ -106,7 +106,7 @@ namespace RuntimeProfile
         {
             constexpr std::array names{
                 "scheduler", "guest", "events", "wait", "transfers", "vu", "gs",
-                "vu-sample", "vu-decode", "vu-hazard", "vu-upper", "vu-lower", "vu-retire", "vu-writeback"};
+                "vu-sample", "vu-decode", "vu-hazard", "vu-upper", "vu-lower", "vu-retire", "vu-writeback", "vu-reset"};
             static_assert(names.size() == static_cast<size_t>(Phase::Count));
             const double wallMs = std::chrono::duration<double, std::milli>(now - state.windowStart).count();
             char line[1536]{};

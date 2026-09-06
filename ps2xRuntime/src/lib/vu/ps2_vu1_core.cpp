@@ -448,6 +448,7 @@ VU1Interpreter::VU1Interpreter(Unit unit)
 
 void VU1Interpreter::resetScheduler()
 {
+    RuntimeProfile::Scope resetProfile(RuntimeProfile::Phase::VuReset);
     m_flagPipeline = {};
     m_fdiv = {};
     m_efu = {};

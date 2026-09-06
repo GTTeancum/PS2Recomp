@@ -10,6 +10,7 @@
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_vu1_replay.h"
 #include "runtime/ps2_vu_flags.h"
+#include "runtime/runtime_profile.h"
 #include "runtime/vu_coverage.h"
 
 #include <cmath>
@@ -236,6 +237,19 @@ void register_ps2_vu1_tests()
 {
     MiniTest::Case("PS2VU1", [](TestCase &tc)
     {
+        tc.Run("VU scheduler reset profiling counts initialization only when enabled", [](TestCase &t)
+        {
+            RuntimeProfile::Scope parent(RuntimeProfile::Phase::Scheduler, true);
+            auto &totals = RuntimeProfile::state.totals[static_cast<size_t>(RuntimeProfile::Phase::VuReset)];
+            const auto before = totals;
+            VU1Interpreter vu;
+            vu.reset();
+            t.Equals(totals.calls - before.calls, RuntimeProfile::enabled() ? uint64_t{2u} : uint64_t{0u},
+                     "Construction and explicit reset must be counted only when profiling is enabled");
+            t.Equals(totals.inclusiveNs - before.inclusiveNs, totals.exclusiveNs - before.exclusiveNs,
+                     "Scheduler resets contain no nested profiled execution");
+        });
+
         tc.Run("VU budget trace records only issued instruction snapshots", [](TestCase &t)
         {
             Vu1Fixture fx;
