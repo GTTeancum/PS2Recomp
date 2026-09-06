@@ -14,6 +14,80 @@
 #include <vector>
 
 extern "C" bool ps2xGuestBumpFree(uint32_t address);
+extern "C" uint32_t ps2xGuestBumpRealloc(uint8_t *rdram, uint32_t address,
+                                       uint32_t size, uint32_t alignment);
+
+static void checkCompatibilityHeapReallocation(TestCase &t)
+{
+    // Fresh process required, as for the fragmentation test below.
+    std::vector<uint8_t> ram(PS2_RAM_SIZE, 0xA5);
+    const bool inPlace = std::getenv("PS2X_GUEST_BUMP_REALLOC") != nullptr;
+    uint32_t address = ps2xGuestBumpRealloc(ram.data(), 0u, 33u, 3u);
+    t.IsTrue(address != 0u, "null realloc allocates");
+    t.Equals(address & 15u, 0u, "invalid alignment uses default");
+    std::memset(ram.data() + address, 0x5A, 33u);
+    uint32_t result = ps2xGuestBumpRealloc(ram.data(), address, 47u, 16u);
+    t.IsTrue(result != 0u, "growth within padding succeeds");
+    t.Equals(result == address, inPlace, "in-place policy is opt-in");
+    t.IsTrue(std::all_of(ram.begin() + result, ram.begin() + result + 33u,
+        [](uint8_t value) { return value == 0x5A; }), "growth preserves old bytes");
+    t.IsTrue(std::all_of(ram.begin() + result + 33u, ram.begin() + result + 47u,
+        [](uint8_t value) { return value == 0u; }), "new bytes are cleared");
+    t.Equals(ps2xGuestBumpAllocationSize(result), 47u, "growth tracks requested size");
+    address = result;
+    result = ps2xGuestBumpRealloc(ram.data(), address, 17u, 16u);
+    t.Equals(result == address, inPlace, "shrink obeys selected policy");
+    t.Equals(ps2xGuestBumpAllocationSize(result), 17u, "shrink tracks requested size");
+    t.Equals(ram[result + 16u], uint8_t{0x5A}, "shrink preserves retained bytes");
+    t.Equals(ps2xGuestBumpRealloc(ram.data(), result, 0u, 16u), 0u, "zero size frees");
+    t.Equals(ps2xGuestBumpAllocationSize(result), 0u, "zero size releases ownership");
+    t.IsTrue(!ps2xGuestBumpFree(result), "no duplicate free after zero-size realloc");
+
+    const uint32_t reserve = ps2xGuestBumpAlloc(ram.data(), 512u, 16u);
+    t.IsTrue(ps2xGuestBumpFree(reserve), "provide a contiguous free extent");
+    address = ps2xGuestBumpAlloc(ram.data(), 64u, 16u);
+    const uint32_t neighbor = ps2xGuestBumpAlloc(ram.data(), 128u, 16u);
+    const uint32_t guard = ps2xGuestBumpAlloc(ram.data(), 16u, 16u);
+    t.Equals(neighbor, address + 64u, "adjacent allocation setup");
+    std::memset(ram.data() + address, 0x39, 64u);
+    t.IsTrue(ps2xGuestBumpFree(neighbor), "release adjacent extent");
+    result = ps2xGuestBumpRealloc(ram.data(), address, 160u, 16u);
+    t.IsTrue(result != 0u, "adjacent growth succeeds");
+    t.Equals(result == address, inPlace, "adjacent growth only with opt-in");
+    t.IsTrue(std::all_of(ram.begin() + result, ram.begin() + result + 64u,
+        [](uint8_t value) { return value == 0x39; }), "adjacent growth preserves bytes");
+    t.IsTrue(std::all_of(ram.begin() + result + 64u, ram.begin() + result + 160u,
+        [](uint8_t value) { return value == 0u; }), "adjacent growth clears extension");
+    if (inPlace) {
+        const uint32_t remainder = ps2xGuestBumpAlloc(ram.data(), 32u, 16u);
+        t.Equals(remainder, address + 160u, "only consumed portion removed from free list");
+        t.IsTrue(ps2xGuestBumpFree(remainder), "release neighbor remainder");
+    }
+    t.IsTrue(ps2xGuestBumpFree(result), "release grown block");
+    t.IsTrue(ps2xGuestBumpFree(guard), "release guard");
+
+    // Exhaust the arena while retaining a small owned allocation. Failed growth
+    // must not surrender that allocation, with either placement policy.
+    address = ps2xGuestBumpAlloc(ram.data(), 64u, 16u);
+    std::memset(ram.data() + address, 0x77, 64u);
+    std::vector<uint32_t> fillers;
+    for (uint32_t chunk : {0x10000u, 0x1000u, 0x100u, 16u}) {
+        while (const uint32_t block = ps2xGuestBumpAlloc(ram.data(), chunk, 16u))
+            fillers.push_back(block);
+    }
+    t.Equals(ps2xGuestBumpRealloc(ram.data(), address, 0x20000u, 16u), 0u,
+        "out-of-memory growth fails");
+    t.Equals(ps2xGuestBumpAllocationSize(address), 64u, "failure preserves ownership");
+    t.IsTrue(std::all_of(ram.begin() + address, ram.begin() + address + 64u,
+        [](uint8_t value) { return value == 0x77; }), "failure preserves contents");
+    t.Equals(ps2xGuestBumpRealloc(ram.data(), address, 0xFFFFFFFFu, 16u), 0u,
+        "overflow request rejected");
+    t.Equals(ps2xGuestBumpAllocationSize(address), 64u, "overflow preserves ownership");
+    t.Equals(ps2xGuestBumpRealloc(ram.data(), 0x1000u, 16u, 16u), 0u,
+        "foreign allocation rejected without freeing it");
+    t.IsTrue(ps2xGuestBumpFree(address), "original block still freeable");
+    for (uint32_t block : fillers) t.IsTrue(ps2xGuestBumpFree(block), "release filler");
+}
 
 static void checkCompatibilityHeapFragmentation(TestCase &t)
 {
@@ -194,6 +268,7 @@ void register_ps2_memory_tests()
     MiniTest::Case("CompatibilityHeap", [](TestCase &tc)
     {
         tc.Run("best fit preserves a large allocation under fragmentation", checkCompatibilityHeapFragmentation);
+        tc.Run("reallocation preserves ownership and resizes safely", checkCompatibilityHeapReallocation);
     });
     MiniTest::Case("PS2Memory", [](TestCase &tc)
     {

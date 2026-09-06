@@ -1013,17 +1013,8 @@ extern "C" uint32_t ps2xGuestBumpAllocationSize(uint32_t address)
     return it != g_guestBumpAllocationSizes.end() ? it->second : 0u;
 }
 
-extern "C" bool ps2xGuestBumpFree(uint32_t address)
+static void insertGuestBumpFreeBlockLocked(uint32_t address, uint32_t paddedSize)
 {
-    std::lock_guard<std::mutex> lock(g_guestBumpAllocationMutex);
-    const auto allocation = g_guestBumpAllocationSizes.find(address);
-    if (allocation == g_guestBumpAllocationSizes.end())
-    {
-        return false;
-    }
-
-    const uint32_t paddedSize = (allocation->second + 0xfu) & ~0xfu;
-    g_guestBumpAllocationSizes.erase(allocation);
     g_guestBumpFreeBlocks.emplace_back(address, paddedSize);
     std::sort(g_guestBumpFreeBlocks.begin(), g_guestBumpFreeBlocks.end());
 
@@ -1040,7 +1031,86 @@ extern "C" bool ps2xGuestBumpFree(uint32_t address)
         g_guestBumpFreeBlocks[write++] = {blockAddress, blockSize};
     }
     g_guestBumpFreeBlocks.resize(write);
+}
+
+extern "C" bool ps2xGuestBumpFree(uint32_t address)
+{
+    std::lock_guard<std::mutex> lock(g_guestBumpAllocationMutex);
+    const auto allocation = g_guestBumpAllocationSizes.find(address);
+    if (allocation == g_guestBumpAllocationSizes.end()) return false;
+    const uint32_t paddedSize = (allocation->second + 0xfu) & ~0xfu;
+    g_guestBumpAllocationSizes.erase(allocation);
+    insertGuestBumpFreeBlockLocked(address, paddedSize);
     return true;
+}
+
+extern "C" uint32_t ps2xGuestBumpRealloc(uint8_t *rdram, uint32_t address,
+                                         uint32_t size, uint32_t alignment)
+{
+    if (!rdram) return 0u;
+    if (size >= kGuestBumpAllocatorLimit - kGuestBumpAllocatorBase) return 0u;
+    if (!alignment || (alignment & (alignment - 1u))) alignment = 16u;
+    alignment = std::max(alignment, 4u);
+    if (!address) return ps2xGuestBumpAlloc(rdram, size, alignment);
+    if (!size)
+    {
+        (void)ps2xGuestBumpFree(address);
+        return 0u;
+    }
+    const uint32_t padded = (size + 15u) & ~15u;
+    static const bool inPlace = []
+    {
+        const bool enabled = std::getenv("PS2X_GUEST_BUMP_REALLOC") != nullptr;
+        if (enabled) std::fprintf(stderr, "[heap:realloc] active=1\n");
+        return enabled;
+    }();
+    const auto reportInPlace = []
+    {
+        static thread_local uint64_t count = 0;
+        ++count;
+        if (count <= 262144 && (count & 4095) == 1)
+            std::fprintf(stderr, "[heap:realloc-in-place] accepted=%llu\n",
+                static_cast<unsigned long long>(count));
+    };
+    uint32_t oldSize = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_guestBumpAllocationMutex);
+        const auto allocation = g_guestBumpAllocationSizes.find(address);
+        if (allocation == g_guestBumpAllocationSizes.end()) return 0u;
+        oldSize = allocation->second;
+        const uint32_t oldPadded = (oldSize + 15u) & ~15u;
+        if (inPlace && (address & (alignment - 1u)) == 0u)
+        {
+            if (padded <= oldPadded)
+            {
+                allocation->second = size;
+                if (padded < oldPadded)
+                    insertGuestBumpFreeBlockLocked(address + padded, oldPadded - padded);
+                if (size > oldSize) std::memset(rdram + address + oldSize, 0, size - oldSize);
+                reportInPlace();
+                return address;
+            }
+            const uint32_t extra = padded - oldPadded;
+            for (auto block = g_guestBumpFreeBlocks.begin(); block != g_guestBumpFreeBlocks.end(); ++block)
+            {
+                if (block->first != address + oldPadded || block->second < extra) continue;
+                if (block->second == extra) g_guestBumpFreeBlocks.erase(block);
+                else { block->first += extra; block->second -= extra; }
+                allocation->second = size;
+                std::memset(rdram + address + oldSize, 0, size - oldSize);
+                reportInPlace();
+                return address;
+            }
+        }
+    }
+    // Failure leaves the original allocation and its contents owned by the caller.
+    const uint32_t result = ps2xGuestBumpAlloc(rdram, size, alignment);
+    if (result)
+    {
+        std::memmove(rdram + result, rdram + address, std::min(oldSize, size));
+        (void)ps2xGuestBumpFree(address);
+    }
+    return result;
 }
 
 static bool UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
@@ -9857,17 +9927,8 @@ xmen_component_attach_trace_done:
                 requestedAlignment != 0u && (requestedAlignment & (requestedAlignment - 1u)) == 0u
                     ? requestedAlignment
                     : 16u;
-            const uint32_t result = ps2xGuestBumpAlloc(rdram, newSize, alignment);
-            const uint32_t copySize = std::min(oldSize, newSize);
-            if (result != 0u && copySize != 0u &&
-                oldAddress <= PS2_RAM_SIZE - copySize && result <= PS2_RAM_SIZE - copySize)
-            {
-                std::memmove(rdram + result, rdram + oldAddress, copySize);
-            }
-            if (result != 0u)
-            {
-                (void)ps2xGuestBumpFree(oldAddress);
-            }
+            const uint32_t result = ps2xGuestBumpRealloc(rdram, oldAddress, newSize, alignment);
+            const uint32_t copySize = result && result != oldAddress ? std::min(oldSize, newSize) : 0u;
             SET_GPR_U32(ctx, 2, result);
             ctx->pc = fallthroughPc;
 
@@ -10094,21 +10155,19 @@ xmen_component_attach_trace_done:
         const uint32_t oldAddress = GPR_U32(ctx, 5);
         const uint32_t newSize = GPR_U32(ctx, 6);
         uint32_t oldSize = ps2xGuestBumpAllocationSize(oldAddress);
+        const bool owned = oldSize != 0u;
         if (oldSize == 0u)
         {
             oldSize = guestAllocationRemainingSize(oldAddress);
         }
 
-        const uint32_t result = ps2xGuestBumpAlloc(rdram, newSize, 16u);
-        const uint32_t copySize = std::min(oldSize, newSize);
-        if (result != 0u && oldAddress != 0u && copySize != 0u &&
+        const uint32_t result = owned ? ps2xGuestBumpRealloc(rdram, oldAddress, newSize, 16u)
+                                      : ps2xGuestBumpAlloc(rdram, newSize, 16u);
+        const uint32_t copySize = result && result != oldAddress ? std::min(oldSize, newSize) : 0u;
+        if (!owned && result != 0u && oldAddress != 0u && copySize != 0u &&
             oldAddress <= PS2_RAM_SIZE - copySize && result <= PS2_RAM_SIZE - copySize)
         {
             std::memmove(rdram + result, rdram + oldAddress, copySize);
-        }
-        if (ps2xGuestBumpAllocationSize(oldAddress) != 0u)
-        {
-            (void)ps2xGuestBumpFree(oldAddress);
         }
         SET_GPR_U32(ctx, 2, result);
         ctx->pc = fallthroughPc;
@@ -10710,21 +10769,19 @@ xmen_component_attach_trace_done:
         const uint32_t oldAddress = GPR_U32(ctx, 5);
         const uint32_t newSize = GPR_U32(ctx, 6);
         uint32_t oldSize = ps2xGuestBumpAllocationSize(oldAddress);
+        const bool owned = oldSize != 0u;
         if (oldSize == 0u)
         {
             oldSize = guestAllocationRemainingSize(oldAddress);
         }
 
-        const uint32_t result = ps2xGuestBumpAlloc(rdram, newSize, 16u);
-        const uint32_t copySize = std::min(oldSize, newSize);
-        if (result != 0u && oldAddress != 0u && copySize != 0u &&
+        const uint32_t result = owned ? ps2xGuestBumpRealloc(rdram, oldAddress, newSize, 16u)
+                                      : ps2xGuestBumpAlloc(rdram, newSize, 16u);
+        const uint32_t copySize = result && result != oldAddress ? std::min(oldSize, newSize) : 0u;
+        if (!owned && result != 0u && oldAddress != 0u && copySize != 0u &&
             oldAddress <= PS2_RAM_SIZE - copySize && result <= PS2_RAM_SIZE - copySize)
         {
             std::memmove(rdram + result, rdram + oldAddress, copySize);
-        }
-        if (ps2xGuestBumpAllocationSize(oldAddress) != 0u)
-        {
-            (void)ps2xGuestBumpFree(oldAddress);
         }
         SET_GPR_U32(ctx, 2, result);
 
