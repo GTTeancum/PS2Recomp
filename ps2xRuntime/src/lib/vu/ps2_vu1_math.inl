@@ -2,6 +2,7 @@
 // Include after the instruction-field and laneForComponent helpers.
 
 #include "runtime/ps2_vu_flags.h"
+#include "runtime/ps2_vu_product_flags.h"
 
 #if defined(_MSC_VER) && (defined(PS2X_BUILD_VU_NATIVE_UPPER) || defined(PS2X_BUILD_VU_NATIVE_PAIRS))
 // Fast-math may narrow arithmetic on widened prepared floats back to float,
@@ -320,6 +321,32 @@ uint32_t VU1Interpreter::calculateFmacProductStickyFor(uint8_t dest, const FmacO
         special == 0x27u || special == 0x29u || special == 0x2Du;
     if (!productSum)
         return 0u;
+
+#if defined(PS2X_VU_AVX2_PRODUCT_FLAGS)
+    if constexpr (Word != kDynamicUpper)
+    {
+        __m128 left = _mm_loadu_ps(prepared->vs);
+        __m128 right;
+        if ((op >= 0x08u && op <= 0x0Fu) || (special >= 0x08u && special <= 0x0Fu))
+        {
+            const uint8_t bc = (op >= 0x08u && op <= 0x0Fu ? op : special) & 3u;
+            right = _mm_set1_ps(prepared->vt[bc]);
+        }
+        else if (op == 0x21u || op == 0x25u || special == 0x21u || special == 0x25u)
+            right = _mm_set1_ps(prepared->q);
+        else if (op == 0x23u || op == 0x27u || special == 0x23u || special == 0x27u)
+            right = _mm_set1_ps(prepared->i);
+        else if (op == 0x2Eu)
+        {
+            left = _mm_shuffle_ps(left, left, _MM_SHUFFLE(3, 0, 2, 1));
+            const __m128 vt = _mm_loadu_ps(prepared->vt);
+            right = _mm_shuffle_ps(vt, vt, _MM_SHUFFLE(3, 1, 0, 2));
+        }
+        else
+            right = _mm_loadu_ps(prepared->vt);
+        return VUFlags::productStickyAvx2(left, right, dest);
+    }
+#endif
 
     const uint8_t fs = FS(upper);
     const uint8_t ft = FT(upper);

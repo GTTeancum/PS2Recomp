@@ -10,10 +10,12 @@
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_vu1_replay.h"
 #include "runtime/ps2_vu_flags.h"
+#include "runtime/ps2_vu_product_flags.h"
 #include "runtime/runtime_profile.h"
 #include "runtime/vu_coverage.h"
 
 #include <cmath>
+#include <cfenv>
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
@@ -3552,6 +3554,69 @@ void register_ps2_vu1_tests()
             t.Equals(vu1.state().vf[3][1], 0.0f,
                      "underflow should flush to signed zero before writeback");
         });
+
+#if defined(PS2X_VU_AVX2_PRODUCT_FLAGS)
+        tc.Run("AVX2 VU product sticky flags match scalar widened products for every mask", [](TestCase &t)
+        {
+            const uint32_t values[] = {0u, 0x80000000u, 0x3F800000u, 0xBF800000u,
+                0x00800000u, 0x80800000u, 0x7F7FFFFFu, 0xFF7FFFFFu,
+                0x3F000000u, 0xBF000000u, 0x00800001u, 0x80800001u};
+            uint32_t random = 0x739AD621u;
+            const auto next = [&]()
+            {
+                random ^= random << 13u;
+                random ^= random >> 17u;
+                random ^= random << 5u;
+                return (random & 0x807FFFFFu) | ((1u + (random % 254u)) << 23u);
+            };
+            constexpr uint32_t count = static_cast<uint32_t>(std::size(values));
+            struct RestoreRounding
+            {
+                int mode = std::fegetround();
+                ~RestoreRounding() { std::fesetround(mode); }
+            } restoreRounding;
+            for (int mode : {FE_TONEAREST, FE_TOWARDZERO})
+            for (uint32_t sample = 0u; sample < count * count + 256u; ++sample)
+            {
+                if (sample == 0u && std::fesetround(mode) != 0)
+                {
+                    t.IsTrue(false, "Product flag rounding mode must be selectable");
+                    return;
+                }
+                float left[4], right[4];
+                uint32_t flags[4]{};
+                for (uint32_t lane = 0u; lane < 4u; ++lane)
+                {
+                    const uint32_t l = sample < count * count ? values[(sample / count + lane) % count] : next();
+                    const uint32_t r = sample < count * count ? values[(sample % count + lane * 3u) % count] : next();
+                    std::memcpy(&left[lane], &l, sizeof(l));
+                    std::memcpy(&right[lane], &r, sizeof(r));
+                    // Volatile widened inputs keep the /fp:fast test oracle
+                    // independent of any float-product narrowing optimization.
+                    volatile long double wideLeft = left[lane];
+                    volatile long double wideRight = right[lane];
+                    const long double product = wideLeft * wideRight;
+                    const long double magnitude = std::fabs(product);
+                    flags[lane] = std::signbit(product) ? 2u : 0u;
+                    if (magnitude == 0.0L)
+                        flags[lane] |= 1u;
+                    else if (magnitude < static_cast<long double>(std::numeric_limits<float>::min()))
+                        flags[lane] |= 5u;
+                    else if (magnitude > static_cast<long double>(std::numeric_limits<float>::max()))
+                        flags[lane] |= 8u;
+                }
+                for (uint8_t dest = 0u; dest < 16u; ++dest)
+                {
+                    uint32_t expected = 0u;
+                    for (uint32_t lane = 0u; lane < 4u; ++lane)
+                        if ((dest & (8u >> lane)) != 0u)
+                            expected |= flags[lane];
+                    t.Equals(VUFlags::productStickyAvx2(_mm_loadu_ps(left), _mm_loadu_ps(right), dest),
+                             expected, "Packed products must preserve every selected lane condition");
+                }
+            }
+        });
+#endif
 
         tc.Run("FMAC product contributes Z/S/U/O sticky flags", [](TestCase &t)
         {
