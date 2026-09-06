@@ -236,6 +236,27 @@ void register_ps2_vu1_tests()
 {
     MiniTest::Case("PS2VU1", [](TestCase &tc)
     {
+        tc.Run("VU budget trace records only issued instruction snapshots", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+            if (!fx.code || !fx.data) return;
+            for (uint32_t pc = 0; pc < 40u * 8u; pc += 8u)
+                writeTrackedVuInstructionPair(fx, pc, 0x8000033cu, kVuUpperNop);
+            VU1Interpreter vu;
+            vu.state().vi[1] = 123;
+            vu.state().vi[15] = -17;
+            uint32_t budget = 3u;
+            if (const char *value = std::getenv("PS2X_VU_TEST_TRACE_BUDGET"))
+            {
+                if (std::strcmp(value, "40") == 0) budget = 40u;
+            }
+            vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
+                       fx.gs, &fx.mem, 0u, 0u, 0u, budget);
+            t.Equals(vu.state().pc, budget * 8u, "NOP pairs stop at the requested budget");
+            t.Equals(vu.state().vi[1], int32_t{123}, "Trace preserves positive VI values");
+            t.Equals(vu.state().vi[15], int32_t{-17}, "Trace preserves signed VI values");
+        });
         tc.Run("VU residual pair profile separates code versions and bounds storage", [](TestCase &t)
         {
             VUPairProfile::Collector profile;

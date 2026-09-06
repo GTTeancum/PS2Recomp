@@ -2536,12 +2536,13 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 #endif
     struct BudgetTraceEntry
     {
-        uint32_t pc = 0;
-        uint32_t lower = 0;
-        uint32_t upper = 0;
-        int32_t vi[16]{};
+        uint32_t pc;
+        uint32_t lower;
+        uint32_t upper;
+        int32_t vi[16];
     };
-    BudgetTraceEntry budgetTrace[32]{};
+    // Every retained entry is fully written before the bounded trace reads it.
+    BudgetTraceEntry budgetTrace[32];
     uint32_t budgetTraceCount = 0;
 
     m_activeVuData = vuData;
