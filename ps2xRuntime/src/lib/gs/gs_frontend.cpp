@@ -12,6 +12,10 @@
 #include <iostream>
 #include <sstream>
 
+#ifdef PS2X_ENABLE_PLAY_GS_BACKEND
+std::unique_ptr<GSRasterBackend> MakePlayGsBackend(std::unique_ptr<GSRasterBackend> cpu);
+#endif
+
 namespace
 {
     static constexpr uint32_t kHostFrameWidth = 640u;
@@ -260,6 +264,10 @@ GS::GS()
     : m_backend(std::make_unique<GSCpuBackend>())
 {
     reset();
+#ifdef PS2X_ENABLE_PLAY_GS_BACKEND
+    if (std::getenv("PS2X_GS_PLAY_VULKAN"))
+        m_backend = MakePlayGsBackend(std::move(m_backend));
+#endif
 }
 
 void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
