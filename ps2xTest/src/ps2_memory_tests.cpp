@@ -17,6 +17,82 @@ extern "C" bool ps2xGuestBumpFree(uint32_t address);
 extern "C" uint32_t ps2xGuestBumpRealloc(uint8_t *rdram, uint32_t address,
                                        uint32_t size, uint32_t alignment);
 
+static void checkCompatibilityHeapDispatch(TestCase &t)
+{
+    std::vector<uint8_t> ram(PS2_RAM_SIZE, 0);
+    PS2Runtime runtime;
+    R5900Context ctx{};
+    using Kind = PS2Runtime::GuestBranchKind;
+    constexpr uint32_t fallthrough = 0x800008u;
+    constexpr uint32_t returnPc = 0x800080u;
+    for (const auto kind : {Kind::DirectCall, Kind::IndirectCall}) {
+        const bool virtualCall = kind == Kind::IndirectCall;
+        SET_GPR_U32(&ctx, virtualCall ? 5 : 4, 80u);
+        SET_GPR_U32(&ctx, virtualCall ? 4 : 5, 0x1000u);
+        t.IsTrue(runtime.dispatchGuestBranch(ram.data(), &ctx, 0x200CE0u, 0x800000u,
+            fallthrough, kind, "allocation-convention-test"), "allocation wrapper returns");
+        const uint32_t result = ::getRegU32(&ctx, 2);
+        t.IsTrue(result != 0u, "allocation wrapper reads nonzero requested size");
+        t.Equals(ps2xGuestBumpAllocationSize(result), 80u, "direct and virtual size arguments differ");
+        t.IsTrue(ps2xGuestBumpFree(result), "release allocation convention test block");
+    }
+    for (const uint32_t target : {0x200F40u, 0x200F90u, 0x201080u, 0x201090u,
+                                  0x2151B0u, 0x2336F0u, 0x22C710u})
+    {
+        const bool publicFree = target < 0x210000u;
+        for (const auto kind : {Kind::DirectCall, Kind::IndirectCall, Kind::DirectJump, Kind::IndirectJump})
+        {
+            const uint32_t address = ps2xGuestBumpAlloc(ram.data(), 64u, 16u);
+            const uint32_t other = ps2xGuestBumpAlloc(ram.data(), 64u, 16u);
+            SET_GPR_U32(&ctx, publicFree ? 4 : 5, address);
+            SET_GPR_U32(&ctx, publicFree ? 5 : 4, other);
+            SET_GPR_U32(&ctx, 31, returnPc);
+            const bool returned = runtime.dispatchGuestBranch(ram.data(), &ctx, target,
+                0x800000u, fallthrough, kind, "owned-free-test");
+            const bool isCall = kind == Kind::DirectCall || kind == Kind::IndirectCall;
+            t.Equals(returned, isCall, "free respects call versus tail-jump continuation");
+            t.Equals(ctx.pc, isCall ? fallthrough : returnPc, "free returns to correct caller");
+            t.Equals(ps2xGuestBumpAllocationSize(address), 0u, "free releases the owned pointer");
+            t.Equals(ps2xGuestBumpAllocationSize(other), 64u, "free leaves other argument owned");
+            t.IsTrue(ps2xGuestBumpFree(other), "release test guard");
+        }
+        runtime.registerFunction(target, [](uint8_t *, R5900Context *c, PS2Runtime *) {
+            SET_GPR_U32(c, 2, 0xFACEu);
+        });
+        SET_GPR_U32(&ctx, 4, 0x1000u);
+        SET_GPR_U32(&ctx, 5, 0x1000u);
+        t.IsTrue(runtime.dispatchGuestBranch(ram.data(), &ctx, target, 0x800000u,
+            fallthrough, Kind::DirectCall, "foreign-free-test"), "foreign free follows guest handler");
+        t.Equals(::getRegU32(&ctx, 2), 0xFACEu, "foreign free was not intercepted");
+    }
+
+    for (const uint32_t target : {0x200E10u, 0x233ED0u})
+    {
+        const uint32_t address = ps2xGuestBumpAlloc(ram.data(), 64u, 16u);
+        std::memset(ram.data() + address, 0x6B, 64u);
+        const bool publicRealloc = target == 0x200E10u;
+        SET_GPR_U32(&ctx, publicRealloc ? 4 : 5, address);
+        SET_GPR_U32(&ctx, publicRealloc ? 5 : 6, 128u);
+        if (publicRealloc) SET_GPR_U32(&ctx, 6, 3u); // Not an alignment argument here.
+        SET_GPR_U32(&ctx, 7, 64u);
+        t.IsTrue(runtime.dispatchGuestBranch(ram.data(), &ctx, target, 0x800000u,
+            fallthrough, Kind::DirectCall, "owned-realloc-test"), "owned realloc returns");
+        const uint32_t result = ::getRegU32(&ctx, 2);
+        t.IsTrue(result != 0u, "positive shared-slot request reallocates instead of freeing");
+        t.Equals(ps2xGuestBumpAllocationSize(result), 128u, "realloc tracks replacement size");
+        t.Equals(result & (publicRealloc ? 15u : 63u), 0u, "realloc uses correct alignment argument");
+        t.IsTrue(std::all_of(ram.begin() + result, ram.begin() + result + 64u,
+            [](uint8_t value) { return value == 0x6B; }), "realloc preserves contents");
+        SET_GPR_U32(&ctx, 5, result);
+        SET_GPR_U32(&ctx, 6, 0xFFFFFFFFu);
+        SET_GPR_U32(&ctx, 31, returnPc);
+        t.IsTrue(!runtime.dispatchGuestBranch(ram.data(), &ctx, 0x233ED0u, 0x800000u,
+            fallthrough, Kind::IndirectJump, "release-sentinel-test"), "release sentinel returns from tail jump");
+        t.Equals(ctx.pc, returnPc, "release sentinel tail continuation");
+        t.Equals(ps2xGuestBumpAllocationSize(result), 0u, "minus-one shared-slot request frees");
+    }
+}
+
 static void checkCompatibilityHeapReallocation(TestCase &t)
 {
     // Fresh process required, as for the fragmentation test below.
@@ -269,6 +345,7 @@ void register_ps2_memory_tests()
     {
         tc.Run("best fit preserves a large allocation under fragmentation", checkCompatibilityHeapFragmentation);
         tc.Run("reallocation preserves ownership and resizes safely", checkCompatibilityHeapReallocation);
+        tc.Run("public allocator dispatch preserves heap ownership", checkCompatibilityHeapDispatch);
     });
     MiniTest::Case("PS2Memory", [](TestCase &tc)
     {

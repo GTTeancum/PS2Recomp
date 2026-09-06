@@ -2295,7 +2295,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // Keep every address referenced by the compatibility region on the proven
     // path. All other edges can use the generic dispatcher without scanning
     // thousands of game-specific diagnostics.
-    static constexpr std::array<uint32_t, 466> kXmenCompatibilityBranchAddresses = {
+    static constexpr std::array<uint32_t, 471> kXmenCompatibilityBranchAddresses = {
         0x0010AC00u, 0x0010AC30u, 0x0010AF50u, 0x0010AFA0u, 0x00116780u, 0x00116AB8u,
         0x00116C28u, 0x001176D0u, 0x00130BBCu, 0x00130F04u, 0x001375A0u, 0x0013781Cu,
         0x00137A28u, 0x0014AD80u, 0x0014AD90u, 0x0014AE50u, 0x0014B200u, 0x0014B240u,
@@ -2309,7 +2309,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         0x001FC15Cu, 0x001FC16Cu, 0x001FC180u, 0x001FC1C4u, 0x001FC1D4u, 0x001FC1E8u,
         0x001FC224u, 0x001FC234u, 0x001FC264u, 0x001FD030u, 0x001FD0B0u, 0x001FD6E4u,
         0x001FD740u, 0x001FDA00u, 0x001FDB10u, 0x001FDB5Cu, 0x001FE3C0u, 0x001FE740u,
-        0x00200CE0u, 0x00200D6Cu, 0x00200E90u, 0x00200EECu, 0x00200F30u, 0x00200FA0u,
+        0x00200CE0u, 0x00200D6Cu, 0x00200E10u, 0x00200E90u, 0x00200EECu, 0x00200F30u,
+        0x00200F40u, 0x00200F90u, 0x00200FA0u, 0x00201080u, 0x00201090u,
         0x00202890u, 0x0020297Cu, 0x0020298Cu, 0x002029ACu, 0x002029BCu, 0x002029E0u,
         0x00202A98u, 0x00202B40u, 0x00202B74u, 0x00202BC0u, 0x00202C40u, 0x00202CA4u,
         0x00203100u, 0x0020318Cu, 0x002031B8u, 0x00203280u, 0x00212660u, 0x00213A80u,
@@ -2486,7 +2487,6 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         case 0x002031B8u:
         case 0x00203280u:
         case 0x00213A80u:
-        case 0x002151B0u:
         case 0x00215FA0u:
         case 0x00217500u:
         case 0x00271F08u:
@@ -2519,7 +2519,6 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         case 0x002FA890u:
         case 0x002FAD08u:
         case 0x002FB570u:
-        case 0x002336F0u:
         case 0x0030CA00u:
         case 0x003B2000u:
         case 0x003B21B4u:
@@ -9868,13 +9867,29 @@ xmen_component_attach_trace_done:
 
     // Compatibility allocations must be returned to the same heap. Passing
     // them to Alchemy's native free-list code corrupts neighboring live blocks.
-    if (targetPc == 0x0022C710u &&
-        (isCall || kind == GuestBranchKind::IndirectJump))
+    // The public free wrappers first query the native owner registry, which
+    // cannot identify host-tracked blocks. Intercept before that lookup too.
+    const bool publicFree = targetPc == 0x00200F40u || targetPc == 0x00200F90u ||
+                            targetPc == 0x00201080u || targetPc == 0x00201090u;
+    if ((publicFree || targetPc == 0x0022C710u || targetPc == 0x002151B0u ||
+         targetPc == 0x002336F0u) &&
+        (isCall || kind == GuestBranchKind::IndirectJump || kind == GuestBranchKind::DirectJump))
     {
-        const uint32_t address = GPR_U32(ctx, 5);
-        if (ps2xGuestBumpAllocationSize(address) != 0u)
+        const uint32_t address = ::getRegU32(ctx, publicFree ? 4 : 5);
+        const uint32_t size = ps2xGuestBumpAllocationSize(address);
+        if (size != 0u)
         {
             (void)ps2xGuestBumpFree(address);
+            if (publicFree)
+            {
+                static thread_local uint64_t count = 0u;
+                static thread_local uint64_t bytes = 0u;
+                ++count;
+                bytes += size;
+                if (count <= 262144u && (count & 4095u) == 1u)
+                    std::fprintf(stderr, "[heap:public-free] accepted=%llu bytes=%llu\n",
+                        static_cast<unsigned long long>(count), static_cast<unsigned long long>(bytes));
+            }
             if (isCall)
             {
                 ctx->pc = fallthroughPc;
@@ -9915,14 +9930,14 @@ xmen_component_attach_trace_done:
     // Compatibility-heap blocks are intentionally invisible to Alchemy's
     // native allocator registry. Handle its outer realloc wrapper before it
     // asks that registry to identify the block owner.
-    if (isCall && (targetPc == 0x00200E90u || targetPc == 0x00200F30u))
+    if (isCall && (targetPc == 0x00200E10u || targetPc == 0x00200E90u || targetPc == 0x00200F30u))
     {
         const uint32_t oldAddress = GPR_U32(ctx, 4);
         const uint32_t oldSize = ps2xGuestBumpAllocationSize(oldAddress);
         if (oldSize != 0u)
         {
             const uint32_t newSize = GPR_U32(ctx, 5);
-            const uint32_t requestedAlignment = GPR_U32(ctx, 6);
+            const uint32_t requestedAlignment = targetPc == 0x00200E10u ? 16u : GPR_U32(ctx, 6);
             const uint32_t alignment =
                 requestedAlignment != 0u && (requestedAlignment & (requestedAlignment - 1u)) == 0u
                     ? requestedAlignment
@@ -10119,16 +10134,24 @@ xmen_component_attach_trace_done:
         const uint32_t allocationSize = ps2xGuestBumpAllocationSize(address);
         if (allocationSize != 0u)
         {
-            (void)ps2xGuestBumpFree(address);
+            // Retail slot 0x1b4 combines allocation/reallocation with release.
+            // 0x2336f0 supplies -1 for release; a positive size is NOT a free.
+            const uint32_t newSize = GPR_U32(ctx, 6);
+            const uint32_t result = newSize == 0xFFFFFFFFu
+                ? (ps2xGuestBumpFree(address), 0u)
+                : ps2xGuestBumpRealloc(rdram, address, newSize, GPR_U32(ctx, 7));
+            SET_GPR_U32(ctx, 2, result);
 
             static std::atomic<uint32_t> s_xmenOuterCompatibilityFreeLogCount{0u};
             const uint32_t count =
                 s_xmenOuterCompatibilityFreeLogCount.fetch_add(1u, std::memory_order_relaxed);
             if (xmenRuntimeDiagnosticsEnabled() && count < 128u)
             {
-                std::cerr << "[xmen-alloc-compat:outer-free] source=0x" << std::hex << sourcePc
+                std::cerr << "[xmen-alloc-compat:allocator-slot] source=0x" << std::hex << sourcePc
                           << " address=0x" << address
                           << " size=0x" << allocationSize
+                          << " newSize=0x" << newSize
+                          << " result=0x" << result
                           << " kind=" << describeGuestBranchKind(kind)
                           << " return=0x" << (isCall ? fallthroughPc : GPR_U32(ctx, 31))
                           << std::dec << std::endl;
@@ -10669,7 +10692,7 @@ xmen_component_attach_trace_done:
     if (isCall && targetPc == 0x00200CE0u)
     {
         const bool virtualCall = kind == GuestBranchKind::IndirectCall;
-        const uint32_t size = GPR_U32(ctx, virtualCall ? 5 : 4);
+        const uint32_t size = ::getRegU32(ctx, virtualCall ? 5 : 4);
         const uint32_t result = ps2xGuestBumpAlloc(rdram, size, 16u);
         SET_GPR_U32(ctx, 2, result);
         ctx->pc = fallthroughPc;
