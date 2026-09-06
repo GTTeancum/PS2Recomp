@@ -592,7 +592,7 @@ void register_ps2_vu1_tests()
         });
 #endif
 #if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
-        tc.Run("native VU arithmetic preserves normal and boundary flags", [](TestCase &t)
+        tc.Run("native VU arithmetic preserves boundary flags and caller rounding", [](TestCase &t)
         {
             Vu1Fixture referenceFx;
             Vu1Fixture nativeFx;
@@ -678,8 +678,10 @@ void register_ps2_vu1_tests()
                     std::ostringstream expected(std::ios::binary), actual(std::ios::binary);
                     t.IsTrue(VUReplay::record(expected, reference, referenceFx.code, referenceFx.data,
                         referenceFx.gs, &referenceFx.mem, budget), "Arithmetic reference must record");
+                    t.Equals(std::fegetround(), mode, "Interpreter must restore caller rounding");
                     t.IsTrue(VUReplay::record(actual, native, nativeFx.code, nativeFx.data,
                         nativeFx.gs, &nativeFx.mem, budget), "Native arithmetic must record");
+                    t.Equals(std::fegetround(), mode, "Native execution must restore caller rounding");
                     const auto expectedBytes = expected.str();
                     const auto actualBytes = actual.str();
                     if (expectedBytes != actualBytes)
