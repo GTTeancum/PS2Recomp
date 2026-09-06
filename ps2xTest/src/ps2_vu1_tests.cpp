@@ -3080,6 +3080,53 @@ void register_ps2_vu1_tests()
                      "XGKICK resource stalls should consume VU cycles");
         });
 
+        tc.Run("VU XGKICK reuses storage across long short and growing packets", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+            if (!fx.code || !fx.data) return;
+            const uint32_t addresses[] = {0u, 8192u, 12288u};
+            const uint32_t sizes[] = {4096u, 32u, 80u};
+            std::vector<std::vector<uint8_t>> expected, captured;
+            for (uint32_t i = 0; i < 3u; ++i)
+            {
+                expected.emplace_back(sizes[i], 0u);
+                auto &packet = expected.back();
+                const uint64_t tag = makeGifTag(sizes[i] / 16u - 1u, GIF_FMT_IMAGE, 0u, true);
+                std::memcpy(packet.data(), &tag, sizeof(tag));
+                for (uint32_t byte = 16u; byte < sizes[i]; ++byte)
+                    packet[byte] = static_cast<uint8_t>(byte * 13u + i * 71u);
+                std::memcpy(fx.data + addresses[i], packet.data(), packet.size());
+                writeTrackedVuInstructionPair(fx, i * 8u, makeVuLowerSpecial(0x6Cu, i + 1u), kVuUpperNop);
+            }
+            writeTrackedVuInstructionPair(fx, 24u, 0u, kVuUpperNop | 0x40000000u);
+            writeTrackedVuInstructionPair(fx, 32u, 0u, kVuUpperNop);
+            fx.mem.setGifPacketCallback([&](const uint8_t *packet, uint32_t size)
+            {
+                captured.emplace_back(packet, packet + size);
+            });
+            std::string referenceState;
+            for (const uint32_t budget : {4096u, 1u, 3u, 8u, 64u})
+            {
+                captured.clear();
+                VU1Interpreter vu;
+                for (uint32_t i = 0; i < 3u; ++i)
+                    vu.state().vi[i + 1u] = static_cast<int32_t>(addresses[i] / 16u);
+                vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
+                           fx.gs, &fx.mem, 0u, 0u, 0u, budget);
+                for (uint32_t calls = 0u; vu.isRunning() && calls < 4096u; ++calls)
+                    vu.resume(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
+                              fx.gs, &fx.mem, 0u, 0u, budget);
+                t.IsFalse(vu.isRunning(), "All three packets and the halt must finish");
+                t.IsTrue(captured == expected, "Packets must contain only new bytes and exact lengths, with no stale suffix");
+                std::ostringstream state(std::ios::binary);
+                t.IsTrue(VUReplay::record(state, vu, fx.code, fx.data, fx.gs, &fx.mem, 0u),
+                         "The completed transfer state must record");
+                if (referenceState.empty()) referenceState = state.str();
+                else t.IsTrue(state.str() == referenceState, "Slicing must preserve final state and transfer completion cycles");
+            }
+        });
+
         tc.Run("synthetic Code Veronica text packet preserves black-frame PATH1 data", [](TestCase &t)
         {
             PS2Memory mem;
