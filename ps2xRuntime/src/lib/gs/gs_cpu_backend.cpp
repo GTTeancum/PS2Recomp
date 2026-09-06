@@ -3561,12 +3561,22 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
     if (!m_usePreparedTexture || s_xmenTraceTextureSample)
         return SampleTextureImpl<false>(state, s, t, q, u, v);
     const uint32_t color = SampleTextureImpl<true>(state, s, t, q, u, v);
+    static thread_local bool reported = false;
+    if (!reported)
+    {
+        std::fprintf(stderr, "[gs:prepared-texture] active=1\n");
+        reported = true;
+    }
     static const bool verify = std::getenv("PS2X_GS_VERIFY_TEXTURE") != nullptr;
     if (verify)
     {
         const uint32_t expected = SampleTextureImpl<false>(state, s, t, q, u, v);
         if (color != expected)
+        {
+            std::fprintf(stderr, "[gs:prepared-texture-audit-failed] actual=%08x expected=%08x psm=%u cpsm=%u csa=%u\n",
+                         color, expected, state.context.tex0.psm, state.context.tex0.cpsm, state.context.tex0.csa);
             throw std::runtime_error("GS prepared texture differs from reference sampler");
+        }
         static thread_local uint64_t samples = 0;
         if ((++samples & 1048575u) == 1u)
             std::fprintf(stderr, "[gs:prepared-texture-audit] samples=%llu mismatches=0\n",
