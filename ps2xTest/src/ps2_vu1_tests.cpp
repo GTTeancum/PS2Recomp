@@ -2356,6 +2356,85 @@ void register_ps2_vu1_tests()
                      "ACC forwarding must not introduce a four-cycle dependency stall");
         });
 
+        tc.Run("one-cycle register writes preserve masks pending loads and branch backup", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+            if (!fx.code || !fx.data)
+                return;
+            uint64_t fingerprint = 14695981039346656037ull;
+            constexpr uint32_t initialAcc[] = {0x80000000u, 0x7FC00042u, 1u, 0xFF800000u};
+            const uint32_t loaded = 0x1234u;
+            std::memcpy(fx.data, &loaded, sizeof(loaded));
+            for (uint8_t mask = 0u; mask < 16u; ++mask)
+            for (int32_t initialVi : {32767, -32768, -1, 0})
+            for (bool pendingLoad : {false, true})
+            {
+                writeTrackedVuInstructionPair(fx, 0u,
+                    pendingLoad ? makeVuIlw(0x8u, 3u, 0u, 0) : 0u,
+                    makeVuUpperSpecial(0x28u, mask, 2u, 1u));
+                writeTrackedVuInstructionPair(fx, 8u, makeVuIaddiu(3u, 2u, 1),
+                    makeVuUpper(0x29u, mask, 4u, 3u, 5u));
+                writeTrackedVuInstructionPair(fx, 16u, makeVuIbne(3u, 2u, 3), kVuUpperNop);
+                writeTrackedVuInstructionPair(fx, 24u, makeVuIaddiu(6u, 0u, 11), kVuUpperNop);
+                writeTrackedVuInstructionPair(fx, 32u, makeVuIaddiu(7u, 0u, 22), kVuUpperNop);
+                writeTrackedVuInstructionPair(fx, 40u, makeVuIaddiu(0u, 2u, 7), kVuUpperNop);
+                writeTrackedVuInstructionPair(fx, 48u, 0u, kVuUpperNop | 0x40000000u);
+                writeTrackedVuInstructionPair(fx, 56u, 0u, kVuUpperNop);
+                VU1Interpreter vu;
+                vu.state().vi[2] = initialVi;
+                vu.state().vi[3] = initialVi;
+                std::memcpy(vu.state().acc, initialAcc, sizeof(initialAcc));
+                for (uint32_t lane = 0u; lane < 4u; ++lane)
+                {
+                    vu.state().vf[1][lane] = static_cast<float>(lane + 1u);
+                    vu.state().vf[2][lane] = static_cast<float>(10u * (lane + 1u));
+                    vu.state().vf[3][lane] = 2.0f;
+                    vu.state().vf[4][lane] = 3.0f;
+                    vu.state().vf[5][lane] = -99.0f;
+                }
+                vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
+                           fx.gs, &fx.mem, 0u, 0u, 0u, 0u);
+                for (uint32_t cycle = 1u; cycle <= 8u; ++cycle)
+                {
+                    std::ostringstream recording(std::ios::binary);
+                    t.IsTrue(VUReplay::record(recording, vu, fx.code, fx.data, fx.gs, &fx.mem, 0u),
+                             "Zero-budget state capture must succeed");
+                    t.Equals(vu.state().cycles, uint64_t{cycle - 1u}, "Zero budget must not publish writes");
+                    t.IsTrue(VUReplay::record(recording, vu, fx.code, fx.data, fx.gs, &fx.mem, 1u),
+                             "One-cycle state capture must succeed");
+                    for (unsigned char byte : recording.str())
+                        fingerprint = (fingerprint ^ byte) * 1099511628211ull;
+                    t.Equals(vu.state().cycles, uint64_t{cycle}, "Register forwarding must not add stalls");
+                    t.Equals(vu.state().pc, cycle * 8u, "Branch must consume the backed-up pre-IALU value");
+                    t.Equals(vu.state().vi[3], cycle < 2u ? initialVi : int32_t{static_cast<int16_t>(initialVi + 1)},
+                             "One-cycle IALU must wrap and cancel the older four-cycle load");
+                    t.Equals(vu.state().vi[0], 0, "Integer zero-register writes must be ignored");
+                    t.Equals(vu.state().vi[6], cycle < 4u ? 0 : 11, "Branch delay slot must execute");
+                    t.Equals(vu.state().vi[7], cycle < 5u ? 0 : 22, "Untaken branch must preserve fallthrough");
+                    for (uint32_t lane = 0u; lane < 4u; ++lane)
+                    {
+                        const bool enabled = (mask & (8u >> lane)) != 0u;
+                        uint32_t actualBits = 0u;
+                        std::memcpy(&actualBits, &vu.state().acc[lane], sizeof(actualBits));
+                        const float sum = static_cast<float>(11u * (lane + 1u));
+                        uint32_t sumBits = 0u;
+                        std::memcpy(&sumBits, &sum, sizeof(sumBits));
+                        t.Equals(actualBits, enabled ? sumBits : initialAcc[lane],
+                                 "ACC must forward enabled lanes and preserve inactive raw bits");
+                        t.Equals(vu.state().vf[5][lane], enabled && cycle >= 5u ? sum + 6.0f : -99.0f,
+                                 "MADD must consume forwarded ACC but retain four-cycle VF latency");
+                    }
+                }
+                t.IsTrue(!vu.isRunning(), "End-bit delay slot must stop the program");
+            }
+            std::printf("[vu-one-cycle-registers] cases=128 fingerprint=%016llx\n",
+                        static_cast<unsigned long long>(fingerprint));
+            // Recorded from the queued implementation before bypassing one-cycle writes.
+            t.Equals(fingerprint, uint64_t{0x00D374D94B9195ADull},
+                     "Serialized pipeline state, sequences, flags and memory must match the queued baseline");
+        });
+
         tc.Run("ILW result becomes visible after four cycles before IALU consumes it", [](TestCase &t)
         {
             Vu1Fixture fx;
