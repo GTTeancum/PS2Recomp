@@ -2738,12 +2738,14 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         float oldLowerVf[4]{};
         float newLowerVf[4]{};
         float oldAcc[4]{};
-        float newAcc[4]{};
+        static_assert(kAccForwardLatency == 1u);
+        const bool forwardAcc = decoded.upperUsage.accWrite != 0u &&
+                                m_accWritePipelineMask == 0u;
         if (hasUpperWrite)
             std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
         if (hasDistinctLowerWrite)
             std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
-        if (decoded.upperUsage.accWrite != 0u)
+        if (decoded.upperUsage.accWrite != 0u && !forwardAcc)
             std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
 
 #if defined(PS2X_ENABLE_VU_NATIVE_PAIRS)
@@ -2861,22 +2863,43 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         }
         if (decoded.upperUsage.accWrite != 0u)
         {
-            std::memcpy(newAcc, m_state.acc, sizeof(newAcc));
-            std::memcpy(m_state.acc, oldAcc, sizeof(oldAcc));
-            // ACC is forwarded to the next upper instruction. Its arithmetic
-            // flags still use the normal four-cycle FMAC timeline.
-            queueAccWrite(decoded.upperUsage.accWrite, newAcc,
-                          kAccForwardLatency);
+            if (forwardAcc)
+            {
+                // Nothing observes ACC between here and the next cycle boundary.
+                // Retain sequence metadata and the queue slot's canonical empty
+                // state, including when resuming an externally recorded state.
+                const uint64_t sequence = ++m_nextWriteSequence;
+                for (uint32_t component = 0u; component < 4u; ++component)
+                    if ((decoded.upperUsage.accWrite & laneForComponent(component)) != 0u)
+                        m_accLatestWrite[component] = sequence;
+                std::memset(&m_accWritePipeline[0], 0, sizeof(m_accWritePipeline[0]));
+            }
+            else
+            {
+                float newAcc[4];
+                std::memcpy(newAcc, m_state.acc, sizeof(newAcc));
+                std::memcpy(m_state.acc, oldAcc, sizeof(oldAcc));
+                queueAccWrite(decoded.upperUsage.accWrite, newAcc, kAccForwardLatency);
+            }
         }
         if (writtenVi != 0u)
         {
-            const int32_t newVi = m_state.vi[writtenVi];
-            m_state.vi[writtenVi] = oldVi;
             const uint32_t latency =
                 decoded.lowerUsage.viLatency != 0u
                     ? decoded.lowerUsage.viLatency
                     : decoded.lowerUsage.latency;
-            queueViWrite(writtenVi, newVi, latency);
+            if (latency == 1u && m_viWritePipelineMask == 0u)
+            {
+                m_state.vi[writtenVi] = static_cast<int16_t>(m_state.vi[writtenVi]);
+                m_viLatestWrite[writtenVi] = ++m_nextWriteSequence;
+                std::memset(&m_viWritePipeline[0], 0, sizeof(m_viWritePipeline[0]));
+            }
+            else
+            {
+                const int32_t newVi = m_state.vi[writtenVi];
+                m_state.vi[writtenVi] = oldVi;
+                queueViWrite(writtenVi, newVi, latency);
+            }
         }
 
         markPairWrites(decoded);
