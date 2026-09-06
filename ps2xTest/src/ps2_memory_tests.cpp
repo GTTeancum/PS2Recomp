@@ -91,6 +91,20 @@ static void checkCompatibilityHeapDispatch(TestCase &t)
         t.Equals(ctx.pc, returnPc, "release sentinel tail continuation");
         t.Equals(ps2xGuestBumpAllocationSize(result), 0u, "minus-one shared-slot request frees");
     }
+    const uint32_t retained = ps2xGuestBumpAlloc(ram.data(), 64u, 16u);
+    const uint32_t frontierBlock = ps2xGuestBumpAlloc(ram.data(), 0x10000u, 16u);
+    const uint32_t filler = ps2xGuestBumpAlloc(ram.data(),
+        0x1800000u - frontierBlock - 0x10000u - 16u, 16u);
+    t.IsTrue(frontierBlock != 0u && filler != 0u, "fill tail without triggering an earlier allocation failure");
+    SET_GPR_U32(&ctx, 4, retained);
+    SET_GPR_U32(&ctx, 5, 0x20000u);
+    t.IsTrue(runtime.dispatchGuestBranch(ram.data(), &ctx, 0x200E10u, 0x800000u,
+        fallthrough, Kind::DirectCall, "failed-realloc-test"), "failed realloc returns to caller");
+    t.Equals(::getRegU32(&ctx, 2), 0u, "failed realloc returns null");
+    t.Equals(ps2xGuestBumpAllocationSize(retained), 64u, "failed dispatch retains old allocation");
+    t.IsTrue(ps2xGuestBumpFree(retained), "release retained block");
+    t.IsTrue(ps2xGuestBumpFree(frontierBlock), "release frontier block");
+    t.IsTrue(ps2xGuestBumpFree(filler), "release dispatch filler");
 }
 
 static void checkCompatibilityHeapReallocation(TestCase &t)

@@ -341,6 +341,29 @@ namespace
     };
 
     thread_local DispatchHistory g_dispatchHistory;
+    struct GuestHeapCallScope;
+    thread_local const GuestHeapCallScope *g_guestHeapCall = nullptr;
+    struct GuestHeapCallScope
+    {
+        const GuestHeapCallScope *previous;
+        const R5900Context *context;
+        uint32_t source, target;
+        bool enabled;
+        GuestHeapCallScope(const R5900Context *ctx, uint32_t from, uint32_t to)
+        {
+            static const bool diagnostics = std::getenv("PS2X_GUEST_BUMP_DIAGNOSTICS") != nullptr;
+            enabled = diagnostics;
+            if (enabled)
+            {
+                previous = g_guestHeapCall;
+                context = ctx;
+                source = from;
+                target = to;
+                g_guestHeapCall = this;
+            }
+        }
+        ~GuestHeapCallScope() { if (enabled) g_guestHeapCall = previous; }
+    };
     thread_local uint64_t g_guestDispatchYieldGeneration = 0u;
     thread_local uint32_t g_xmenPendingFastCheckpointCycles = 0u;
     struct XmenPacingProfile
@@ -975,7 +998,8 @@ extern "C" uint32_t ps2xGuestBumpAlloc(uint8_t *rdram, uint32_t size, uint32_t a
             if (diagnostics)
             {
                 static std::atomic<uint32_t> failures{0};
-                if (failures.fetch_add(1, std::memory_order_relaxed) < 16)
+                const uint32_t failureIndex = failures.fetch_add(1, std::memory_order_relaxed);
+                if (failureIndex < 16)
                 {
                     std::lock_guard<std::mutex> lock(g_guestBumpAllocationMutex);
                     uint64_t freeBytes = 0;
@@ -984,6 +1008,29 @@ extern "C" uint32_t ps2xGuestBumpAlloc(uint8_t *rdram, uint32_t size, uint32_t a
                     {
                         freeBytes += bytes;
                         largest = std::max(largest, bytes);
+                    }
+                    if (failureIndex == 0u)
+                    {
+                        std::unordered_map<uint32_t, uint32_t> sizeCounts;
+                        for (const auto &[address, bytes] : g_guestBumpAllocationSizes) ++sizeCounts[bytes];
+                        std::vector<std::pair<uint32_t, uint32_t>> ranked(sizeCounts.begin(), sizeCounts.end());
+                        std::sort(ranked.begin(), ranked.end(), [](const auto &a, const auto &b) {
+                            return uint64_t{a.first} * a.second > uint64_t{b.first} * b.second;
+                        });
+                        for (size_t i = 0; i < std::min<size_t>(ranked.size(), 16u); ++i)
+                            std::fprintf(stderr, "[heap:live-size] size=%u count=%u bytes=%llu\n",
+                                ranked[i].first, ranked[i].second,
+                                static_cast<unsigned long long>(uint64_t{ranked[i].first} * ranked[i].second));
+                        if (g_guestHeapCall)
+                        {
+                            const auto *call = g_guestHeapCall;
+                            std::fprintf(stderr, "[heap:failed-call] source=0x%x target=0x%x ra=0x%x sp=0x%x a0=0x%x a1=0x%x a2=0x%x a3=0x%x s0=0x%x s1=0x%x trace=%s\n",
+                                call->source, call->target, ::getRegU32(call->context, 31),
+                                ::getRegU32(call->context, 29), ::getRegU32(call->context, 4),
+                                ::getRegU32(call->context, 5), ::getRegU32(call->context, 6),
+                                ::getRegU32(call->context, 7), ::getRegU32(call->context, 16),
+                                ::getRegU32(call->context, 17), formatDispatchHistory().c_str());
+                        }
                     }
                     std::fprintf(stderr, "[heap:allocation-failed] size=%u alignment=%u bump=%u tail=%u free=%llu largest=%u live=%zu\n",
                         size, alignment, current, kGuestBumpAllocatorLimit - current,
@@ -2282,6 +2329,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     }
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+    const GuestHeapCallScope heapCall(ctx, sourcePc, targetPc);
     static thread_local std::array<uint32_t, 256> s_guestReturnTargets{};
     static thread_local std::array<uint32_t, 256> s_guestCallSources{};
     static thread_local uint32_t s_guestReturnDepth = 0u;
