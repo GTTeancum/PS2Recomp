@@ -919,7 +919,30 @@ extern "C" uint32_t ps2xGuestBumpAlloc(uint8_t *rdram, uint32_t size, uint32_t a
 
     {
         std::lock_guard<std::mutex> lock(g_guestBumpAllocationMutex);
-        for (size_t i = 0; i < g_guestBumpFreeBlocks.size(); ++i)
+        static const bool bestFit = []
+        {
+            const bool enabled = std::getenv("PS2X_GUEST_BUMP_BEST_FIT") != nullptr;
+            if (enabled) std::fprintf(stderr, "[heap:best-fit] active=1\n");
+            return enabled;
+        }();
+        size_t first = 0;
+        if (bestFit)
+        {
+            first = g_guestBumpFreeBlocks.size();
+            uint32_t smallest = std::numeric_limits<uint32_t>::max();
+            for (size_t i = 0; i < g_guestBumpFreeBlocks.size(); ++i)
+            {
+                const auto [address, bytes] = g_guestBumpFreeBlocks[i];
+                const uint32_t aligned = (address + mask) & ~mask;
+                const uint32_t prefix = aligned - address;
+                if (prefix <= bytes && paddedSize <= bytes - prefix && bytes < smallest)
+                {
+                    first = i;
+                    smallest = bytes;
+                }
+            }
+        }
+        for (size_t i = first; i < g_guestBumpFreeBlocks.size(); ++i)
         {
             const auto [blockAddress, blockSize] = g_guestBumpFreeBlocks[i];
             const uint32_t aligned = (blockAddress + mask) & ~mask;
@@ -948,6 +971,25 @@ extern "C" uint32_t ps2xGuestBumpAlloc(uint8_t *rdram, uint32_t size, uint32_t a
         const uint32_t next = aligned + paddedSize;
         if (next >= kGuestBumpAllocatorLimit || next < aligned)
         {
+            static const bool diagnostics = std::getenv("PS2X_GUEST_BUMP_DIAGNOSTICS") != nullptr;
+            if (diagnostics)
+            {
+                static std::atomic<uint32_t> failures{0};
+                if (failures.fetch_add(1, std::memory_order_relaxed) < 16)
+                {
+                    std::lock_guard<std::mutex> lock(g_guestBumpAllocationMutex);
+                    uint64_t freeBytes = 0;
+                    uint32_t largest = 0;
+                    for (const auto &[address, bytes] : g_guestBumpFreeBlocks)
+                    {
+                        freeBytes += bytes;
+                        largest = std::max(largest, bytes);
+                    }
+                    std::fprintf(stderr, "[heap:allocation-failed] size=%u alignment=%u bump=%u tail=%u free=%llu largest=%u live=%zu\n",
+                        size, alignment, current, kGuestBumpAllocatorLimit - current,
+                        static_cast<unsigned long long>(freeBytes), largest, g_guestBumpAllocationSizes.size());
+                }
+            }
             return 0u;
         }
 

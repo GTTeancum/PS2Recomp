@@ -9,8 +9,42 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
+
+extern "C" bool ps2xGuestBumpFree(uint32_t address);
+
+static void checkCompatibilityHeapFragmentation(TestCase &t)
+{
+    // Run in a fresh process: the compatibility heap has process-global ownership.
+    std::vector<uint8_t> ram(PS2_RAM_SIZE, 0xA5);
+    const uint32_t large = ps2xGuestBumpAlloc(ram.data(), 0x50000u, 16u);
+    const uint32_t separator = ps2xGuestBumpAlloc(ram.data(), 16u, 16u);
+    const uint32_t small = ps2xGuestBumpAlloc(ram.data(), 64u, 16u);
+    const uint32_t end = ps2xGuestBumpAlloc(ram.data(), 16u, 16u);
+    t.IsTrue(large != 0u && separator != 0u && small != 0u && end != 0u,
+        "initial allocations must succeed");
+    const uint32_t fillSize = 0x01800000u - end - 16u - 128u;
+    const uint32_t filler = ps2xGuestBumpAlloc(ram.data(), fillSize, 16u);
+    t.Equals(filler, end + 16u, "fill arena leaving only a small tail");
+    t.IsTrue(ps2xGuestBumpFree(large), "free large hole");
+    t.IsTrue(ps2xGuestBumpFree(small), "free small hole");
+    const uint32_t reusedSmall = ps2xGuestBumpAlloc(ram.data(), 48u, 16u);
+    const uint32_t reusedLarge = ps2xGuestBumpAlloc(ram.data(), 0x50000u, 16u);
+    const bool bestFit = std::getenv("PS2X_GUEST_BUMP_BEST_FIT") != nullptr;
+    t.Equals(reusedSmall, bestFit ? small : large, "policy chooses the expected hole");
+    t.Equals(reusedLarge, bestFit ? large : 0u, "best fit preserves space for large request");
+    t.Equals(ps2xGuestBumpAllocationSize(reusedSmall), 48u, "requested size remains exact");
+    t.Equals(reusedSmall & 15u, 0u, "alignment is preserved");
+    t.IsTrue(std::all_of(ram.begin() + reusedSmall, ram.begin() + reusedSmall + 48u,
+        [](uint8_t value) { return value == 0u; }), "reused memory is cleared");
+    t.IsTrue(ps2xGuestBumpFree(reusedSmall), "free reused small block");
+    if (reusedLarge) t.IsTrue(ps2xGuestBumpFree(reusedLarge), "free reused large block");
+    t.IsTrue(ps2xGuestBumpFree(separator), "free first separator");
+    t.IsTrue(ps2xGuestBumpFree(end), "free last separator");
+    t.IsTrue(ps2xGuestBumpFree(filler), "free filler");
+}
 
 namespace
 {
@@ -157,6 +191,10 @@ namespace
 
 void register_ps2_memory_tests()
 {
+    MiniTest::Case("CompatibilityHeap", [](TestCase &tc)
+    {
+        tc.Run("best fit preserves a large allocation under fragmentation", checkCompatibilityHeapFragmentation);
+    });
     MiniTest::Case("PS2Memory", [](TestCase &tc)
     {
         tc.Run("uncached aliases map to same RDRAM bytes", [](TestCase &t)
