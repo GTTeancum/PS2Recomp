@@ -775,7 +775,7 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
     if (slot != kMaxPendingStores)
     {
         PendingStore &store = m_storePipeline[slot];
-        store = {};
+        std::memset(&store, 0, sizeof(store));
         store.valid = true;
         store.readyCycle = m_cycle + 1u;
         store.address = address;
@@ -797,7 +797,7 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
     if (slot != kMaxPendingVfWrites)
     {
         PendingVfWrite &write = m_vfWritePipeline[slot];
-        write = {};
+        std::memset(&write, 0, sizeof(write));
         write.valid = true;
         write.readyCycle = m_cycle + latency;
         write.sequence = ++m_nextWriteSequence;
@@ -824,7 +824,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
     if (slot != kMaxPendingViWrites)
     {
         PendingViWrite &write = m_viWritePipeline[slot];
-        write = {};
+        std::memset(&write, 0, sizeof(write));
         write.valid = true;
         write.readyCycle = m_cycle + latency;
         write.sequence = ++m_nextWriteSequence;
@@ -846,7 +846,7 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
     if (slot != kMaxPendingAccWrites)
     {
         PendingAccWrite &write = m_accWritePipeline[slot];
-        write = {};
+        std::memset(&write, 0, sizeof(write));
         write.valid = true;
         write.readyCycle = m_cycle + latency;
         write.sequence = ++m_nextWriteSequence;
@@ -865,6 +865,9 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
 
 void VU1Interpreter::commitReadyPipelines()
 {
+    // Pipeline defaults are integer/bool zero and positive float zero. Clear
+    // in place to avoid MSVC's aggregate stack temporary and reload sequence.
+    static_assert(std::bit_cast<uint32_t>(0.0f) == 0u);
 #if defined(PS2X_ENABLE_VU_DETAIL_PROFILE)
     RuntimeProfile::Scope profile(RuntimeProfile::Phase::VuRetire, RuntimeProfile::sampleVu);
 #endif
@@ -898,7 +901,7 @@ void VU1Interpreter::commitReadyPipelines()
         m_state.q = m_fdiv.value;
         const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
         m_state.status = (m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
-        m_fdiv = {};
+        std::memset(&m_fdiv, 0, sizeof(m_fdiv));
     }
 
     for (ScalarPipelineEntry &entry : m_efu)
@@ -906,7 +909,7 @@ void VU1Interpreter::commitReadyPipelines()
         if (entry.valid && entry.readyCycle <= m_cycle)
         {
             m_state.p = entry.value;
-            entry = {};
+            std::memset(&entry, 0, sizeof(entry));
         }
     }
 
@@ -927,7 +930,7 @@ void VU1Interpreter::commitReadyPipelines()
             }
             std::memcpy(m_activeVuData + store.address, oldWords, sizeof(oldWords));
         }
-        store = {};
+        std::memset(&store, 0, sizeof(store));
         m_storePipelineMask &= ~(1u << slot);
     }
 
@@ -945,7 +948,7 @@ void VU1Interpreter::commitReadyPipelines()
                 m_state.vf[write.reg][component] = write.value[component];
             }
         }
-        write = {};
+        std::memset(&write, 0, sizeof(write));
         m_vfWritePipelineMask &= ~(1u << slot);
     }
 
@@ -957,7 +960,7 @@ void VU1Interpreter::commitReadyPipelines()
             continue;
         if (m_viLatestWrite[write.reg] == write.sequence)
             m_state.vi[write.reg] = static_cast<int16_t>(write.value);
-        write = {};
+        std::memset(&write, 0, sizeof(write));
         m_viWritePipelineMask &= ~(1u << slot);
     }
 
@@ -975,7 +978,7 @@ void VU1Interpreter::commitReadyPipelines()
                 m_state.acc[component] = write.value[component];
             }
         }
-        write = {};
+        std::memset(&write, 0, sizeof(write));
         m_accWritePipelineMask &= ~(1u << slot);
     }
 }

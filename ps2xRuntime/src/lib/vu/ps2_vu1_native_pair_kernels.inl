@@ -599,6 +599,8 @@ private:
 
     static void retireReadyVf(VU1Interpreter *vu)
     {
+        // Match interpreter clearing without an aggregate stack temporary.
+        static_assert(std::bit_cast<uint32_t>(0.0f) == 0u);
         for (uint32_t slots = vu->m_vfWritePipelineMask; slots != 0u; slots &= slots - 1u)
         {
             const uint32_t slot = static_cast<uint32_t>(std::countr_zero(slots));
@@ -613,7 +615,7 @@ private:
                     vu->m_state.vf[write.reg][component] = write.value[component];
                 }
             }
-            write = {};
+            std::memset(&write, 0, sizeof(write));
             vu->m_vfWritePipelineMask &= ~(1u << slot);
         }
     }
@@ -628,7 +630,7 @@ private:
                 continue;
             if (vu->m_viLatestWrite[write.reg] == write.sequence)
                 vu->m_state.vi[write.reg] = static_cast<int16_t>(write.value);
-            write = {};
+            std::memset(&write, 0, sizeof(write));
             vu->m_viWritePipelineMask &= ~(1u << slot);
         }
     }
@@ -652,7 +654,7 @@ private:
                 }
                 std::memcpy(vu->m_activeVuData + store.address, words, sizeof(words));
             }
-            store = {};
+            std::memset(&store, 0, sizeof(store));
             vu->m_storePipelineMask &= ~(1u << slot);
         }
     }
@@ -732,7 +734,7 @@ private:
                 std::memcpy(value, vu->m_state.vf[upperUsage.writeReg], sizeof(value));
                 std::memcpy(vu->m_state.vf[upperUsage.writeReg], oldUpper, sizeof(oldUpper));
                 auto &pending = vu->m_vfWritePipeline[upperVfSlot];
-                pending = {};
+                std::memset(&pending, 0, sizeof(pending));
                 pending.valid = true;
                 pending.readyCycle = vu->m_cycle + upperLatency;
                 pending.sequence = sequence;
@@ -760,7 +762,7 @@ private:
                 std::memcpy(value, vu->m_state.vf[lowerUsage.vfWriteReg], sizeof(value));
                 std::memcpy(vu->m_state.vf[lowerUsage.vfWriteReg], oldLower, sizeof(oldLower));
                 auto &pending = vu->m_vfWritePipeline[lowerVfSlot];
-                pending = {};
+                std::memset(&pending, 0, sizeof(pending));
                 pending.valid = true;
                 pending.readyCycle = vu->m_cycle + upperLatency;
                 pending.sequence = sequence;
