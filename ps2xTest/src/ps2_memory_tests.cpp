@@ -98,7 +98,11 @@ static void checkCompatibilityHeapDispatch(TestCase &t)
     t.IsTrue(frontierBlock != 0u && filler != 0u, "fill tail without triggering an earlier allocation failure");
     SET_GPR_U32(&ctx, 4, retained);
     SET_GPR_U32(&ctx, 5, 0x20000u);
-    t.IsTrue(runtime.dispatchGuestBranch(ram.data(), &ctx, 0x200E10u, 0x800000u,
+    runtime.registerFunction(0x800100u, [](uint8_t *memory, R5900Context *c, PS2Runtime *r) {
+        r->dispatchGuestBranch(memory, c, 0x200E10u, 0x800000u,
+            0x800008u, Kind::DirectCall, "nested-failed-realloc-test");
+    });
+    t.IsTrue(runtime.dispatchGuestBranch(ram.data(), &ctx, 0x800100u, 0x800200u,
         fallthrough, Kind::DirectCall, "failed-realloc-test"), "failed realloc returns to caller");
     t.Equals(::getRegU32(&ctx, 2), 0u, "failed realloc returns null");
     t.Equals(ps2xGuestBumpAllocationSize(retained), 64u, "failed dispatch retains old allocation");
@@ -177,6 +181,32 @@ static void checkCompatibilityHeapReallocation(TestCase &t)
         "foreign allocation rejected without freeing it");
     t.IsTrue(ps2xGuestBumpFree(address), "original block still freeable");
     for (uint32_t block : fillers) t.IsTrue(ps2xGuestBumpFree(block), "release filler");
+}
+
+static void checkCompatibilityHeapTailJoin(TestCase &t)
+{
+    std::vector<uint8_t> ram(PS2_RAM_SIZE, 0xA5);
+    constexpr uint32_t limit = 0x1800000u;
+    const uint32_t headSize = 0xF00000u - 0x11000u - 16u;
+    const uint32_t head = ps2xGuestBumpAlloc(ram.data(), headSize, 16u);
+    const uint32_t tail = ps2xGuestBumpAlloc(ram.data(), 0x10000u, 16u);
+    t.IsTrue(head != 0u && tail != 0u, "tail join setup succeeds");
+    t.Equals(tail, head + headSize, "tail follows live head");
+    ram[tail - 1u] = 0x6Bu;
+    t.IsTrue(ps2xGuestBumpFree(tail), "release frontier extent");
+    const uint32_t joined = ps2xGuestBumpAlloc(ram.data(), 0x10800u, 256u);
+    t.Equals(joined, (tail + 255u) & ~255u, "join honors requested alignment");
+    t.Equals(ps2xGuestBumpAllocationSize(joined), 0x10800u, "joined ownership records full request");
+    t.Equals(ram[tail - 1u], uint8_t{0x6B}, "join preserves neighboring live allocation");
+    t.IsTrue(std::all_of(ram.begin() + joined, ram.begin() + joined + 0x10800u,
+        [](uint8_t value) { return value == 0; }), "joined allocation is cleared");
+    t.Equals(ram[limit], uint8_t{0xA5}, "native heap boundary untouched");
+    const uint32_t prefix = ps2xGuestBumpAlloc(ram.data(), 16u, 16u);
+    t.Equals(prefix, tail, "alignment prefix remains reusable");
+    t.Equals(ps2xGuestBumpAlloc(ram.data(), 0x1000u, 16u), 0u, "unavailable space still fails");
+    t.IsTrue(ps2xGuestBumpFree(prefix), "release alignment prefix");
+    t.IsTrue(ps2xGuestBumpFree(joined), "release joined allocation");
+    t.IsTrue(ps2xGuestBumpFree(head), "release head");
 }
 
 static void checkCompatibilityHeapFragmentation(TestCase &t)
@@ -360,6 +390,7 @@ void register_ps2_memory_tests()
         tc.Run("best fit preserves a large allocation under fragmentation", checkCompatibilityHeapFragmentation);
         tc.Run("reallocation preserves ownership and resizes safely", checkCompatibilityHeapReallocation);
         tc.Run("public allocator dispatch preserves heap ownership", checkCompatibilityHeapDispatch);
+        tc.Run("free frontier joins untouched tail", checkCompatibilityHeapTailJoin);
     });
     MiniTest::Case("PS2Memory", [](TestCase &tc)
     {

@@ -348,6 +348,7 @@ namespace
         const GuestHeapCallScope *previous;
         const R5900Context *context;
         uint32_t source, target;
+        uint32_t entryA0, entryA1;
         bool enabled;
         GuestHeapCallScope(const R5900Context *ctx, uint32_t from, uint32_t to)
         {
@@ -359,6 +360,8 @@ namespace
                 context = ctx;
                 source = from;
                 target = to;
+                entryA0 = ::getRegU32(ctx, 4);
+                entryA1 = ::getRegU32(ctx, 5);
                 g_guestHeapCall = this;
             }
         }
@@ -994,6 +997,30 @@ extern "C" uint32_t ps2xGuestBumpAlloc(uint8_t *rdram, uint32_t size, uint32_t a
         const uint32_t next = aligned + paddedSize;
         if (next >= kGuestBumpAllocatorLimit || next < aligned)
         {
+            // A free extent ending at the frontier and the untouched tail are
+            // one contiguous range, even when neither can satisfy this request.
+            {
+                std::lock_guard<std::mutex> lock(g_guestBumpAllocationMutex);
+                for (size_t i = 0; i < g_guestBumpFreeBlocks.size(); ++i)
+                {
+                    const auto [address, bytes] = g_guestBumpFreeBlocks[i];
+                    if (address + bytes != current) continue;
+                    const uint32_t joined = (address + mask) & ~mask;
+                    const uint64_t joinedEnd = uint64_t{joined} + paddedSize;
+                    if (joined < address || joinedEnd >= kGuestBumpAllocatorLimit) break;
+                    const uint32_t frontier = std::max(current, static_cast<uint32_t>(joinedEnd));
+                    if (!s_bump.compare_exchange_strong(current, frontier,
+                            std::memory_order_acq_rel, std::memory_order_relaxed)) break;
+                    g_guestBumpFreeBlocks.erase(g_guestBumpFreeBlocks.begin() + static_cast<std::ptrdiff_t>(i));
+                    if (joined != address) g_guestBumpFreeBlocks.emplace_back(address, joined - address);
+                    if (joinedEnd < current)
+                        g_guestBumpFreeBlocks.emplace_back(static_cast<uint32_t>(joinedEnd), current - static_cast<uint32_t>(joinedEnd));
+                    g_guestBumpAllocationSizes[joined] = size;
+                    std::memset(rdram + joined, 0, paddedSize);
+                    traceXmenOverlapAllocation(joined, "joined-tail");
+                    return joined;
+                }
+            }
             static const bool diagnostics = std::getenv("PS2X_GUEST_BUMP_DIAGNOSTICS") != nullptr;
             if (diagnostics)
             {
@@ -1030,6 +1057,9 @@ extern "C" uint32_t ps2xGuestBumpAlloc(uint8_t *rdram, uint32_t size, uint32_t a
                                 ::getRegU32(call->context, 5), ::getRegU32(call->context, 6),
                                 ::getRegU32(call->context, 7), ::getRegU32(call->context, 16),
                                 ::getRegU32(call->context, 17), formatDispatchHistory().c_str());
+                            for (uint32_t depth = 0; call && depth < 12u; ++depth, call = call->previous)
+                                std::fprintf(stderr, "[heap:call-chain] depth=%u source=0x%x target=0x%x a0=0x%x a1=0x%x\n",
+                                    depth, call->source, call->target, call->entryA0, call->entryA1);
                         }
                     }
                     std::fprintf(stderr, "[heap:allocation-failed] size=%u alignment=%u bump=%u tail=%u free=%llu largest=%u live=%zu\n",
