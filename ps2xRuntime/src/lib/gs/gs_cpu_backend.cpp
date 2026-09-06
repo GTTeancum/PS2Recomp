@@ -1,4 +1,5 @@
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_color_filter.h"
 #include "runtime/runtime_profile.h"
 #include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_psmct16.h"
@@ -17,6 +18,10 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <stdexcept>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 using namespace GSInternal;
 
@@ -747,6 +752,51 @@ namespace
         const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
         return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
     }
+}
+
+namespace GSColorFilter
+{
+    uint32_t bilinearScalar(uint32_t c00, uint32_t c10, uint32_t c01, uint32_t c11,
+                            float fx, float fy)
+    {
+        uint32_t result = 0;
+        for (unsigned shift = 0; shift < 32; shift += 8)
+            result |= uint32_t(lerpChannel(uint8_t(c00 >> shift), uint8_t(c10 >> shift),
+                uint8_t(c01 >> shift), uint8_t(c11 >> shift), fx, fy)) << shift;
+        return result;
+    }
+
+#if defined(_MSC_VER)
+#pragma float_control(precise, on, push)
+#endif
+    uint32_t bilinearPacked(uint32_t c00, uint32_t c10, uint32_t c01, uint32_t c11,
+                            float fx, float fy)
+    {
+#if defined(_MSC_VER) && defined(__AVX2__)
+        const auto unpack = [](uint32_t color) {
+            return _mm_cvtepi32_ps(_mm_cvtepu8_epi32(_mm_cvtsi32_si128(static_cast<int>(color))));
+        };
+        const __m128 a = unpack(c00), b = unpack(c10), c = unpack(c01), d = unpack(c11);
+        const __m128 x = _mm_set1_ps(fx), y = _mm_set1_ps(fy);
+        const __m128 top = _mm_add_ps(_mm_mul_ps(_mm_sub_ps(b, a), x), a);
+        const __m128 bottom = _mm_add_ps(_mm_mul_ps(_mm_sub_ps(d, c), x), c);
+        const __m128 value = _mm_add_ps(_mm_mul_ps(_mm_sub_ps(bottom, top), y), top);
+        // Adding 0.5 before truncation can round a value just below a tie up.
+        // Compare the fractional part instead, preserving lround's tie rule.
+        const __m128i whole = _mm_cvttps_epi32(value);
+        const __m128 fraction = _mm_sub_ps(value, _mm_cvtepi32_ps(whole));
+        const __m128i roundUp = _mm_and_si128(_mm_castps_si128(_mm_cmpge_ps(fraction, _mm_set1_ps(0.5f))),
+                                             _mm_set1_epi32(1));
+        const __m128i rounded = _mm_add_epi32(whole, roundUp);
+        const __m128i words = _mm_packs_epi32(rounded, rounded);
+        return static_cast<uint32_t>(_mm_cvtsi128_si32(_mm_packus_epi16(words, words)));
+#else
+        return bilinearScalar(c00, c10, c01, c11, fx, fy);
+#endif
+    }
+#if defined(_MSC_VER)
+#pragma float_control(pop)
+#endif
 }
 
 namespace
@@ -3596,31 +3646,23 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
     const uint32_t c01 = samplePoint(u0, v1);
     const uint32_t c11 = samplePoint(u1, v1);
 
-    const uint8_t r = lerpChannel(static_cast<uint8_t>(c00 & 0xFFu),
-                                  static_cast<uint8_t>(c10 & 0xFFu),
-                                  static_cast<uint8_t>(c01 & 0xFFu),
-                                  static_cast<uint8_t>(c11 & 0xFFu),
-                                  fx, fy);
-    const uint8_t g = lerpChannel(static_cast<uint8_t>((c00 >> 8) & 0xFFu),
-                                  static_cast<uint8_t>((c10 >> 8) & 0xFFu),
-                                  static_cast<uint8_t>((c01 >> 8) & 0xFFu),
-                                  static_cast<uint8_t>((c11 >> 8) & 0xFFu),
-                                  fx, fy);
-    const uint8_t b = lerpChannel(static_cast<uint8_t>((c00 >> 16) & 0xFFu),
-                                  static_cast<uint8_t>((c10 >> 16) & 0xFFu),
-                                  static_cast<uint8_t>((c01 >> 16) & 0xFFu),
-                                  static_cast<uint8_t>((c11 >> 16) & 0xFFu),
-                                  fx, fy);
-    const uint8_t a = lerpChannel(static_cast<uint8_t>((c00 >> 24) & 0xFFu),
-                                  static_cast<uint8_t>((c10 >> 24) & 0xFFu),
-                                  static_cast<uint8_t>((c01 >> 24) & 0xFFu),
-                                  static_cast<uint8_t>((c11 >> 24) & 0xFFu),
-                                  fx, fy);
-
-    return static_cast<uint32_t>(r) |
-           (static_cast<uint32_t>(g) << 8) |
-           (static_cast<uint32_t>(b) << 16) |
-           (static_cast<uint32_t>(a) << 24);
+    const uint32_t filtered = GSColorFilter::bilinearPacked(c00, c10, c01, c11, fx, fy);
+    static const bool verifyFilter = std::getenv("PS2X_GS_VERIFY_BILINEAR") != nullptr;
+    if (verifyFilter)
+    {
+        const uint32_t expected = GSColorFilter::bilinearScalar(c00, c10, c01, c11, fx, fy);
+        if (filtered != expected)
+        {
+            std::fprintf(stderr, "[gs:bilinear-audit-failed] actual=%08x expected=%08x xy=%.9g/%.9g\n",
+                filtered, expected, fx, fy);
+            throw std::runtime_error("GS packed bilinear differs from scalar filtering");
+        }
+        static thread_local uint64_t samples = 0;
+        if ((++samples & 1048575u) == 1)
+            std::fprintf(stderr, "[gs:bilinear-audit] samples=%llu mismatches=0\n",
+                static_cast<unsigned long long>(samples));
+    }
+    return filtered;
 }
 
 void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)

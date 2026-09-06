@@ -5,6 +5,7 @@
 #include "ps2_syscalls.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_color_filter.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
@@ -15,6 +16,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <cfenv>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <thread>
@@ -415,6 +418,69 @@ void register_ps2_gs_tests()
 {
     MiniTest::Case("PS2GS", [](TestCase &tc)
     {
+        tc.Run("GS packed bilinear preserves scalar colors and halfway rounding", [](TestCase &t)
+        {
+            struct RestoreRounding
+            {
+                int saved = std::fegetround();
+                ~RestoreRounding() { std::fesetround(saved); }
+            } restore;
+            uint32_t random = 0x953ad74b;
+            const auto next = [&]() {
+                random ^= random << 13; random ^= random >> 17; random ^= random << 5;
+                return random;
+            };
+            uint64_t cases = 0;
+            const auto check = [&](uint32_t a, uint32_t b, uint32_t c, uint32_t d, float x, float y) {
+                const auto expected = GSColorFilter::bilinearScalar(a, b, c, d, x, y);
+                const auto actual = GSColorFilter::bilinearPacked(a, b, c, d, x, y);
+                ++cases;
+                if (actual != expected)
+                    std::printf("[gs:filter-diff] mode=%d rgba=%08x/%08x/%08x/%08x xy=%.9g/%.9g actual=%08x expected=%08x\n",
+                        std::fegetround(), a, b, c, d, x, y, actual, expected);
+                return actual == expected;
+            };
+            for (int mode : {FE_TONEAREST, FE_TOWARDZERO, FE_DOWNWARD, FE_UPWARD})
+            {
+                if (std::fesetround(mode) != 0) { t.Fail("Rounding mode must be available"); return; }
+                for (unsigned i = 0; i < 200000; ++i)
+                {
+                    const uint32_t a = next(), b = next(), c = next(), d = next();
+                    const float x = float(next() & 0xffffffu) / 16777216.0f;
+                    const float y = float(next() & 0xffffffu) / 16777216.0f;
+                    if (!check(a,b,c,d,x,y)) { t.Fail("Packed random colors differ"); return; }
+                }
+                for (unsigned a = 0; a < 256; ++a)
+                for (unsigned b = 0; b < 256; ++b)
+                for (float x : {0.0f, std::nextafter(0.0f, 1.0f), std::nextafter(0.5f, 0.0f),
+                    0.5f, std::nextafter(0.5f, 1.0f), std::nextafter(1.0f, 0.0f), 1.0f})
+                {
+                    const uint32_t left = a * 0x01010101u, right = b * 0x01010101u;
+                    if (!check(left,right,left,right,x,0.25f)) { t.Fail("Packed boundary colors differ"); return; }
+                }
+            }
+            std::printf("[gs:filter-check] cases=%llu modes=4 mismatches=0\n", static_cast<unsigned long long>(cases));
+        });
+        tc.Run("GS packed bilinear benchmark preserves the scalar checksum", [](TestCase &t)
+        {
+            if (!std::getenv("PS2X_GS_FILTER_BENCH")) return;
+            uint32_t checksums[2]{};
+            for (unsigned mode = 0; mode < 2; ++mode)
+            {
+                const auto filter = mode ? GSColorFilter::bilinearPacked : GSColorFilter::bilinearScalar;
+                uint32_t random = 0x1a63c842;
+                const auto begin = std::chrono::steady_clock::now();
+                for (unsigned i = 0; i < 1048576; ++i)
+                {
+                    random ^= random << 13; random ^= random >> 17; random ^= random << 5;
+                    checksums[mode] += filter(random, random ^ 0xa71c59e3u, ~random, random * 37u,
+                        float(i & 1023u) / 1024.0f, float((i >> 10) & 1023u) / 1024.0f);
+                }
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+                std::printf("[gs:filter-bench] packed=%u iterations=1048576 ms=%.3f checksum=%08x\n", mode, ms, checksums[mode]);
+            }
+            t.Equals(checksums[0], checksums[1], "Both filter kernels preserve every accumulated channel");
+        });
         tc.Run("GS CSR/IMR support coherent 64-bit and 32-bit access", [](TestCase &t)
         {
             PS2Memory mem;
