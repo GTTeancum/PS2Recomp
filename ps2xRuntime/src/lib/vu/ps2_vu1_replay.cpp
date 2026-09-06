@@ -2,6 +2,9 @@
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/gs/gs_frontend.h"
+#if defined(PS2X_ENABLE_VU_COMPILED_ENGINE)
+#include "runtime_adapter.h"
+#endif
 
 #include <algorithm>
 #include <bit>
@@ -422,6 +425,7 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
 {
     if (executing) executing->store(false, std::memory_order_relaxed);
     Result result;
+    const bool hybrid = std::getenv("PS2X_VU_REPLAY_COMPILED") != nullptr;
     std::map<uint32_t, uint64_t> fetches;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t>, uint64_t> executedPairs;
     std::map<std::pair<uint32_t, uint32_t>, uint64_t> executedEdges;
@@ -434,6 +438,12 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
         *residualPairs = {};
     try
     {
+#if !defined(PS2X_ENABLE_VU_COMPILED_ENGINE)
+        require(!hybrid, "Compiled VU engine was not included in this build");
+#endif
+        require(!hybrid || (!upperSamples && !pairSamples && !residualPairs &&
+            !std::getenv("PS2X_VU_REPLAY_MEMORY_TRACE_CASE")),
+            "Hybrid verification cannot use instruction-level tracing");
 #if !defined(PS2X_ENABLE_VU_PAIR_PROFILE)
         require(residualPairs == nullptr, "Residual pair profiling was not compiled into this build");
 #endif
@@ -463,6 +473,40 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
         GS gs;
         gs.init(memory->getGSVRAM(), PS2_GS_VRAM_SIZE, &memory->gs());
         auto vu = std::make_unique<VU1Interpreter>();
+#if defined(PS2X_ENABLE_VU_COMPILED_ENGINE)
+        auto expected = hybrid ? std::make_unique<VU1Interpreter>() : nullptr;
+        uint64_t compiledCases = 0, compiledCalls = 0;
+        // Completed drains may have different inert queue slots and sequence
+        // numbers. Require identical architectural values and no live work on
+        // either side; fallback results still require the original exact state.
+        const auto completedState = [](const VU1Interpreter &v) {
+            require(v.m_unit == VU1Interpreter::Unit::VU1 && !v.m_running &&
+                !v.m_stopRequested && !v.m_pendingHaltD && !v.m_pendingHaltT &&
+                !v.m_state.ebit && !v.m_state.haltAfterDelaySlot && !v.m_state.branchPending &&
+                !v.m_state.dBitEnabled && !v.m_state.tBitEnabled &&
+                !v.m_state.stoppedByD && !v.m_state.stoppedByT &&
+                !v.m_xgkick.active && !v.m_fdiv.valid && !v.m_viBranchBackupValid &&
+                !v.m_flagPipelineMask && !v.m_storePipelineMask && !v.m_vfWritePipelineMask &&
+                !v.m_viWritePipelineMask && !v.m_accWritePipelineMask &&
+                v.m_cycle == v.m_state.cycles && v.m_efuResourceReady <= v.m_cycle &&
+                v.m_workingClip == v.m_state.clip, "Hybrid result is not fully drained");
+            const auto empty = [](const auto &queue) {
+                return std::none_of(queue.begin(), queue.end(), [](const auto &e) { return e.valid; });
+            };
+            require(empty(v.m_efu) && empty(v.m_flagPipeline) && empty(v.m_storePipeline) &&
+                empty(v.m_vfWritePipeline) && empty(v.m_viWritePipeline) && empty(v.m_accWritePipeline),
+                "Hybrid drain retains a live pipeline slot");
+            for (const auto &reg : v.m_vfReady)
+                for (const auto ready : reg) require(ready <= v.m_cycle, "Hybrid VF deadline remains pending");
+            for (const auto ready : v.m_viReady) require(ready <= v.m_cycle, "Hybrid VI deadline remains pending");
+            for (const auto ready : v.m_accReady) require(ready <= v.m_cycle, "Hybrid ACC deadline remains pending");
+            auto s = v.m_state;
+            Writer w;
+            w(s.vf, s.acc, s.q, s.p, s.i, s.r, s.pc, s.mac, s.clip, s.status, s.cycles, s.top, s.itop);
+            for (const auto value : s.vi) { auto bits = static_cast<uint16_t>(value); w(bits); }
+            return w.bytes;
+        };
+#endif
 #if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
         vu->setUpperLookup(upperLookup);
 #endif
@@ -505,7 +549,7 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
             require(vu->m_cycle >= initialCycle, "Invalid VU replay cycle ordering");
             const auto elapsedCycles = vu->m_cycle - initialCycle;
             require(elapsedCycles <= (1u << 21u), "Invalid VU replay elapsed cycles");
-            totalCycles += elapsedCycles * (static_cast<uint64_t>(repeats) + 1u);
+            totalCycles += elapsedCycles * (static_cast<uint64_t>(repeats) + (hybrid ? 2u : 1u));
             require(totalCycles <= 100000000u, "VU replay exceeds its execution budget");
             for (uint32_t offset = 0; offset < PS2_VU1_CODE_SIZE; offset += 8u)
             {
@@ -514,9 +558,17 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
                 memory->write64(PS2_VU1_CODE_BASE + offset, pair);
             }
             memory->gs().vsyncTick.store(record.tick, std::memory_order_relaxed);
+#if defined(PS2X_ENABLE_VU_COMPILED_ENGINE)
+            if (hybrid) loadState(record.after, *expected);
+#endif
             uint64_t caseNs = 0;
-            for (uint32_t iteration = 0; iteration <= repeats; ++iteration)
+            for (uint32_t iteration = 0; iteration <= repeats + (hybrid ? 1u : 0u); ++iteration)
             {
+                const bool warm = iteration > (hybrid ? 1u : 0u);
+#if defined(PS2X_ENABLE_VU_COMPILED_ENGINE)
+                ScopedCompiledVuMode mode(hybrid && iteration != 0);
+                const auto countsBefore = compiledVuCounters();
+#endif
                 loadState(record.before, *vu);
                 std::memcpy(memory->getVU1Data(), record.data.data(), record.data.size());
                 Context context;
@@ -528,7 +580,7 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
                 const auto start = std::chrono::steady_clock::now();
                 {
                     ContextScope scope(context);
-                    ExecutionScope execution(iteration != 0u ? executing : nullptr);
+                    ExecutionScope execution(warm ? executing : nullptr);
 #if defined(PS2X_ENABLE_VU_PAIR_PROFILE)
                     VUPairProfile::Scope pairProfile(iteration == 0u ? residualPairs : nullptr, vu.get());
 #endif
@@ -605,8 +657,26 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
                 const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - start).count();
                 const auto actual = saveState(*vu);
+                bool stateMatches = actual == record.after;
+#if defined(PS2X_ENABLE_VU_COMPILED_ENGINE)
+                const auto countsAfter = compiledVuCounters();
+                const auto committed = countsAfter.accepted - countsBefore.accepted;
+                require(committed <= 1 && (!committed || (hybrid && iteration != 0)),
+                    "Unexpected compiled execution during replay");
+                if (committed)
+                {
+                    stateMatches = completedState(*vu) == completedState(*expected);
+                    ++compiledCalls;
+                    if (iteration == 1) ++compiledCases;
+                }
+                if (hybrid && iteration == 1)
+                    std::printf("[vu-replay:compiled] case=%u committed=%llu attempts=%llu raw-state=%u architecture=%u\n",
+                        result.cases, static_cast<unsigned long long>(committed),
+                        static_cast<unsigned long long>(countsAfter.attempted - countsBefore.attempted),
+                        unsigned(actual == record.after), unsigned(stateMatches));
+#endif
                 require(!residualPairs || !residualPairs->overflow, "Residual pair profile exceeds its limit");
-                if (actual != record.after || context.overflow || context.gifs.bytes != record.gifs ||
+                if (!stateMatches || context.overflow || context.gifs.bytes != record.gifs ||
                     std::memcmp(memory->getVU1Data(), record.afterData.data(), record.afterData.size()) != 0)
                 {
                     size_t stateOffset = 0u;
@@ -626,6 +696,7 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
                     result.error = "Replay mismatch in case " + std::to_string(result.cases) +
                         " pc=" + std::to_string(initialPc) + " iteration=" + std::to_string(iteration) +
                         " state=" + std::to_string(actual == record.after) +
+                        " architecture=" + std::to_string(stateMatches) +
                         " state-offset=" + std::to_string(stateOffset) +
                         " state-byte=" + std::to_string(actualByte) + "/" + std::to_string(expectedByte) +
                         " state-word=" + std::to_string(actualWord) + "/" + std::to_string(expectedWord) +
@@ -633,8 +704,9 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
                         " gifs=" + std::to_string(context.gifs.bytes == record.gifs);
                     return result;
                 }
-                // The first iteration validates a cold decode cache but is not timed.
-                if (iteration != 0u)
+                // Hybrid mode first verifies the unchanged raw reference, then
+                // performs one untimed compiled/fallback pass before warm timing.
+                if (warm)
                 {
                     ++result.iterations;
                     result.executeNs += static_cast<uint64_t>(ns);
@@ -650,6 +722,11 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
             ++result.cases;
         }
         require(result.cases != 0u && !input.bad(), "Empty or unreadable VU replay file");
+#if defined(PS2X_ENABLE_VU_COMPILED_ENGINE)
+        if (hybrid)
+            std::printf("[vu-replay:compiled-summary] cases=%llu calls=%llu baseline-raw-verified=1\n",
+                static_cast<unsigned long long>(compiledCases), static_cast<unsigned long long>(compiledCalls));
+#endif
 #if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
         result.nativeUpper = vu->upperCounters().native;
         result.interpretedUpper = vu->upperCounters().interpreted;

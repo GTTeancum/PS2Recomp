@@ -6,6 +6,9 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_vu1_detail.h"
+#if defined(PS2X_ENABLE_VU_COMPILED_ENGINE)
+#include "runtime_adapter.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -2510,6 +2513,11 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         VUReplay::captureSlice(*this, vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles))
         return;
     RuntimeProfile::Scope vuProfile(RuntimeProfile::Phase::Vu);
+#if defined(PS2X_ENABLE_VU_COMPILED_ENGINE)
+    if (maxCycles > 64 && compiledVuEnabled() &&
+        tryCompiledVuDrain(*this, vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles))
+        return;
+#endif
 #if defined(PS2X_ENABLE_VU_NATIVE_PAIRS) && defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
     static const bool coverageRequested = std::getenv("PS2X_VU_COVERAGE_PROFILE") != nullptr;
     if (coverageRequested && m_unit == Unit::VU1 && memory)

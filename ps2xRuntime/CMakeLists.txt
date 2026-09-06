@@ -621,6 +621,11 @@ endif()
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VUNativeUpper.cmake")
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VUNativePairs.cmake")
 
+set(PS2X_VU_COMPILED_ENGINE_DIR "" CACHE PATH "Optional external full-drain VU engine")
+if(PS2X_VU_COMPILED_ENGINE_DIR)
+    include("${PS2X_VU_COMPILED_ENGINE_DIR}/runtime-engine.cmake")
+endif()
+
 if(WIN32 AND NOT PS2X_SHOW_WINDOWS_CONSOLE)
     if(MSVC)
         target_link_options(ps2EntryRunner PRIVATE
