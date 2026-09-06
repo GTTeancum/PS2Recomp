@@ -592,6 +592,86 @@ void register_ps2_vu1_tests()
         });
 #endif
 #if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
+        tc.Run("native VU block flag batching preserves incoming conflicts and pending tails", [](TestCase &t)
+        {
+            Vu1Fixture referenceFx, nativeFx;
+            if (!referenceFx.initialize() || !nativeFx.initialize())
+            {
+                t.IsTrue(false, "Block flag fixtures must initialize");
+                return;
+            }
+            constexpr uint32_t startPc = 0x3d00u;
+            constexpr uint32_t words[] = {0x01e208e8u, 0x000209ffu, 0x01e2092au,
+                kVuUpperNop, 0x01e20969u, 0x000209ffu, kVuUpperNop, 0x01e209acu};
+            for (auto *fx : {&referenceFx, &nativeFx})
+            {
+                for (uint32_t index = 0u; index < 8u; ++index)
+                    writeTrackedVuInstructionPair(*fx, startPc + index * 8u, 0u, words[index]);
+                writeTrackedVuInstructionPair(*fx, startPc + 64u, 0u, kVuUpperNop | 0x40000000u);
+                writeTrackedVuInstructionPair(*fx, startPc + 72u, 0u, kVuUpperNop);
+            }
+            for (uint32_t pattern = 0u; pattern < 216u; ++pattern)
+            for (uint32_t budget : {0u, 1u, 4u, 7u, 8u, 9u, 12u})
+            for (bool batch : {false, true})
+            {
+                uint32_t kinds = pattern;
+                for (uint32_t index = 0u; index < 3u; ++index)
+                {
+                    const uint32_t kind = kinds % 6u;
+                    kinds /= 6u;
+                    const uint32_t upper = kind == 1u || kind == 4u
+                        ? makeVuUpper(0x28u, 0xFu, 2u, 1u, 7u)
+                        : kind == 2u || kind == 5u
+                        ? makeVuUpperSpecial(0x1Fu, 0u, 2u, 1u) : kVuUpperNop;
+                    const uint32_t lower = kind == 3u || kind == 4u
+                        ? makeVuFlagImmediate(0x15u, 0u, 0xA80u)
+                        : kind == 5u ? (0x11u << 25u) | 0x123456u : 0u;
+                    for (auto *fx : {&referenceFx, &nativeFx})
+                        writeTrackedVuInstructionPair(*fx, startPc - 24u + index * 8u, lower, upper);
+                }
+                VU1Interpreter reference, native;
+                for (auto *vu : {&reference, &native})
+                {
+                    const uint32_t bits[] = {0x00800000u, 0x7f7fffffu, 0x80000000u, 0xbf800000u};
+                    for (uint32_t lane = 0u; lane < 4u; ++lane)
+                    {
+                        std::memcpy(&vu->state().vf[1][lane], &bits[lane], 4u);
+                        vu->state().vf[2][lane] = lane == 0u ? 0.5f : 2.0f;
+                        vu->state().acc[lane] = -1.0f;
+                    }
+                    vu->state().status = 0xC30u;
+                    vu->state().clip = 0x654321u;
+                }
+                reference.execute(referenceFx.code, PS2_VU1_CODE_SIZE, referenceFx.data,
+                    PS2_VU1_DATA_SIZE, referenceFx.gs, &referenceFx.mem, startPc - 24u, 0u, 0u, 3u);
+                native.execute(nativeFx.code, PS2_VU1_CODE_SIZE, nativeFx.data,
+                    PS2_VU1_DATA_SIZE, nativeFx.gs, &nativeFx.mem, startPc - 24u, 0u, 0u, 3u);
+                native.setNativeBlocksEnabled(true);
+                native.setNativeBlockFlagBatchEnabled(batch);
+                for (uint32_t cycles : {budget, 1u, 1u, 1u, 16u})
+                {
+                    std::ostringstream expected(std::ios::binary), actual(std::ios::binary);
+                    t.IsTrue(VUReplay::record(expected, reference, referenceFx.code, referenceFx.data,
+                        referenceFx.gs, &referenceFx.mem, cycles), "Reference flags must record");
+                    t.IsTrue(VUReplay::record(actual, native, nativeFx.code, nativeFx.data,
+                        nativeFx.gs, &nativeFx.mem, cycles), "Native flags must record");
+                    if (expected.str() != actual.str())
+                    {
+                        std::fprintf(stderr, "[vu-block-flags] pattern=%u budget=%u slice=%u batch=%u\n",
+                            pattern, budget, cycles, static_cast<unsigned>(batch));
+                        t.IsTrue(false, "Flag batching must preserve full state and queue bytes");
+                        return;
+                    }
+                }
+                if (budget >= 8u)
+                {
+                    t.IsTrue(native.blockCounters().pairs >= 8u, "Flag test must execute its native block");
+                    t.Equals(native.blockCounters().flagBatchedPairs, batch ? uint64_t{8} : uint64_t{0},
+                        "Flag test must exercise the requested execution path");
+                }
+            }
+        });
+
         tc.Run("native VU arithmetic preserves boundary flags and caller rounding", [](TestCase &t)
         {
             Vu1Fixture referenceFx;

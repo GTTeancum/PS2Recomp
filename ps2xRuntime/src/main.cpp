@@ -315,6 +315,8 @@ int main(int argc, char *argv[])
 #if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
         const bool nativeBlocks = std::getenv("PS2X_VU_NATIVE_BLOCKS") != nullptr;
         runtime.vu1().setNativeBlocksEnabled(nativeBlocks);
+        runtime.vu1().setNativeBlockFlagBatchEnabled(
+            std::getenv("PS2X_VU_BATCH_FLAGS") != nullptr);
         std::fprintf(stderr, "[vu:blocks] mode=%s\n", nativeBlocks ? "native-with-fallback" : "interpreter");
 #endif
         runtime.run();

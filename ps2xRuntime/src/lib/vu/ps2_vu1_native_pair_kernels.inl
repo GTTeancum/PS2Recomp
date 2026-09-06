@@ -83,6 +83,7 @@ struct VUNativeUpperUsage
     uint8_t writeLanes = 0u;
     uint8_t accRead = 0u;
     uint8_t accWrite = 0u;
+    bool writesFlags = false;
     bool valid = false;
 };
 
@@ -316,6 +317,8 @@ consteval VUNativeUpperUsage nativeUpperUsage()
     if constexpr (op <= 0x2Fu)
     {
         usage.valid = true;
+        usage.writesFlags = dest != 0u && !(op >= 0x10u && op <= 0x17u) &&
+            op != 0x1Du && op != 0x1Fu && op != 0x2Bu && op != 0x2Fu;
         addRead(fs, dest);
         if constexpr (fd != 0u && dest != 0u)
         {
@@ -349,6 +352,7 @@ consteval VUNativeUpperUsage nativeUpperUsage()
         constexpr bool writesClip = special == 0x1Fu;
         constexpr bool isNop = special == 0x2Fu || special == 0x30u;
         usage.valid = writesAcc || writesVf || writesClip || isNop;
+        usage.writesFlags = (writesAcc && dest != 0u) || writesClip;
         if constexpr (writesAcc)
         {
             addRead(fs, dest);
@@ -571,29 +575,34 @@ private:
         return (matchesPair<Words, Index>(code, startPc) && ...);
     }
 
-    static void retireReadyFlags(VU1Interpreter *vu)
+    static void retireFlagSlot(VU1Interpreter *vu, uint32_t slot)
+    {
+        auto &entry = vu->m_flagPipeline[slot];
+        if (entry.writesMac)
+            vu->m_state.mac = entry.mac;
+        if (entry.writesStatus)
+        {
+            const uint32_t current = entry.status & 0xFu;
+            vu->m_state.status = (vu->m_state.status & 0xFF0u) |
+                current | ((current | entry.extraSticky) << 6u);
+        }
+        if (entry.writesSticky)
+            vu->m_state.status = (vu->m_state.status & 0x03Fu) | (entry.status & 0xFC0u);
+        if (entry.writesClip)
+            vu->m_state.clip = entry.clip;
+        std::memset(&entry, 0, sizeof(entry));
+        vu->m_flagPipelineMask &= ~(1u << slot);
+    }
+
+    static void retireReadyFlags(VU1Interpreter *vu, uint64_t readyCycle)
     {
         for (uint32_t slots = vu->m_flagPipelineMask; slots != 0u; slots &= slots - 1u)
         {
             const uint32_t slot = static_cast<uint32_t>(std::countr_zero(slots));
             auto &entry = vu->m_flagPipeline[slot];
-            if (entry.readyCycle > vu->m_cycle)
+            if (entry.readyCycle > readyCycle)
                 continue;
-            if (entry.writesMac)
-                vu->m_state.mac = entry.mac;
-            if (entry.writesStatus)
-            {
-                const uint32_t current = entry.status & 0xFu;
-                vu->m_state.status = (vu->m_state.status & 0xFF0u) |
-                    current | ((current | entry.extraSticky) << 6u);
-            }
-            if (entry.writesSticky)
-                vu->m_state.status = (vu->m_state.status & 0x03Fu) | (entry.status & 0xFC0u);
-            if (entry.writesClip)
-                vu->m_state.clip = entry.clip;
-            // All fields are integer/bool zeros; avoid MSVC's aggregate temporary and copy.
-            std::memset(&entry, 0, sizeof(entry));
-            vu->m_flagPipelineMask &= ~(1u << slot);
+            retireFlagSlot(vu, slot);
         }
     }
 
@@ -635,10 +644,10 @@ private:
         }
     }
 
-    template <size_t Index, typename Words, uint8_t QueuedVf>
+    template <size_t Index, typename Words, uint8_t QueuedVf, uint8_t FlagMode>
     static void executeFastPair(
         VU1Interpreter *vu,
-        uint8_t upperVfSlot, uint8_t lowerVfSlot)
+        uint8_t upperVfSlot, uint8_t lowerVfSlot, uint8_t flagSlot)
     {
         constexpr VUNativeUpperUsage upperUsage = nativeUpperUsage<Words::upper>();
         constexpr VUNativeLowerUsage lowerUsage =
@@ -667,7 +676,7 @@ private:
             ? vu->m_state.vi[lowerUsage.viWriteReg] : 0;
 
         ++vu->m_pairCounters.native;
-        vu->template execUpperNative<Words::upper>();
+        vu->template execUpperNative<Words::upper, FlagMode>(flagSlot);
         if constexpr ((Words::upper & 0x80000000u) != 0u)
         {
             float immediate = 0.0f;
@@ -798,7 +807,8 @@ private:
         }
         ++vu->m_cycle;
         vu->m_state.cycles = vu->m_cycle;
-        retireReadyFlags(vu);
+        if constexpr (FlagMode == 0u)
+            retireReadyFlags(vu, vu->m_cycle);
         retireReadyVf(vu);
         retireReadyVi(vu);
         if (lowerUsage.viWriteReg != 0u && lowerUsage.viLatency == 1u &&
@@ -810,11 +820,12 @@ private:
             vu->progressXgkick();
     }
 
-    template <typename PairTuple, auto Schedule, size_t... Index>
+    template <typename PairTuple, auto Schedule, bool BatchFlags, size_t... Index>
     static void executeFastPairs(
         VU1Interpreter *vu, uint64_t blockEndCycle,
         const std::array<uint8_t, sizeof...(Index)> &upperVfSlots,
         const std::array<uint8_t, sizeof...(Index)> &lowerVfSlots,
+        const std::array<uint8_t, sizeof...(Index)> &flagSlots,
                                  std::index_sequence<Index...>)
     {
         const auto issuePair = [&]<size_t PairIndex>()
@@ -828,10 +839,100 @@ private:
                 }
             }
             executeFastPair<PairIndex, std::tuple_element_t<PairIndex, PairTuple>,
-                           Schedule.queuedVf[PairIndex]>(
-                vu, upperVfSlots[PairIndex], lowerVfSlots[PairIndex]);
+                           Schedule.queuedVf[PairIndex],
+                           !BatchFlags ? 0u : Schedule.issue[PairIndex] + 4u <= Schedule.cycles ? 1u : 2u>(
+                vu, upperVfSlots[PairIndex], lowerVfSlots[PairIndex], flagSlots[PairIndex]);
         };
         (issuePair.template operator()<Index>(), ...);
+    }
+
+    template <typename... Words>
+    static bool prepareBatchedFlags(
+        VU1Interpreter *vu, std::array<uint8_t, sizeof...(Words)> &flagSlots)
+    {
+        constexpr auto schedule = nativeBlockSchedule<Words...>();
+        constexpr std::array<bool, sizeof...(Words)> writesFlags = {
+            nativeUpperUsage<Words::upper>().writesFlags...};
+        constexpr uint32_t validSlots = (1u << VU1Interpreter::kMaxFlagEntries) - 1u;
+        if constexpr (schedule.cycles < VU1Interpreter::kFmacLatency)
+            return false;
+        // Keep externally observed transfers and unusual restored deadlines on
+        // the serial path. Ordinary incoming flags mature before the first new
+        // result, so they can be folded first without changing sticky ordering.
+        if (!vu->m_nativeBlockFlagBatchEnabled || vu->m_xgkick.active)
+            return false;
+        uint32_t mask = vu->m_flagPipelineMask;
+        uint32_t key = mask;
+        std::array<uint64_t, VU1Interpreter::kMaxFlagEntries> deadlines{};
+        for (uint32_t slots = mask; slots != 0u; slots &= slots - 1u)
+        {
+            const uint32_t slot = static_cast<uint32_t>(std::countr_zero(slots));
+            const uint64_t ready = vu->m_flagPipeline[slot].readyCycle;
+            if (ready >= vu->m_cycle + VU1Interpreter::kFmacLatency)
+                return false;
+            deadlines[slot] = ready;
+            const uint32_t offset = ready > vu->m_cycle
+                ? static_cast<uint32_t>(ready - vu->m_cycle) : 0u;
+            key |= offset << (8u + 2u * slot);
+        }
+
+        struct Plan
+        {
+            uint32_t key = UINT32_MAX;
+            uint32_t touched = 0u;
+            std::array<uint8_t, sizeof...(Words)> slots{};
+            std::array<uint8_t, VU1Interpreter::kMaxFlagEntries> incoming{};
+            uint8_t incomingCount = 0u;
+        };
+        // A block's schedule depends on relative deadlines, not flag values.
+        // Reuse it for repeated loop entries; never cache architectural results.
+        static thread_local Plan plan;
+        if (plan.key != key)
+        {
+        Plan next;
+        next.key = key;
+        for (uint32_t offset = 0u; offset < VU1Interpreter::kFmacLatency; ++offset)
+            for (uint32_t slots = mask; slots != 0u; slots &= slots - 1u)
+            {
+                const uint32_t slot = static_cast<uint32_t>(std::countr_zero(slots));
+                if (((key >> (8u + 2u * slot)) & 3u) == offset)
+                    next.incoming[next.incomingCount++] = static_cast<uint8_t>(slot);
+            }
+        uint32_t touched = 0u;
+        for (size_t index = 0u; index < sizeof...(Words); ++index)
+        {
+            const uint64_t issue = vu->m_cycle + schedule.issue[index];
+            for (uint32_t slots = mask; slots != 0u; slots &= slots - 1u)
+            {
+                const uint32_t slot = static_cast<uint32_t>(std::countr_zero(slots));
+                if (deadlines[slot] <= issue)
+                    mask &= ~(1u << slot);
+            }
+            if (!writesFlags[index])
+                continue;
+            const uint32_t available = ~mask & validSlots;
+            if (available == 0u)
+                return false;
+            const uint32_t slot = static_cast<uint32_t>(std::countr_zero(available));
+            next.slots[index] = static_cast<uint8_t>(slot);
+            mask |= 1u << slot;
+            touched |= 1u << slot;
+            deadlines[slot] = issue + VU1Interpreter::kFmacLatency;
+        }
+        next.touched = touched;
+        plan = next;
+        }
+        flagSlots = plan.slots;
+        for (uint32_t index = 0u; index < plan.incomingCount; ++index)
+            retireFlagSlot(vu, plan.incoming[index]);
+        // Preserve canonical inactive queue bytes, including slots used only by
+        // results folded inside this block. Tail writes fill their original slots.
+        for (uint32_t slots = plan.touched; slots != 0u; slots &= slots - 1u)
+        {
+            auto &entry = vu->m_flagPipeline[std::countr_zero(slots)];
+            std::memset(&entry, 0, sizeof(entry));
+        }
+        return true;
     }
 
     template <size_t Index, typename Words, size_t Count>
@@ -1051,9 +1152,16 @@ public:
                 break;
             }
             const uint64_t blockEndCycle = vu->m_cycle + schedule.cycles;
-            executeFastPairs<PairTuple, schedule>(vu, blockEndCycle, upperVfSlots,
-                                        lowerVfSlots,
-                                        std::make_index_sequence<pairCount>{});
+            std::array<uint8_t, pairCount> flagSlots{};
+            if (prepareBatchedFlags<PairWords...>(vu, flagSlots))
+            {
+                executeFastPairs<PairTuple, schedule, true>(vu, blockEndCycle,
+                    upperVfSlots, lowerVfSlots, flagSlots, std::make_index_sequence<pairCount>{});
+                vu->m_blockCounters.flagBatchedPairs += pairCount;
+            }
+            else
+                executeFastPairs<PairTuple, schedule, false>(vu, blockEndCycle,
+                    upperVfSlots, lowerVfSlots, flagSlots, std::make_index_sequence<pairCount>{});
             executed += static_cast<uint32_t>(pairCount);
         } while (vu->m_state.pc == StartPc &&
                  budgetEnd - vu->m_cycle >= schedule.cycles);

@@ -439,19 +439,29 @@ uint32_t VU1Interpreter::calculateFmacProductStickyFor(uint8_t dest, const FmacO
     return extraSticky;
 }
 
-template <uint8_t Dest>
+template <uint8_t Dest, uint8_t FlagMode>
 void VU1Interpreter::updateFmacFlagsFor(const uint8_t laneFlags[4],
-                                        uint32_t extraSticky)
+                                        uint32_t extraSticky, uint8_t flagSlot)
 {
     static_assert(Dest <= 0xFu);
+    static_assert(FlagMode <= 2u);
     if constexpr (Dest == 0u)
         return;
 
     const auto flags = VUFlags::packFmac(laneFlags, Dest);
 
+    if constexpr (FlagMode == 1u)
+    {
+        // Only used inside a fully guarded block with no flag readers.
+        m_state.mac = flags.mac;
+        m_state.status = (m_state.status & 0xFF0u) | flags.status |
+            ((flags.status | extraSticky) << 6u);
+        return;
+    }
+
     const uint32_t available =
         (~m_flagPipelineMask) & ((1u << kMaxFlagEntries) - 1u);
-    const uint32_t slot = available != 0u
+    const uint32_t slot = FlagMode == 2u ? flagSlot : available != 0u
         ? static_cast<uint32_t>(std::countr_zero(available))
         : kMaxFlagEntries;
     if (slot == kMaxFlagEntries)
@@ -473,8 +483,8 @@ void VU1Interpreter::updateFmacFlagsFor(const uint8_t laneFlags[4],
     m_flagPipelineMask |= 1u << slot;
 }
 
-template <uint64_t Word>
-void VU1Interpreter::applyFmacDestFor(float *dst, float *result, uint8_t dest, const FmacOperands *prepared)
+template <uint64_t Word, uint8_t FlagMode>
+void VU1Interpreter::applyFmacDestFor(float *dst, float *result, uint8_t dest, const FmacOperands *prepared, uint8_t flagSlot)
 {
     uint8_t laneFlags[4]{};
     normalizeFmacResultFor<Word>(result, dest, laneFlags, prepared);
@@ -482,13 +492,13 @@ void VU1Interpreter::applyFmacDestFor(float *dst, float *result, uint8_t dest, c
     if constexpr (Word == kDynamicUpper)
         updateFmacFlags(laneFlags, dest, extraSticky);
     else
-        updateFmacFlagsFor<static_cast<uint8_t>((Word >> 21u) & 0xFu)>(
-            laneFlags, extraSticky);
+        updateFmacFlagsFor<static_cast<uint8_t>((Word >> 21u) & 0xFu), FlagMode>(
+            laneFlags, extraSticky, flagSlot);
     applyDest(dst, result, dest);
 }
 
-template <uint64_t Word>
-void VU1Interpreter::applyFmacDestAccFor(float *result, uint8_t dest, const FmacOperands *prepared)
+template <uint64_t Word, uint8_t FlagMode>
+void VU1Interpreter::applyFmacDestAccFor(float *result, uint8_t dest, const FmacOperands *prepared, uint8_t flagSlot)
 {
     uint8_t laneFlags[4]{};
     normalizeFmacResultFor<Word>(result, dest, laneFlags, prepared);
@@ -496,8 +506,8 @@ void VU1Interpreter::applyFmacDestAccFor(float *result, uint8_t dest, const Fmac
     if constexpr (Word == kDynamicUpper)
         updateFmacFlags(laneFlags, dest, extraSticky);
     else
-        updateFmacFlagsFor<static_cast<uint8_t>((Word >> 21u) & 0xFu)>(
-            laneFlags, extraSticky);
+        updateFmacFlagsFor<static_cast<uint8_t>((Word >> 21u) & 0xFu), FlagMode>(
+            laneFlags, extraSticky, flagSlot);
     applyDestAcc(result, dest);
 }
 

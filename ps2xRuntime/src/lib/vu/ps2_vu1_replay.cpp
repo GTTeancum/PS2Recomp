@@ -462,6 +462,7 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
 #endif
 #if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
         vu->setNativeBlocksEnabled(std::getenv("PS2X_VU_REPLAY_BLOCKS") != nullptr);
+        vu->setNativeBlockFlagBatchEnabled(std::getenv("PS2X_VU_BATCH_FLAGS") != nullptr);
 #endif
         size_t totalBytes = 0;
         uint64_t totalCycles = 0;
@@ -641,6 +642,8 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
                          static_cast<unsigned long long>(counters.attempted),
                          static_cast<unsigned long long>(counters.executed),
                          static_cast<unsigned long long>(counters.pairs));
+            std::fprintf(stderr, "[vu-replay:flag-batch] pairs=%llu\n",
+                         static_cast<unsigned long long>(counters.flagBatchedPairs));
         }
 #endif
         if (upperSamples)
