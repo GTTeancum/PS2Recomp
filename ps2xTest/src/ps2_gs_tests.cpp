@@ -3831,6 +3831,145 @@ void register_ps2_gs_tests()
                      "REGION_REPEAT should calculate (U & UMSK) | UFIX");
         });
 
+        tc.Run("GS prepared indexed sampler preserves palette transitions and live feedback", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GSCpuBackend backend;
+            backend.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
+            uint64_t hash = 14695981039346656037ull;
+            uint32_t cases = 0;
+            for (uint8_t source : {GS_PSM_T8, GS_PSM_T8H, GS_PSM_T4, GS_PSM_T4HL, GS_PSM_T4HH})
+            for (uint8_t palette : {GS_PSM_CT32, GS_PSM_CT24, GS_PSM_CT16, GS_PSM_CT16S})
+            for (uint8_t bank : {0u, 1u, 15u, 31u})
+            for (bool linear : {false, true})
+            {
+                GSPrimitiveBatch batch{};
+                auto &state = batch.state;
+                auto &ctx = state.context;
+                state.prim.type = GS_PRIM_SPRITE;
+                state.prim.tme = state.prim.fst = true;
+                state.textureWidth = state.textureHeight = 16u;
+                state.linearFilter = linear;
+                ctx.frame = {0u, 1u, GS_PSM_CT32, 0u};
+                ctx.zbuf.zmask = true;
+                ctx.scissor = {0u, 15u, 0u, 15u};
+                ctx.tex0.tbp0 = 2048u;
+                ctx.tex0.tbw = 1u;
+                ctx.tex0.psm = source;
+                ctx.tex0.cbp = 4096u;
+                ctx.tex0.cpsm = palette;
+                ctx.tex0.csa = bank;
+                ctx.tex0.csm = 1u;
+                ctx.tex0.tcc = ctx.tex0.tfx = 1u;
+                state.texclut.cbw = 1u;
+                batch.vertexCount = 2u;
+                batch.vertices[1].x = batch.vertices[1].y = 16.0f;
+                batch.vertices[1].u = batch.vertices[1].v = 16u * 16u;
+                batch.vertices[1].r = batch.vertices[1].g = batch.vertices[1].b = 128u;
+                batch.vertices[1].a = 128u;
+                for (uint32_t phase = 0; phase < 8; ++phase)
+                {
+                    for (uint32_t y = 0; y < 16; ++y)
+                    for (uint32_t x = 0; x < 16; ++x)
+                    {
+                        const uint32_t index = y * 16u + x;
+                        backend.WriteVram(source, 2048u, 1u, x, y, index + phase);
+                        backend.WriteVram(palette, 4096u, 1u, x, y,
+                            (index * 0x01020409u) ^ (phase * 0x73518269u));
+                    }
+                    if (phase == 6u) backend.Reset();
+                    constexpr uint8_t loads[] = {1u, 0u, 0u, 4u, 4u, 2u, 6u, 1u};
+                    ctx.tex0.cld = loads[phase];
+                    backend.LoadClut(ctx.tex0, state.texclut);
+                    state.texa = {static_cast<uint8_t>(phase * 19u), (phase & 1u) != 0u,
+                                  static_cast<uint8_t>(255u - phase * 23u)};
+                    ctx.clamp = (phase & 3ull) | ((phase >> 1u) << 2u) |
+                        (3ull << 4u) | (12ull << 14u) | (2ull << 24u) | (13ull << 34u);
+                    // Last draw writes over its own live index storage. A decoded
+                    // texture-image cache would incorrectly hide those writes.
+                    ctx.frame.fbp = phase == 7u ? 64u : 0u;
+                    backend.Submit(batch);
+                    backend.Submit(batch); // Reuse the prepared state without a palette load.
+                    for (uint32_t y = 0; y < 16; ++y)
+                    for (uint32_t x = 0; x < 16; ++x)
+                        hash = (hash ^ backend.ReadVram(GS_PSM_CT32, ctx.frame.fbp * 32u, 1u, x, y)) * 1099511628211ull;
+                    ++cases;
+                }
+            }
+            std::printf("[gs-indexed-differential] cases=%u hash=%016llx\n", cases,
+                        static_cast<unsigned long long>(hash));
+            t.Equals(cases, 1280u, "all indexed formats, palette banks, filters and transitions run");
+            t.Equals(hash, uint64_t{0xda0ce5b7a3b6a9e5ull}, "palette transitions retain the reference framebuffer checksum");
+        });
+
+        tc.Run("GS indexed textured triangle benchmark retains framebuffer checksum", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GSCpuBackend backend;
+            backend.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
+            GSPrimitiveBatch batch{};
+            batch.vertexCount = 3u;
+            auto &state = batch.state;
+            auto &ctx = state.context;
+            state.prim.type = GS_PRIM_TRIANGLE;
+            state.prim.tme = state.prim.iip = true;
+            state.textureWidth = state.textureHeight = 64u;
+            state.linearFilter = true;
+            ctx.frame = {0u, 3u, GS_PSM_CT32, 0u};
+            ctx.zbuf.zmask = true;
+            ctx.scissor = {0u, 159u, 0u, 111u};
+            ctx.tex0.tbp0 = 2048u;
+            ctx.tex0.tbw = 1u;
+            ctx.tex0.psm = GS_PSM_T8;
+            ctx.tex0.cbp = 4096u;
+            ctx.tex0.cpsm = GS_PSM_CT32;
+            ctx.tex0.tcc = 1u;
+            ctx.tex0.cld = 1u;
+            for (uint32_t y = 0; y < 64; ++y)
+            for (uint32_t x = 0; x < 64; ++x)
+                backend.WriteVram(GS_PSM_T8, 2048u, 1u, x, y, (x * 7u + y * 13u) & 255u);
+            for (uint32_t y = 0; y < 16; ++y)
+            for (uint32_t x = 0; x < 16; ++x)
+                backend.WriteVram(GS_PSM_CT32, 4096u, 1u, x, y, 0x80000000u | ((x + y * 16u) * 0x010307u));
+            backend.LoadClut(ctx.tex0, state.texclut);
+            batch.vertices[1].x = 160.0f;
+            batch.vertices[2].y = 112.0f;
+            for (uint32_t i = 0; i < 3; ++i)
+            {
+                auto &v = batch.vertices[i];
+                v.s = i == 1u ? 2.0f : -0.2f;
+                v.t = i == 2u ? 1.5f : -0.1f;
+                v.q = 0.5f + static_cast<float>(i);
+                v.r = static_cast<uint8_t>(70u + i * 30u);
+                v.g = static_cast<uint8_t>(140u - i * 20u);
+                v.b = 128u; v.a = 128u;
+            }
+            for (uint32_t scenario = 0; scenario < 4; ++scenario)
+            {
+                const uint32_t draws = scenario == 0u ? 512u : 23424u;
+                const uint32_t reloadEvery = scenario == 2u ? 8u : scenario == 3u ? 1u : 0u;
+                batch.vertices[1].x = scenario == 0u ? 160.0f : 8.0f;
+                batch.vertices[2].y = scenario == 0u ? 112.0f : 8.0f;
+                backend.Submit(batch);
+                const auto start = std::chrono::steady_clock::now();
+                for (uint32_t i = 0; i < draws; ++i)
+                {
+                    if (reloadEvery && i % reloadEvery == 0u) backend.LoadClut(ctx.tex0, state.texclut);
+                    backend.Submit(batch);
+                }
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+                uint64_t hash = 14695981039346656037ull;
+                for (uint32_t y = 0; y < 112; ++y)
+                for (uint32_t x = 0; x < 160; ++x)
+                    hash = (hash ^ backend.ReadVram(GS_PSM_CT32, 0u, 3u, x, y)) * 1099511628211ull;
+                std::printf("[gs-indexed-benchmark] scenario=%u draws=%u reload=%u ms=%.3f hash=%016llx\n",
+                            scenario, draws, reloadEvery, ms, static_cast<unsigned long long>(hash));
+                t.Equals(hash, scenario == 0u ? uint64_t{0xe0b47b3066d49e9eull} : uint64_t{0x0c1456a835c30febull},
+                         "benchmark output retains its reference framebuffer checksum");
+                t.IsTrue(backend.ReadVram(GS_PSM_CT32, 0u, 3u, 2u, 2u) != 0u, "textured interior is drawn");
+            }
+        });
+
         tc.Run("GS early depth preserves GEQUAL and GREATER stores across Z formats", [](TestCase &t)
         {
             for (uint8_t format : {GS_PSM_Z32, GS_PSM_Z24, GS_PSM_Z16, GS_PSM_Z16S})

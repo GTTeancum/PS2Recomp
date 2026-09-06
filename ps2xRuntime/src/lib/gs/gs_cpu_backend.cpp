@@ -1102,6 +1102,8 @@ void GSCpuBackend::Reset()
 
 void GSCpuBackend::ResetUnlocked()
 {
+    m_preparedPaletteValid = false;
+    m_usePreparedTexture = false;
     m_clutCache.fill(0u);
     m_clutCbp.fill(0u);
     m_transfer = {};
@@ -1277,6 +1279,7 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
     if (!shouldLoad)
         return;
 
+    m_preparedPaletteValid = false;
     for (uint32_t i = 0u; i < count; ++i)
     {
         const uint32_t cacheIndex = base + i;
@@ -1838,6 +1841,7 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
             std::memcpy(referenceVram.data(), m_vram, m_vramSize);
             referenceBackend.m_clutCache = m_clutCache;
             referenceBackend.m_clutCbp = m_clutCbp;
+            referenceBackend.m_preparedPaletteValid = false;
             DrawTriangle(batch);
             referenceBackend.DrawTriangle(batch, false);
             ++verifiedDepthBatches;
@@ -3526,7 +3530,53 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
     return texel;
 }
 
+void GSCpuBackend::PrepareTexture(const GSDrawState &state)
+{
+    static const bool enabled = std::getenv("PS2X_GS_PREPARED_TEXTURE") != nullptr;
+    const auto &tex = state.context.tex0;
+    m_usePreparedTexture = enabled && state.prim.tme && isIndexedPsm(tex.psm);
+    if (!m_usePreparedTexture) return;
+    m_textureReader = m_readVramFuncs[tex.psm & 0x3fu];
+    const uint32_t base = clutBaseIndex(tex.cpsm, tex.csa);
+    if (tex.cpsm == GS_PSM_CT32 && (base == 0u || isFourBitIndexedPsm(tex.psm)))
+    {
+        m_preparedColors = m_clutCache.data() + base;
+        return;
+    }
+    m_preparedColors = m_preparedPalette.data();
+    const uint64_t key = uint64_t(tex.psm) | (uint64_t(tex.cpsm) << 8u) |
+        (uint64_t(tex.csa) << 16u) | (uint64_t(state.texa.ta0) << 24u) |
+        (uint64_t(state.texa.ta1) << 32u) | (uint64_t(state.texa.aem) << 40u);
+    if (m_preparedPaletteValid && key == m_preparedPaletteKey) return;
+    // The GS palette is separate from live VRAM. Only an actual CLUT load or
+    // changed interpretation invalidates these colors, not a texture write.
+    for (uint32_t index = 0; index < m_preparedPalette.size(); ++index)
+        m_preparedPalette[index] = LookupCLUT(state, static_cast<uint8_t>(index), tex.cpsm, tex.csa, tex.psm);
+    m_preparedPaletteKey = key;
+    m_preparedPaletteValid = true;
+}
+
 uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v)
+{
+    if (!m_usePreparedTexture || s_xmenTraceTextureSample)
+        return SampleTextureImpl<false>(state, s, t, q, u, v);
+    const uint32_t color = SampleTextureImpl<true>(state, s, t, q, u, v);
+    static const bool verify = std::getenv("PS2X_GS_VERIFY_TEXTURE") != nullptr;
+    if (verify)
+    {
+        const uint32_t expected = SampleTextureImpl<false>(state, s, t, q, u, v);
+        if (color != expected)
+            throw std::runtime_error("GS prepared texture differs from reference sampler");
+        static thread_local uint64_t samples = 0;
+        if ((++samples & 1048575u) == 1u)
+            std::fprintf(stderr, "[gs:prepared-texture-audit] samples=%llu mismatches=0\n",
+                         static_cast<unsigned long long>(samples));
+    }
+    return color;
+}
+
+template<bool Prepared>
+uint32_t GSCpuBackend::SampleTextureImpl(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v)
 {
     const auto &ctx = state.context;
     const auto &tex = ctx.tex0;
@@ -3571,6 +3621,9 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
     {
         sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
         sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
+
+        if constexpr (Prepared)
+            return m_preparedColors[static_cast<uint8_t>(m_textureReader(m_vram, tex.tbp0, tex.tbw, sampleU, sampleV))];
 
         const u32 out = ReadVramUnlocked(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
         uint32_t texel = 0xFFFF00FFu;
@@ -3667,6 +3720,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
 
 void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
 {
+    PrepareTexture(batch.state);
     const GSDrawState &state = batch.state;
     const GSVertex &v0 = batch.vertices[0];
     const GSVertex &v1 = batch.vertices[1];
@@ -3831,6 +3885,7 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
 
 void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, bool allowEarlyDepth)
 {
+    PrepareTexture(batch.state);
     const GSDrawState &state = batch.state;
     const GSVertex &v0 = batch.vertices[0];
     const GSVertex &v1 = batch.vertices[1];
@@ -4005,6 +4060,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, bool allowEarlyDe
 
 void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
 {
+    PrepareTexture(batch.state);
     const GSDrawState &state = batch.state;
     const GSVertex &v0 = batch.vertices[0];
     const GSVertex &v1 = batch.vertices[1];

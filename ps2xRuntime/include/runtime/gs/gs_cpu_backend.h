@@ -47,6 +47,8 @@ private:
     void DrawLine(const GSPrimitiveBatch &batch);
     void WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
     uint32_t SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v);
+    void PrepareTexture(const GSDrawState &state);
+    template<bool Prepared> uint32_t SampleTextureImpl(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v);
     uint32_t LookupCLUT(const GSDrawState &state, uint8_t index, uint8_t cpsm, uint8_t csa, uint8_t sourcePsm);
 
     void PerformLocalToLocalTransfer();
@@ -73,6 +75,12 @@ private:
     std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
     std::array<uint32_t, 768> m_clutCache{};
     std::array<uint32_t, 2> m_clutCbp{};
+    std::array<uint32_t, 256> m_preparedPalette{};
+    const uint32_t *m_preparedColors = nullptr;
+    uint64_t m_preparedPaletteKey = 0;
+    bool m_preparedPaletteValid = false;
+    bool m_usePreparedTexture = false;
+    ReadVramFunc m_textureReader = nullptr;
 
     GSTransferCommand m_transfer{};
     GSTransferSnapshot m_transferState{};
