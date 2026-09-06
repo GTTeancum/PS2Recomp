@@ -236,8 +236,15 @@ namespace
     }
 }
 
+#if defined(PS2X_TEST_COMPILED_VU_PRODUCER)
+void register_compiled_vu_producer_tests();
+#endif
+
 void register_ps2_vu1_tests()
 {
+#if defined(PS2X_TEST_COMPILED_VU_PRODUCER)
+    register_compiled_vu_producer_tests();
+#endif
     MiniTest::Case("PS2VU1", [](TestCase &tc)
     {
         tc.Run("VU compiled state adapter validates before commit and resumes normally", [](TestCase &t)

@@ -143,3 +143,8 @@ include("${CMAKE_SOURCE_DIR}/ps2xRuntime/cmake/ReleaseMode.cmake")
 
 EnableFastReleaseMode(ps2_test_lib)
 EnableFastReleaseMode(ps2x_tests)
+
+set(PS2X_VU_COMPILED_TEST_DIR "" CACHE PATH "Optional external VU producer integration tests")
+if(PS2X_VU_COMPILED_TEST_DIR)
+    include("${PS2X_VU_COMPILED_TEST_DIR}/runtime-integration.cmake")
+endif()
