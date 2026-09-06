@@ -2571,6 +2571,11 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
     const uint64_t budgetEnd = m_cycle + maxCycles;
     bool programEnded = false;
+#if defined(PS2X_ENABLE_VU_COMPILED_ENGINE)
+    static const bool retryRequested = std::getenv("PS2X_VU_COMPILED_RETRY") != nullptr;
+    bool retryCompiled = retryRequested && m_unit == Unit::VU1 && maxCycles > 72 && compiledVuEnabled();
+    const uint64_t retryCycle = m_cycle + 8;
+#endif
 #if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
     static const bool storeTraceRequested =
         std::getenv("PS2X_TRACE_VU_STORE_ADDRESS_FIRST") != nullptr ||
@@ -2586,6 +2591,30 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         commitReadyPipelines();
     while (m_cycle < budgetEnd && !m_stopRequested)
     {
+#if defined(PS2X_ENABLE_VU_COMPILED_ENGINE)
+        if (retryCompiled && m_cycle >= retryCycle)
+        {
+            // A bounded interpreter prefix can retire entry-only pending work.
+            retryCompiled = false;
+            const auto remaining = static_cast<uint32_t>(budgetEnd - m_cycle);
+            if (remaining > 64 && tryCompiledVuDrain(*this, vuCode, codeSize,
+                    vuData, dataSize, gs, memory, remaining))
+            {
+                static const bool reportRetry = std::getenv("PS2X_VU_COMPILED_STATS") != nullptr;
+                if (reportRetry)
+                {
+                    static thread_local uint64_t accepted = 0;
+                    ++accepted;
+                    if (accepted <= 262144 && (accepted & 4095) == 1)
+                        std::fprintf(stderr, "[vu:compiled-retry] accepted=%llu\n",
+                            static_cast<unsigned long long>(accepted));
+                }
+                if (useVuRounding && previousRoundingMode != -1)
+                    std::fesetround(previousRoundingMode);
+                return;
+            }
+        }
+#endif
         if (m_state.pc + 8u > codeSize)
         {
             programEnded = true;

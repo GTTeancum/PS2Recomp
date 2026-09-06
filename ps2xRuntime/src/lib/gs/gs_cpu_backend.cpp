@@ -966,7 +966,8 @@ namespace
 
         const GSFrameReg display1 = decodeDisplayFrame(request.dispfb1);
         const GSFrameReg display2 = decodeDisplayFrame(request.dispfb2);
-        std::cerr << "[gs:black-present] index=" << index
+        std::ostringstream line;
+        line << "[gs:black-present] index=" << index
                   << " mode=" << mode
                   << " result=" << result.width << "x" << result.height
                   << " displayFbp=" << result.displayFbp
@@ -991,9 +992,9 @@ namespace
         {
             if (slot.count == 0u)
                 continue;
-            std::cerr << slot.page << ":" << slot.count << ",";
+            line << slot.page << ":" << slot.count << ",";
         }
-        std::cerr << std::endl;
+        std::fprintf(stderr, "%s\n", line.str().c_str());
     }
 }
 
