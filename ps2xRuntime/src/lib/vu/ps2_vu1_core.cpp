@@ -15,6 +15,7 @@
 #include <atomic>
 #include <bit>
 #include <cfenv>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -25,6 +26,67 @@
 
 namespace
 {
+    struct VuBudgetTotals
+    {
+        struct Entry { uint64_t calls = 0, ns = 0; };
+        std::array<Entry, 3> totals{};
+        std::array<std::array<Entry, 2048>, 2> entries{};
+        ~VuBudgetTotals()
+        {
+            constexpr const char *names[] = {"short", "long-reference", "long-compiled"};
+            for (unsigned kind = 0; kind < totals.size(); ++kind)
+                std::fprintf(stderr, "[vu:budget-profile] kind=%s calls=%llu ns=%llu\n", names[kind],
+                    static_cast<unsigned long long>(totals[kind].calls),
+                    static_cast<unsigned long long>(totals[kind].ns));
+            for (unsigned kind = 0; kind < entries.size(); ++kind)
+            {
+                std::array<unsigned, 2048> order{};
+                for (unsigned i = 0; i < order.size(); ++i) order[i] = i;
+                std::partial_sort(order.begin(), order.begin() + 8, order.end(),
+                    [&](unsigned a, unsigned b) { return entries[kind][a].ns > entries[kind][b].ns; });
+                for (unsigned rank = 0; rank < 8; ++rank)
+                {
+                    const auto pc = order[rank];
+                    const auto &entry = entries[kind][pc];
+                    if (entry.calls) std::fprintf(stderr,
+                        "[vu:budget-hotspot] kind=%s pc=0x%x calls=%llu ns=%llu\n", names[kind], pc * 8,
+                        static_cast<unsigned long long>(entry.calls), static_cast<unsigned long long>(entry.ns));
+                }
+            }
+        }
+    };
+
+    struct VuBudgetProfile
+    {
+        using Clock = std::chrono::steady_clock;
+        VuBudgetTotals *totals = nullptr;
+        Clock::time_point start;
+        unsigned kind = 0, pc = 0;
+        VuBudgetProfile(bool vu1, uint32_t budget, uint32_t entryPc)
+        {
+            static const bool enabled = std::getenv("PS2X_VU_BUDGET_PROFILE") != nullptr;
+            if (!enabled || !vu1) return;
+            static thread_local VuBudgetTotals collector;
+            totals = &collector;
+            kind = budget <= 64 ? 0 : 1;
+            pc = entryPc / 8;
+            start = Clock::now();
+        }
+        void compiled() { if (kind == 1) kind = 2; }
+        ~VuBudgetProfile()
+        {
+            if (!totals) return;
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
+            ++totals->totals[kind].calls;
+            totals->totals[kind].ns += ns;
+            if (kind < 2 && pc < 2048)
+            {
+                ++totals->entries[kind][pc].calls;
+                totals->entries[kind][pc].ns += ns;
+            }
+        }
+    };
+
     template <uint32_t Capacity>
     uint32_t firstAvailablePipelineSlot(uint32_t occupied)
     {
@@ -2513,10 +2575,14 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         VUReplay::captureSlice(*this, vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles))
         return;
     RuntimeProfile::Scope vuProfile(RuntimeProfile::Phase::Vu);
+    VuBudgetProfile budgetProfile(m_unit == Unit::VU1, maxCycles, m_state.pc);
 #if defined(PS2X_ENABLE_VU_COMPILED_ENGINE)
     if (maxCycles > 64 && compiledVuEnabled() &&
         tryCompiledVuDrain(*this, vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles))
+    {
+        budgetProfile.compiled();
         return;
+    }
 #endif
 #if defined(PS2X_ENABLE_VU_NATIVE_PAIRS) && defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
     static const bool coverageRequested = std::getenv("PS2X_VU_COVERAGE_PROFILE") != nullptr;
@@ -2600,6 +2666,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             if (remaining > 64 && tryCompiledVuDrain(*this, vuCode, codeSize,
                     vuData, dataSize, gs, memory, remaining))
             {
+                budgetProfile.compiled();
                 static const bool reportRetry = std::getenv("PS2X_VU_COMPILED_STATS") != nullptr;
                 if (reportRetry)
                 {
