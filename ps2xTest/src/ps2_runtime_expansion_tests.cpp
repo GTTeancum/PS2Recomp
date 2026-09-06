@@ -9,6 +9,7 @@
 #include "ps2_stubs.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/presentation_fps.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
 #include "ps2_runtime_macros.h"
 #include "Stubs/MPEG.h"
@@ -21,6 +22,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cmath>
 #include <cstring>
 #include <exception>
 #include <string>
@@ -335,6 +337,40 @@ void register_ps2_runtime_expansion_tests()
 {
     MiniTest::Case("PS2RuntimeExpansion", [](TestCase &tc)
     {
+        tc.Run("presentation FPS excludes host redraws and falls to zero during stalls", [](TestCase &t)
+        {
+            const PresentationFps::Clock::time_point start{};
+            PresentationFps fps(start);
+            t.Equals(fps.title("X-Men Legends"), std::string("X-Men Legends | -- FPS"),
+                "Warmup must not invent an FPS measurement");
+            for (int step = 1; step <= 100; ++step)
+            {
+                const bool updated = fps.update(start + std::chrono::milliseconds(step * 10), step % 25 == 0);
+                t.Equals(updated, step == 100, "Refresh title once per second, not once per host redraw");
+            }
+            t.IsTrue(std::abs(fps.fps() - 4.0) < 1e-9, "Only four fresh presentations occurred in 100 host redraws");
+            t.Equals(fps.title("X-Men Legends"), std::string("X-Men Legends | 4.0 FPS"),
+                "Title must include readable game name and measured FPS");
+            t.IsTrue(fps.update(start + std::chrono::seconds(2), false), "A stall must refresh the counter");
+            t.Equals(fps.fps(), 0.0, "No new frame must display zero rather than stale FPS");
+            t.IsTrue(fps.update(start + std::chrono::seconds(5), true), "Slow frames must use full elapsed time");
+            t.Equals(fps.title("X-Men Legends"), std::string("X-Men Legends | 0.3 FPS"),
+                "A three-second frame must not be counted as one FPS");
+        });
+
+        tc.Run("presentation FPS measures thirty frames and resets each sample window", [](TestCase &t)
+        {
+            const PresentationFps::Clock::time_point start{};
+            PresentationFps fps(start);
+            for (int step = 1; step <= 120; ++step)
+            {
+                const auto now = start + std::chrono::nanoseconds(static_cast<int64_t>(step) * 1000000000 / 60);
+                fps.update(now, step % 2 == 0);
+                if (step == 60 || step == 120)
+                    t.IsTrue(std::abs(fps.fps() - 30.0) < 1e-9, "Thirty game frames must not count as sixty host refreshes");
+            }
+        });
+
         tc.Run("differential decoder/codegen gpr-write contract for MULT and DIV families", [](TestCase &t)
         {
             R5900Decoder decoder;

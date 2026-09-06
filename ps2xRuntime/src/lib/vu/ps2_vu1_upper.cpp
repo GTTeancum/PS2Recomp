@@ -24,7 +24,7 @@ namespace
 // Upper instructions (FMAC pipeline)
 // ============================================================================
 #if defined(PS2X_BUILD_VU_NATIVE_UPPER) || defined(PS2X_BUILD_VU_NATIVE_PAIRS)
-template <uint32_t Word, uint8_t FlagMode> void VU1Interpreter::execUpperNative(uint8_t flagSlot)
+template <uint32_t Word> void VU1Interpreter::execUpperNative()
 {
     constexpr uint32_t instr = Word;
 #else
@@ -63,13 +63,13 @@ void VU1Interpreter::execUpper(uint32_t instr)
 #if defined(PS2X_BUILD_VU_NATIVE_UPPER) || defined(PS2X_BUILD_VU_NATIVE_PAIRS)
     // Flags use the same normalized inputs as the native arithmetic operation.
     const FmacOperands prepared{vs, vt, acc, q, i};
-    const auto applyFmacDest = [this, &prepared, flagSlot](float *dst, float *result, uint8_t dest)
+    const auto applyFmacDest = [this, &prepared](float *dst, float *result, uint8_t dest)
     {
-        applyFmacDestFor<Word, FlagMode>(dst, result, dest, &prepared, flagSlot);
+        applyFmacDestFor<Word>(dst, result, dest, &prepared);
     };
-    const auto applyFmacDestAcc = [this, &prepared, flagSlot](float *result, uint8_t dest)
+    const auto applyFmacDestAcc = [this, &prepared](float *result, uint8_t dest)
     {
-        applyFmacDestAccFor<Word, FlagMode>(result, dest, &prepared, flagSlot);
+        applyFmacDestAccFor<Word>(result, dest, &prepared);
     };
 #endif
 
@@ -440,27 +440,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
                 flags |= 0x10u;
             if (exceedsClipPlane(m_state.vf[fs][2], 0x80000000u))
                 flags |= 0x20u;
-#if defined(PS2X_BUILD_VU_NATIVE_UPPER) || defined(PS2X_BUILD_VU_NATIVE_PAIRS)
-            if constexpr (FlagMode != 0u)
-            {
-                m_workingClip = ((m_workingClip << 6u) | (flags & 0x3Fu)) & 0xFFFFFFu;
-                if constexpr (FlagMode == 1u)
-                    m_state.clip = m_workingClip;
-                else
-                {
-                    auto &entry = m_flagPipeline[flagSlot];
-                    std::memset(&entry, 0, sizeof(entry));
-                    entry.valid = true;
-                    entry.issueCycle = m_cycle;
-                    entry.readyCycle = m_cycle + kFmacLatency;
-                    entry.clip = m_workingClip;
-                    entry.writesClip = true;
-                    m_flagPipelineMask |= 1u << flagSlot;
-                }
-            }
-            else
-#endif
-                queueClip(flags);
+            queueClip(flags);
             return;
         }
         case 0x20: // ADDAq

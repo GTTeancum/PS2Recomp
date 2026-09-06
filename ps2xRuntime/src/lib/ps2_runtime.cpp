@@ -6,6 +6,7 @@
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/presentation_fps.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
@@ -60,6 +61,8 @@ extern "C" void ps2xGetXmenVif1Debug(
     uint32_t *chainChcr, uint32_t *chainEnded);
 
 static std::atomic<bool> g_xmenTitleBranchTraceArmed{false};
+// The host owns one raylib window; its title is set and used on the UI thread.
+static std::string g_hostWindowTitle;
 static std::atomic<uint32_t> g_xmenTitleBranchTraceCount{0u};
 static std::atomic<uint32_t> g_xmenMainBackIgbPackage{0u};
 static std::atomic<uint32_t> g_xmenMainBackIgbObjectEntries{0u};
@@ -998,7 +1001,7 @@ extern "C" bool ps2xGuestBumpFree(uint32_t address)
     return true;
 }
 
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+static bool UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static bool s_hasLatchedInitialFrame = false;
@@ -1023,7 +1026,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     {
         outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
         outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
-        return;
+        return false;
     }
 
     s_scratch.clear();
@@ -1047,7 +1050,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         s_lastWidth = outWidth;
         s_lastHeight = outHeight;
         s_hasUploadedFrame = true;
-        return;
+        return false;
     }
 
     PS2_IF_AGRESSIVE_LOGS({
@@ -1100,6 +1103,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     outWidth = width;
     outHeight = height;
     s_hasUploadedFrame = true;
+    return needsLatch;
 }
 
 PS2Runtime::PS2Runtime()
@@ -1382,6 +1386,9 @@ bool PS2Runtime::syncCoreSubsystems()
 
 bool PS2Runtime::initialize(const char *title)
 {
+    g_hostWindowTitle = title ? title : "PS2 Game";
+    const std::string initialTitle = PresentationFps(PresentationFps::Clock::now()).title(g_hostWindowTitle);
+    title = initialTitle.c_str();
     try
     {
         if (!m_memory.initialize())
@@ -13551,6 +13558,7 @@ void PS2Runtime::run()
         }
         gameThreadFinished.store(true, std::memory_order_release); });
 
+    PresentationFps presentationFps(PresentationFps::Clock::now());
     uint64_t tick = 0;
     bool xmenZeroPcLogged = false;
     std::ofstream xmenProgressTrace;
@@ -13987,7 +13995,7 @@ void PS2Runtime::run()
         });
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        UploadFrame(frameTex, this, presentWidth, presentHeight);
+        const bool newPresentation = UploadFrame(frameTex, this, presentWidth, presentHeight);
         m_audioBackend.update();
 
         BeginDrawing();
@@ -14011,6 +14019,9 @@ void PS2Runtime::run()
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
         EndDrawing();
+
+        if (presentationFps.update(PresentationFps::Clock::now(), newPresentation))
+            SetWindowTitle(presentationFps.title(g_hostWindowTitle).c_str());
 
         if (WindowShouldClose())
         {

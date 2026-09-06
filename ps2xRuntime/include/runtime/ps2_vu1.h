@@ -94,8 +94,7 @@ public:
 #endif
 #if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
     void setNativeBlocksEnabled(bool enabled) { m_nativeBlocksEnabled = enabled; }
-    void setNativeBlockFlagBatchEnabled(bool enabled) { m_nativeBlockFlagBatchEnabled = enabled; }
-    struct BlockCounters { uint64_t attempted = 0; uint64_t executed = 0; uint64_t pairs = 0; uint64_t flagBatchedPairs = 0; };
+    struct BlockCounters { uint64_t attempted = 0; uint64_t executed = 0; uint64_t pairs = 0; };
     BlockCounters blockCounters() const { return m_blockCounters; }
 #endif
 
@@ -299,7 +298,6 @@ private:
 #if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
     BlockCounters m_blockCounters{};
     bool m_nativeBlocksEnabled = false;
-    bool m_nativeBlockFlagBatchEnabled = true;
 #endif
 
     std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
@@ -359,7 +357,7 @@ private:
 
     PS2X_VU_ARITH_INLINE void execUpper(uint32_t instr);
 #if defined(PS2X_BUILD_VU_NATIVE_UPPER) || defined(PS2X_BUILD_VU_NATIVE_PAIRS)
-    template <uint32_t Word, uint8_t FlagMode = 0u> void execUpperNative(uint8_t flagSlot = 0u);
+    template <uint32_t Word> void execUpperNative();
 #endif
 #if defined(PS2X_BUILD_VU_NATIVE_PAIRS)
     template <uint32_t Word, bool DirectStore = false>
@@ -408,9 +406,9 @@ private:
     template <uint64_t Word> void normalizeFmacResultFor(float *result, uint8_t dest, uint8_t laneFlags[4], const FmacOperands *prepared);
     template <uint64_t Word> bool calculateFmacExactResultFor(uint32_t component, long double &result, const FmacOperands *prepared) const;
     template <uint64_t Word> uint32_t calculateFmacProductStickyFor(uint8_t dest, const FmacOperands *prepared) const;
-    template <uint8_t Dest, uint8_t FlagMode = 0u> void updateFmacFlagsFor(const uint8_t laneFlags[4], uint32_t extraSticky, uint8_t flagSlot = 0u);
-    template <uint64_t Word, uint8_t FlagMode = 0u> void applyFmacDestFor(float *dst, float *result, uint8_t dest, const FmacOperands *prepared = nullptr, uint8_t flagSlot = 0u);
-    template <uint64_t Word, uint8_t FlagMode = 0u> void applyFmacDestAccFor(float *result, uint8_t dest, const FmacOperands *prepared = nullptr, uint8_t flagSlot = 0u);
+    template <uint8_t Dest> void updateFmacFlagsFor(const uint8_t laneFlags[4], uint32_t extraSticky);
+    template <uint64_t Word> void applyFmacDestFor(float *dst, float *result, uint8_t dest, const FmacOperands *prepared = nullptr);
+    template <uint64_t Word> void applyFmacDestAccFor(float *result, uint8_t dest, const FmacOperands *prepared = nullptr);
     void updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky);
     void queueFsset(uint16_t immediate);
     void queueClip(uint32_t clip);

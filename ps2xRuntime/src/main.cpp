@@ -248,6 +248,9 @@ int main(int argc, char *argv[])
             windowTitle += elfName;
         }
 
+        if (normalizedId == "SLUS-20656")
+            windowTitle = "X-Men Legends";
+
         const char *nativeModulePath = std::getenv("PS2X_VU_NATIVE_MODULE");
 #if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
         // Declared before runtime so early-return unwinding cannot unload live kernels.
@@ -315,8 +318,6 @@ int main(int argc, char *argv[])
 #if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
         const bool nativeBlocks = std::getenv("PS2X_VU_NATIVE_BLOCKS") != nullptr;
         runtime.vu1().setNativeBlocksEnabled(nativeBlocks);
-        runtime.vu1().setNativeBlockFlagBatchEnabled(
-            std::getenv("PS2X_VU_BATCH_FLAGS") != nullptr);
         std::fprintf(stderr, "[vu:blocks] mode=%s\n", nativeBlocks ? "native-with-fallback" : "interpreter");
 #endif
         runtime.run();
