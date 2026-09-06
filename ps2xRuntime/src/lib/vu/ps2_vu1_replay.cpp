@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -469,7 +470,7 @@ bool VUReplay::record(std::ostream &output, VU1Interpreter &vu,
 
 bool VUReplay::CaptureSchedule::select(uint64_t tick, uint32_t maxCycles)
 {
-    if (tick < 1100u || maxCycles == 0u || maxCycles > (1u << 20u))
+    if (tick < firstTick || maxCycles == 0u || maxCycles > (1u << 20u))
         return false;
     random ^= random << 13u;
     random ^= random >> 17u;
@@ -493,7 +494,17 @@ bool VUReplay::captureSlice(VU1Interpreter &vu, uint8_t *code, uint32_t codeSize
         codeSize != PS2_VU1_CODE_SIZE || dataSize != PS2_VU1_DATA_SIZE || maxCycles > (1u << 20u))
         return false;
     static std::ofstream output;
-    static CaptureSchedule schedule;
+    static CaptureSchedule schedule = [] {
+        uint64_t first = 1100u;
+        if (const char *value = std::getenv("PS2X_VU_REPLAY_CAPTURE_START_TICK"))
+        {
+            const auto *end = value + std::char_traits<char>::length(value);
+            const auto parsed = std::from_chars(value, end, first);
+            require(parsed.ec == std::errc{} && parsed.ptr == end && first <= 1000000u,
+                "Invalid VU capture start tick");
+        }
+        return CaptureSchedule(first);
+    }();
     static bool finished = false;
     const auto tick = memory->gs().vsyncTick.load(std::memory_order_relaxed);
     if (finished || !schedule.select(tick, maxCycles))
@@ -510,6 +521,10 @@ bool VUReplay::captureSlice(VU1Interpreter &vu, uint8_t *code, uint32_t codeSize
     }
     const auto pc = vu.m_state.pc;
     const auto cycle = vu.m_cycle;
+#if defined(PS2X_ENABLE_VU_COMPILED_ENGINE)
+    // Record canonical queue state even when the surrounding run uses compiled drains.
+    ScopedCompiledVuMode reference(false);
+#endif
     const bool saved = record(output, vu, code, data, gs, memory, maxCycles);
     std::fprintf(stderr, "[vu-replay:capture] short=%u long=%u pc=0x%x budget=%u cycles=%llu saved=%u bytes=%lld tick=%llu\n",
                  schedule.shortCases, schedule.longCases, pc, maxCycles,

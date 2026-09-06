@@ -1312,6 +1312,19 @@ void register_ps2_vu1_tests()
             t.IsTrue(schedule.complete(), "Both capture quotas should complete");
             t.IsTrue(lastShort >= 1160u && lastLong >= 1160u,
                      "Captures must span at least sixty gameplay ticks");
+            for (uint64_t first : {0u, 530u, 1100u, 1000000u})
+            {
+                VUReplay::CaptureSchedule early(first), shifted;
+                if (first) t.IsTrue(!early.select(first - 1u, 64u), "Custom capture gate excludes earlier ticks");
+                bool equivalent = true;
+                for (uint64_t offset = 0; offset < 80; ++offset)
+                    for (unsigned i = 0; i < 8192; ++i)
+                    {
+                        const uint32_t cycles = (i & 1u) ? (1u << 20) : 64u;
+                        equivalent &= early.select(first + offset, cycles) == shifted.select(1100u + offset, cycles);
+                    }
+                t.IsTrue(equivalent && early.complete(), "Changing the start tick preserves sampling, spacing and both quotas");
+            }
         });
 
 #if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)

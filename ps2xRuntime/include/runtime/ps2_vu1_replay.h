@@ -21,11 +21,14 @@ class VUReplay
 public:
     struct CaptureSchedule
     {
+        explicit CaptureSchedule(uint64_t first = 1100u)
+            : firstTick(first), nextShortTick(first), nextLongTick(first) {}
         uint32_t shortCases = 0u;
         uint32_t longCases = 0u;
         uint32_t random = 0x57C019ABu;
-        uint64_t nextShortTick = 1100u;
-        uint64_t nextLongTick = 1100u;
+        uint64_t firstTick;
+        uint64_t nextShortTick;
+        uint64_t nextLongTick;
 
         bool select(uint64_t tick, uint32_t maxCycles);
         bool complete() const { return shortCases == 16u && longCases == 16u; }
