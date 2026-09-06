@@ -2731,11 +2731,17 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         if (decoded.pairKernel != nullptr && !xmenDiagnosticsEnabled())
         {
             ++m_pairCounters.native;
+#if defined(PS2X_ENABLE_VU_PAIR_PROFILE)
+            VUPairProfile::record(this, m_state.pc, decoded.lower, decoded.upper, true);
+#endif
             decoded.pairKernel(this, &decoded, vuData, dataSize, gs, memory);
         }
         else
         {
             ++m_pairCounters.interpreted;
+#endif
+#if defined(PS2X_ENABLE_VU_PAIR_PROFILE)
+        VUPairProfile::record(this, m_state.pc, decoded.lower, decoded.upper, false);
 #endif
         if (decoded.iBit)
         {

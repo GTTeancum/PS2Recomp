@@ -236,6 +236,46 @@ void register_ps2_vu1_tests()
 {
     MiniTest::Case("PS2VU1", [](TestCase &tc)
     {
+        tc.Run("VU residual pair profile separates code versions and bounds storage", [](TestCase &t)
+        {
+            VUPairProfile::Collector profile;
+            profile.record(0u, 1u, 2u, true);
+            profile.record(0u, 1u, 2u, false);
+            profile.record(0u, 1u, 3u, false);
+            t.Equals(profile.pairs.size(), size_t{2}, "Changed code at the same PC stays separate");
+            const auto counts = profile.pairs.at({0u, 1u, 2u});
+            t.Equals(counts.native, uint64_t{1}, "Native executions are counted");
+            t.Equals(counts.interpreted, uint64_t{1}, "Interpreted executions are counted separately");
+            for (uint32_t i = 0; i < VUPairProfile::Collector::capacity; ++i)
+                profile.record(i * 8u, 4u, 5u, false);
+            t.Equals(profile.pairs.size(), VUPairProfile::Collector::capacity, "Profile memory is bounded");
+            t.IsTrue(profile.overflow, "Overflow is explicit, never silently accepted");
+            profile.record(0u, 1u, 2u, true);
+            t.Equals(profile.pairs.at({0u, 1u, 2u}).native, uint64_t{2}, "Existing counters still work at capacity");
+        });
+        tc.Run("VU residual profile scopes isolate owners and disable warm passes", [](TestCase &t)
+        {
+            VUPairProfile::Collector profile, nested;
+            int owner = 0, other = 0;
+            {
+                VUPairProfile::Scope scope(&profile, &owner);
+                VUPairProfile::record(&other, 0u, 0u, 0u, false);
+                VUPairProfile::record(&owner, 0u, 0u, 0u, false);
+                {
+                    VUPairProfile::Scope warm(nullptr, &owner);
+                    VUPairProfile::record(&owner, 0u, 0u, 0u, false);
+                }
+                {
+                    VUPairProfile::Scope scope2(&nested, &other);
+                    VUPairProfile::record(&other, 0u, 0u, 0u, true);
+                }
+                VUPairProfile::record(&owner, 0u, 0u, 0u, false);
+            }
+            VUPairProfile::record(&owner, 0u, 0u, 0u, false);
+            t.Equals(profile.pairs.at({0u, 0u, 0u}).interpreted, uint64_t{2}, "Only the scoped owner's cold work is counted");
+            t.Equals(nested.pairs.at({0u, 0u, 0u}).native, uint64_t{1}, "Nested owner has independent counters");
+            t.IsTrue(VUPairProfile::active == nullptr && VUPairProfile::owner == nullptr, "Scopes restore inactive state");
+        });
         tc.Run("VU coverage windows exclude startup and preserve actual tick spans", [](TestCase &t)
         {
             VUCoverage::Sampler sampler;
@@ -1250,6 +1290,8 @@ void register_ps2_vu1_tests()
                 std::ifstream input(path, std::ios::binary);
                 const char *exportPath = std::getenv("PS2X_VU_REPLAY_UPPER_EXPORT");
                 const char *pairExportPath = std::getenv("PS2X_VU_REPLAY_PAIR_EXPORT");
+                const char *residualPath = std::getenv("PS2X_VU_REPLAY_RESIDUAL_EXPORT");
+                VUPairProfile::Collector residual;
                 std::vector<VUReplay::UpperSample> upperSamples;
                 std::vector<VUReplay::PairSample> pairSamples;
                 VUReplay::Result result;
@@ -1272,7 +1314,33 @@ void register_ps2_vu1_tests()
                                              , lookup
 #endif
                                              , sampler.executionFlag()
+                                             , residualPath ? &residual : nullptr
                                              );
+                }
+                if (residualPath && result.error.empty())
+                {
+                    std::ofstream output(residualPath);
+                    output << "pc,lower,upper,native,interpreted\n";
+                    uint64_t native = 0, interpreted = 0;
+                    for (const auto &[key, counts] : residual.pairs)
+                    {
+                        const auto &[pc, lower, upper] = key;
+                        output << pc << ',' << lower << ',' << upper << ','
+                               << counts.native << ',' << counts.interpreted << '\n';
+                        native += counts.native;
+                        interpreted += counts.interpreted;
+                    }
+                    output.flush();
+                    t.IsTrue(static_cast<bool>(output), "Residual profile export must succeed");
+#if defined(PS2X_ENABLE_VU_NATIVE_PAIRS)
+                    t.Equals(native * (repeats + 1ull), result.nativePairs - result.nativeBlockPairs,
+                             "Residual native counts exclude exactly the compiled block pairs");
+                    t.Equals(interpreted * (repeats + 1ull), result.interpretedPairs,
+                             "Residual interpreted counts match real dispatch at the requested budget");
+#endif
+                    std::printf("[vu-replay:residual] entries=%zu native=%llu interpreted=%llu cold-only=1\n",
+                                residual.pairs.size(), static_cast<unsigned long long>(native),
+                                static_cast<unsigned long long>(interpreted));
                 }
                 if (pairExportPath && result.error.empty())
                 {

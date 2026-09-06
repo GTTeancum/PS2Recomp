@@ -5,6 +5,7 @@
 #include <iosfwd>
 #include <string>
 #include <vector>
+#include "runtime/vu_pair_profile.h"
 #if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
 #include "runtime/ps2_vu1.h"
 #endif
@@ -48,6 +49,7 @@ public:
         uint64_t interpretedUpper = 0;
         uint64_t nativePairs = 0;
         uint64_t interpretedPairs = 0;
+        uint64_t nativeBlockPairs = 0;
         std::string error;
         std::vector<CaseTiming> timings;
     };
@@ -81,6 +83,8 @@ public:
     // Optional one-cycle cold pass. Upper fetches include dependency stalls;
     // pair executions are counted only when the instruction retires.
     // Optional profiler flag covers warm execution only, not snapshot I/O or the cold pass.
+    // Residual pairs require PS2X_ENABLE_VU_PAIR_PROFILE and observe the cold pass
+    // at its normal budget. They cannot be combined with one-cycle export tracing.
     static Result replay(std::istream &input, uint32_t repeats,
                          std::vector<UpperSample> *upperSamples = nullptr,
                          std::vector<PairSample> *pairSamples = nullptr
@@ -88,6 +92,7 @@ public:
                          , VU1Interpreter::UpperLookup upperLookup = nullptr
 #endif
                          , std::atomic_bool *executing = nullptr
+                         , VUPairProfile::Collector *residualPairs = nullptr
                          );
     static bool writeUpperKernels(std::ostream &output,
                                   const std::vector<UpperSample> &samples, uint32_t limit);

@@ -417,6 +417,7 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
                                  , VU1Interpreter::UpperLookup upperLookup
 #endif
                                  , std::atomic_bool *executing
+                                 , VUPairProfile::Collector *residualPairs
                                  )
 {
     if (executing) executing->store(false, std::memory_order_relaxed);
@@ -429,8 +430,15 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
         upperSamples->clear();
     if (pairSamples)
         pairSamples->clear();
+    if (residualPairs)
+        *residualPairs = {};
     try
     {
+#if !defined(PS2X_ENABLE_VU_PAIR_PROFILE)
+        require(residualPairs == nullptr, "Residual pair profiling was not compiled into this build");
+#endif
+        require(!residualPairs || (!upperSamples && !pairSamples),
+                "Residual profiling cannot use the one-cycle instruction export pass");
         require(repeats > 0u && repeats <= 4096u, "Invalid VU replay repetition count");
         uint32_t replaySliceCycles = 0u;
         if (const char *value = std::getenv("PS2X_VU_REPLAY_SLICE_CYCLES"))
@@ -509,6 +517,9 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
                 {
                     ContextScope scope(context);
                     ExecutionScope execution(iteration != 0u ? executing : nullptr);
+#if defined(PS2X_ENABLE_VU_PAIR_PROFILE)
+                    VUPairProfile::Scope pairProfile(iteration == 0u ? residualPairs : nullptr, vu.get());
+#endif
                     if ((upperSamples || pairSamples) && iteration == 0u && elapsedCycles != 0u)
                     {
                         const auto budgetEnd = initialCycle + record.maxCycles;
@@ -567,6 +578,7 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
                 const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - start).count();
                 const auto actual = saveState(*vu);
+                require(!residualPairs || !residualPairs->overflow, "Residual pair profile exceeds its limit");
                 if (actual != record.after || context.overflow || context.gifs.bytes != record.gifs ||
                     std::memcmp(memory->getVU1Data(), record.afterData.data(), record.afterData.size()) != 0)
                 {
@@ -620,6 +632,7 @@ VUReplay::Result VUReplay::replay(std::istream &input, uint32_t repeats,
         result.interpretedPairs = vu->pairCounters().interpreted;
 #endif
 #if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
+        result.nativeBlockPairs = vu->blockCounters().pairs;
         if (std::getenv("PS2X_VU_REPLAY_BLOCKS") != nullptr)
         {
             const auto counters = vu->blockCounters();
