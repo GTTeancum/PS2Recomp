@@ -3396,6 +3396,63 @@ void register_ps2_vu1_tests()
                      "the underflowing product should set sticky Z and U");
         });
 
+        tc.Run("interpreted FMAC snapshots preserve masked aliased inputs", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+            constexpr float left[] = {2.0f, -3.0f, 4.0f, -5.0f};
+            constexpr float right[] = {7.0f, 11.0f, -13.0f, 17.0f};
+            constexpr float accumulator[] = {31.0f, -37.0f, 41.0f, -43.0f};
+            // Independently calculated MADD, MADDq, MADDi, OPMSUB, MADDA, MSUBA.
+            constexpr float expected[][4] = {
+                {45.0f, -70.0f, -11.0f, -128.0f},
+                {32.0f, -38.5f, 43.0f, -45.5f},
+                {27.0f, -31.0f, 33.0f, -33.0f},
+                {-8.0f, -65.0f, 19.0f, 0.0f},
+                {45.0f, -70.0f, -11.0f, -128.0f},
+                {17.0f, -4.0f, 93.0f, 42.0f}
+            };
+            constexpr uint8_t ops[] = {0x29u, 0x21u, 0x23u, 0x2Eu, 0x29u, 0x2Du};
+            constexpr uint8_t productSign[] = {0x7u, 0x5u, 0xAu, 0x1u, 0x7u, 0x7u};
+            for (uint8_t kind = 0u; kind < 6u; ++kind)
+            for (uint8_t dest = 0u; dest < 16u; ++dest)
+            for (uint8_t fd = 1u; fd <= 3u; ++fd)
+            {
+                VU1Interpreter vu;
+                std::memcpy(vu.state().vf[1], left, sizeof(left));
+                std::memcpy(vu.state().vf[2], right, sizeof(right));
+                std::memcpy(vu.state().acc, accumulator, sizeof(accumulator));
+                vu.state().q = 0.5f;
+                vu.state().i = -2.0f;
+                const bool writesAcc = kind >= 4u;
+                const uint32_t upper = writesAcc ? makeVuUpperSpecial(ops[kind], dest, 2u, 1u)
+                    : makeVuUpper(ops[kind], dest, 2u, 1u, fd);
+                writeTrackedVuInstructionPair(fx, 0u, 0x8000033cu, upper);
+                for (uint32_t pc = 8u; pc <= 32u; pc += 8u)
+                    writeTrackedVuInstructionPair(fx, pc, 0x8000033cu, kVuUpperNop);
+                vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
+                    fx.gs, &fx.mem, 0u, 0u, 0u, 5u);
+                const float *actual = writesAcc ? vu.state().acc : vu.state().vf[fd];
+                const float *original = writesAcc ? accumulator : fd == 1u ? left : right;
+                uint32_t mac = 0u;
+                uint32_t status = 0u;
+                for (uint8_t lane = 0u; lane < 4u; ++lane)
+                {
+                    const uint8_t mask = 8u >> lane;
+                    const bool written = (dest & mask) != 0u;
+                    const float value = written ? expected[kind][lane]
+                        : !writesAcc && fd == 3u ? 0.0f : original[lane];
+                    t.Equals(actual[lane], value, "Masked/aliased FMAC result must use original operands");
+                    if (!written) continue;
+                    if (value == 0.0f) { mac |= mask; status |= 0x41u; }
+                    if (value < 0.0f) { mac |= static_cast<uint32_t>(mask) << 4u; status |= 0x82u; }
+                }
+                if (dest & productSign[kind]) status |= 0x80u;
+                t.Equals(vu.state().mac, mac, "MAC must describe masked result lanes");
+                t.Equals(vu.state().status, status, "Sticky flags must include original products");
+            }
+        });
+
         tc.Run("reserved opcodes stop before executing or corrupting state", [](TestCase &t)
         {
             Vu1Fixture fx;
