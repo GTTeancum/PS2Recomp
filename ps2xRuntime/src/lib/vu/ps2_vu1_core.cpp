@@ -1,6 +1,7 @@
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_vu1_replay.h"
 #include "runtime/runtime_profile.h"
+#include "runtime/vu_coverage.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_memory.h"
@@ -2500,6 +2501,35 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         VUReplay::captureSlice(*this, vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles))
         return;
     RuntimeProfile::Scope vuProfile(RuntimeProfile::Phase::Vu);
+#if defined(PS2X_ENABLE_VU_NATIVE_PAIRS) && defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
+    static const bool coverageRequested = std::getenv("PS2X_VU_COVERAGE_PROFILE") != nullptr;
+    if (coverageRequested && m_unit == Unit::VU1 && memory)
+    {
+        const uint64_t tick = memory->gs().vsyncTick.load(std::memory_order_relaxed);
+        static thread_local const VU1Interpreter *lastOwner = nullptr;
+        static thread_local uint64_t lastTick = UINT64_MAX;
+        static thread_local VUCoverage::Sampler sampler;
+        if (tick >= 1100u && tick <= 1400u && (lastOwner != this || lastTick != tick))
+        {
+            lastOwner = this;
+            lastTick = tick;
+            const auto window = sampler.observe(this, tick, {
+                m_pairCounters.native, m_pairCounters.interpreted, m_blockCounters.pairs,
+                m_blockCounters.attempted, m_blockCounters.executed});
+            if (window)
+                std::fprintf(stderr,
+                    "[vu:coverage-window] begin=%llu end=%llu native=%llu interpreted=%llu "
+                    "block-pairs=%llu attempted=%llu executed=%llu\n",
+                    static_cast<unsigned long long>(window->begin),
+                    static_cast<unsigned long long>(window->end),
+                    static_cast<unsigned long long>(window->delta[VUCoverage::NativePairs]),
+                    static_cast<unsigned long long>(window->delta[VUCoverage::InterpretedPairs]),
+                    static_cast<unsigned long long>(window->delta[VUCoverage::BlockPairs]),
+                    static_cast<unsigned long long>(window->delta[VUCoverage::Attempts]),
+                    static_cast<unsigned long long>(window->delta[VUCoverage::Executions]));
+        }
+    }
+#endif
 #if defined(PS2X_ENABLE_VU_DETAIL_PROFILE)
     RuntimeProfile::VuDetailSample detailSample;
     RuntimeProfile::Scope sampleProfile(RuntimeProfile::Phase::VuSample, RuntimeProfile::sampleVu);

@@ -10,6 +10,7 @@
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_vu1_replay.h"
 #include "runtime/ps2_vu_flags.h"
+#include "runtime/vu_coverage.h"
 
 #include <cmath>
 #include <chrono>
@@ -235,6 +236,45 @@ void register_ps2_vu1_tests()
 {
     MiniTest::Case("PS2VU1", [](TestCase &tc)
     {
+        tc.Run("VU coverage windows exclude startup and preserve actual tick spans", [](TestCase &t)
+        {
+            VUCoverage::Sampler sampler;
+            int owner = 0;
+            t.IsTrue(!sampler.observe(&owner, 1100u, {1000u, 2000u, 800u, 40u, 30u}), "First sample establishes baseline");
+            t.IsTrue(!sampler.observe(&owner, 1100u, {1001u, 2002u, 800u, 41u, 30u}), "Same tick cannot finish a window");
+            t.IsTrue(!sampler.observe(&owner, 1131u, {1010u, 2020u, 805u, 45u, 33u}), "Partial window is not reported");
+            const auto first = sampler.observe(&owner, 1132u, {1100u, 2200u, 850u, 60u, 40u});
+            t.IsTrue(first.has_value(), "32 ticks complete the first window");
+            if (!first) return;
+            t.Equals(first->begin, uint64_t{1100}, "Window begins at baseline tick");
+            t.Equals(first->end, uint64_t{1132}, "Window ends at observed tick");
+            t.IsTrue(first->delta == VUCoverage::Counters{100u, 200u, 50u, 20u, 10u}, "Startup counts are excluded");
+            const auto skipped = sampler.observe(&owner, 1200u, {1200u, 2400u, 900u, 80u, 50u});
+            t.IsTrue(skipped.has_value(), "Skipped ticks retain the actual interval");
+            if (!skipped) return;
+            t.Equals(skipped->begin, uint64_t{1132}, "Next window begins at previous end");
+            t.Equals(skipped->end, uint64_t{1200}, "Skipped ticks are not rounded away");
+            t.IsTrue(skipped->delta == first->delta, "Each window uses the preceding boundary");
+        });
+        tc.Run("VU coverage windows reset on owner tick or counter rollback", [](TestCase &t)
+        {
+            int firstOwner = 0, secondOwner = 0;
+            for (size_t field = 0; field < VUCoverage::Count; ++field)
+            {
+                VUCoverage::Sampler sampler;
+                VUCoverage::Counters counts{100u, 100u, 100u, 100u, 100u};
+                t.IsTrue(!sampler.observe(&firstOwner, 1100u, counts), "First owner establishes baseline");
+                counts.fill(200u);
+                t.IsTrue(!sampler.observe(&firstOwner, 1110u, counts), "Intermediate counters remain pending");
+                counts[field] = 150u; // Still above the baseline, but below the last sample.
+                t.IsTrue(!sampler.observe(&firstOwner, 1132u, counts), "Counter rollback resets the window");
+                t.IsTrue(!sampler.observe(&secondOwner, 1164u, counts), "Owner change resets the window");
+                t.IsTrue(!sampler.observe(&secondOwner, 1100u, counts), "Tick rollback resets the window");
+                const auto result = sampler.observe(&secondOwner, 1132u, counts);
+                t.IsTrue(result.has_value(), "A new complete window follows reset");
+                if (result) t.IsTrue(result->delta == VUCoverage::Counters{}, "Unchanged counters produce zero deltas");
+            }
+        });
         tc.Run("VU FMAC packing preserves every flag combination and destination", [](TestCase &t)
         {
             const auto check = [&](const uint8_t *flags, uint8_t dest)
