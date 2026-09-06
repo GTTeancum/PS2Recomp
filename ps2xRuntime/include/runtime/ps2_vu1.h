@@ -118,6 +118,7 @@ public:
 
 private:
     friend class VUReplay;
+    friend class VUCompiledState;
 #if defined(PS2X_ENABLE_VU_NATIVE_UPPER)
     friend struct VUNativeAccess;
 #endif

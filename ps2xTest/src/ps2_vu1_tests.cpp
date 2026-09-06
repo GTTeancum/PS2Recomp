@@ -9,6 +9,7 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_vu1_replay.h"
+#include "runtime/ps2_vu_compiled_state.h"
 #include "runtime/ps2_vu_flags.h"
 #include "runtime/ps2_vu_product_flags.h"
 #include "runtime/runtime_profile.h"
@@ -239,6 +240,92 @@ void register_ps2_vu1_tests()
 {
     MiniTest::Case("PS2VU1", [](TestCase &tc)
     {
+        tc.Run("VU compiled state adapter validates before commit and resumes normally", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU fixture initializes");
+            if (!fx.code || !fx.data) return;
+            for (uint32_t pc = 0; pc < 64; pc += 8)
+                writeTrackedVuInstructionPair(fx, pc, 0x8000033cu, kVuUpperNop);
+            writeTrackedVuInstructionPair(fx, 0, 0x8000033cu, makeVuUpper(0x28, 0xf, 2, 1, 3));
+            writeTrackedVuInstructionPair(fx, 16, 0x8000033cu, kVuUpperNop | 0x40000000u);
+            writeTrackedVuInstructionPair(fx, 40, 0x8000033cu, kVuUpperNop | 0x40000000u);
+            VU1Interpreter vu, reference;
+            t.IsTrue(!VUCompiledState::capture(vu, 1048576), "Stopped VU cannot be captured");
+            vu.state().vf[1][0] = reference.state().vf[1][0] = 1.0f;
+            vu.state().vf[2][0] = reference.state().vf[2][0] = 2.0f;
+            vu.execute(fx.code, 16384, fx.data, 16384, fx.gs, &fx.mem, 0, 0, 0, 1);
+            t.IsTrue(!VUCompiledState::capture(vu, 64), "Short slices stay on the current engine");
+            const auto input = VUCompiledState::capture(vu, 1048576);
+            t.IsTrue(input.has_value(), "Capture pending VF and flag pipelines");
+            if (!input) return;
+            t.IsTrue(input->vfMask != 0 && input->flagMask != 0, "Pending queues are exported, not dropped");
+            reference.execute(fx.code, 16384, fx.data, 16384, fx.gs, &fx.mem, 0, 0, 0, 1048576);
+            VUCompiledState::Output output;
+            output.state = reference.state();
+            output.elapsed = output.state.cycles - input->cycle;
+            output.macMask = 0xffff;
+            output.statusMask = 0xfff;
+            output.data[100] = 0x5a;
+            const VU1State before = vu.state();
+            const auto unchanged = [&] {
+                return !std::memcmp(&vu.state(), &before, sizeof(before)) && fx.data[100] == 0 && vu.isRunning();
+            };
+            output.statusMask = 0xe3;
+            t.IsTrue(!VUCompiledState::commit(vu, *input, output, fx.data, 16384, fx.gs, &fx.mem) && unchanged(),
+                "Incomplete STATUS coverage cannot publish memory or state");
+            output.statusMask = 0xfff;
+            output.macMask = 0xff;
+            t.IsTrue(!VUCompiledState::commit(vu, *input, output, fx.data, 16384, fx.gs, &fx.mem) && unchanged(),
+                "Incomplete MAC coverage cannot publish memory or state");
+            output.macMask = 0xffff;
+            const auto validPc = output.state.pc;
+            output.state.pc = 16384;
+            t.IsTrue(!VUCompiledState::commit(vu, *input, output, fx.data, 16384, fx.gs, &fx.mem) && unchanged(),
+                "Out-of-range completed PC rejects");
+            output.state.pc = validPc;
+            for (uint32_t bits : {0x80000000u, 0x7fc00001u, 0x7f800000u, 0x00000001u})
+            {
+                std::memcpy(&output.state.vf[0][0], &bits, sizeof(bits));
+                t.IsTrue(!VUCompiledState::commit(vu, *input, output, fx.data, 16384, fx.gs, &fx.mem) && unchanged(),
+                    "VF0 is checked as canonical raw bits even under fast floating-point compilation");
+            }
+            output.state.vf[0][0] = 0;
+            const auto elapsed = output.elapsed;
+            output.elapsed = 1;
+            output.state.cycles = input->cycle + 1;
+            t.IsTrue(!VUCompiledState::commit(vu, *input, output, fx.data, 16384, fx.gs, &fx.mem) && unchanged(),
+                "A completion before incoming write deadlines rejects");
+            output.elapsed = elapsed;
+            output.state.cycles = input->cycle + elapsed;
+            vu.state().vi[5] = 7;
+            t.IsTrue(!VUCompiledState::commit(vu, *input, output, fx.data, 16384, fx.gs, &fx.mem), "Stale state rejects");
+            vu.state().vi[5] = 0;
+            VUCompiledState::Packet packet;
+            packet.cycle = 1;
+            packet.bytes.resize(16);
+            const uint64_t tag = makeGifTag(0, 0, 1);
+            std::memcpy(packet.bytes.data(), &tag, 8);
+            output.packets = {packet, packet};
+            output.packets[1].bytes.resize(15);
+            t.IsTrue(!VUCompiledState::commit(vu, *input, output, fx.data, 16384, fx.gs, &fx.mem) && unchanged(),
+                "Malformed later packet rejects the entire batch before publishing");
+            output.packets = {packet};
+            output.packets[0].cycle = output.elapsed + 1;
+            t.IsTrue(!VUCompiledState::commit(vu, *input, output, fx.data, 16384, fx.gs, &fx.mem) && unchanged(),
+                "Packet after completion rejects");
+            output.packets[0].cycle = 1;
+            t.IsTrue(VUCompiledState::commit(vu, *input, output, fx.data, 16384, fx.gs, &fx.mem), "Fully validated output commits");
+            t.IsTrue(!vu.isRunning(), "Committed drain leaves the VU stopped");
+            t.Equals(fx.data[100], uint8_t{0x5a}, "Committed memory is published");
+            t.Equals(vu.state().vf[3][0], 3.0f, "Final arithmetic result is preserved");
+            t.Equals(vu.state().cycles, reference.state().cycles, "Completed time is preserved");
+            vu.resume(fx.code, 16384, fx.data, 16384, fx.gs, &fx.mem, 0, 0, 1);
+            t.IsTrue(vu.isRunning(), "Existing runtime resumes after commit");
+            const auto resumed = VUCompiledState::capture(vu, 1048576);
+            t.IsTrue(resumed && !resumed->vfMask && !resumed->flagMask,
+                "Retired writes do not leak into the next program");
+        });
         tc.Run("VU scheduler reset profiling counts initialization only when enabled", [](TestCase &t)
         {
             RuntimeProfile::Scope parent(RuntimeProfile::Phase::Scheduler, true);
