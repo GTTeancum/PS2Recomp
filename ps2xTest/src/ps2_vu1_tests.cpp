@@ -628,9 +628,20 @@ void register_ps2_vu1_tests()
             };
             uint32_t random = 0x94e6c217u;
             const uint32_t boundaryCases = static_cast<uint32_t>(std::size(values) * std::size(values));
+            struct RestoreArithmeticRounding
+            {
+                int mode = std::fegetround();
+                ~RestoreArithmeticRounding() { std::fesetround(mode); }
+            } restoreArithmeticRounding;
+            for (int mode : {FE_TONEAREST, FE_TOWARDZERO})
             for (uint32_t sample = 0u; sample < boundaryCases + 128u; ++sample)
             for (const uint32_t startPc : {0x3500u, 0x3540u, 0x3580u, 0x35c0u})
             {
+                if (sample == 0u && std::fesetround(mode) != 0)
+                {
+                    t.IsTrue(false, "Native arithmetic rounding mode must be selectable");
+                    return;
+                }
                 VU1Interpreter reference;
                 VU1Interpreter native;
                 for (uint32_t lane = 0u; lane < 4u; ++lane)
@@ -3556,6 +3567,57 @@ void register_ps2_vu1_tests()
         });
 
 #if defined(PS2X_VU_AVX2_PRODUCT_FLAGS)
+        tc.Run("AVX2 VU exact normalization preserves lane bits and masks", [](TestCase &t)
+        {
+            const double minimum = std::numeric_limits<float>::min();
+            const double maximum = std::numeric_limits<float>::max();
+            const double values[] = {0.0, -0.0, minimum, -minimum, maximum, -maximum,
+                minimum * 0.5, -minimum * 0.5, maximum * 2.0, -maximum * 2.0,
+                std::nextafter(minimum, 0.0), std::nextafter(minimum, 1.0),
+                std::nextafter(maximum, 0.0), std::nextafter(maximum, maximum * 2.0),
+                1.0, -1.0, minimum * minimum, -minimum * minimum};
+            constexpr uint32_t original[] = {0x7FC01234u, 0x80000001u, 0x3F800001u, 0xFF800000u};
+            for (uint32_t sample = 0u; sample < std::size(values); ++sample)
+            for (uint8_t dest = 0u; dest < 16u; ++dest)
+            {
+                double exact[4];
+                float actual[4];
+                uint8_t flags[4] = {0xFFu, 0xFFu, 0xFFu, 0xFFu};
+                uint32_t expected[4];
+                uint8_t expectedFlags[4]{};
+                std::memcpy(actual, original, sizeof(actual));
+                std::memcpy(expected, original, sizeof(expected));
+                for (uint32_t lane = 0u; lane < 4u; ++lane)
+                {
+                    exact[lane] = values[(sample + lane * 5u) % std::size(values)];
+                    if ((dest & (8u >> lane)) == 0u) continue;
+                    const double magnitude = std::fabs(exact[lane]);
+                    const uint32_t sign = std::signbit(exact[lane]) ? 0x80000000u : 0u;
+                    expectedFlags[lane] = sign ? 2u : 0u;
+                    if (magnitude == 0.0)
+                    {
+                        expectedFlags[lane] |= 1u;
+                        expected[lane] = sign;
+                    }
+                    else if (magnitude > maximum)
+                    {
+                        expectedFlags[lane] |= 8u;
+                        expected[lane] = sign | 0x7F7FFFFFu;
+                    }
+                    else if (magnitude < minimum)
+                    {
+                        expectedFlags[lane] |= 5u;
+                        expected[lane] = sign;
+                    }
+                }
+                VUFlags::normalizeExactAvx2(_mm256_loadu_pd(exact), actual, flags, dest);
+                t.IsTrue(std::memcmp(actual, expected, sizeof(expected)) == 0,
+                         "Normalization must preserve normal/inactive bits and saturate exceptional lanes");
+                t.IsTrue(std::memcmp(flags, expectedFlags, sizeof(flags)) == 0,
+                         "Each active lane must retain its independent Z/S/U/O conditions");
+            }
+        });
+
         tc.Run("AVX2 VU product sticky flags match scalar widened products for every mask", [](TestCase &t)
         {
             const uint32_t values[] = {0u, 0x80000000u, 0x3F800000u, 0xBF800000u,

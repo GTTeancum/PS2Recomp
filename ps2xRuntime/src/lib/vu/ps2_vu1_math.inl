@@ -61,6 +61,53 @@ template <uint64_t Word>
 void VU1Interpreter::normalizeFmacResultFor(float *result, uint8_t dest,
                                           uint8_t laneFlags[4], const FmacOperands *prepared)
 {
+#if defined(PS2X_VU_AVX2_PRODUCT_FLAGS)
+    if constexpr (Word != kDynamicUpper)
+    {
+        constexpr uint8_t op = static_cast<uint8_t>(Word & 0x3Fu);
+        constexpr uint8_t function = op >= 0x3Cu
+            ? static_cast<uint8_t>((Word & 3u) | ((Word >> 4u) & 0x7Cu)) : op;
+        constexpr bool supported = function <= 0x0Fu ||
+            (function >= 0x18u && function <= 0x1Cu) || function == 0x1Eu ||
+            (function >= 0x20u && function <= 0x2Au) || function == 0x2Cu || function == 0x2Du;
+        if constexpr (supported)
+        {
+            const __m256d left = _mm256_cvtps_pd(_mm_loadu_ps(prepared->vs));
+            __m128 rightFloat;
+            if constexpr (function <= 0x0Fu || (function >= 0x18u && function <= 0x1Bu))
+                rightFloat = _mm_set1_ps(prepared->vt[function & 3u]);
+            else if constexpr (function == 0x1Cu || function == 0x20u || function == 0x21u ||
+                               function == 0x24u || function == 0x25u)
+                rightFloat = _mm_set1_ps(prepared->q);
+            else if constexpr (function == 0x1Eu || function == 0x22u || function == 0x23u ||
+                               function == 0x26u || function == 0x27u)
+                rightFloat = _mm_set1_ps(prepared->i);
+            else
+                rightFloat = _mm_loadu_ps(prepared->vt);
+            const __m256d right = _mm256_cvtps_pd(rightFloat);
+            __m256d exact;
+            if constexpr (function <= 0x03u || function == 0x20u || function == 0x22u || function == 0x28u)
+                exact = _mm256_add_pd(left, right);
+            else if constexpr (function <= 0x07u || function == 0x24u || function == 0x26u || function == 0x2Cu)
+                exact = _mm256_sub_pd(left, right);
+            else if constexpr ((function >= 0x18u && function <= 0x1Eu) || function == 0x2Au)
+                exact = _mm256_mul_pd(left, right);
+            else
+            {
+                // Preserve the scalar widened multiply followed by add/subtract,
+                // never a fused multiply-add or a rounded float product.
+                const __m256d product = _mm256_mul_pd(left, right);
+                const __m256d acc = _mm256_cvtps_pd(_mm_loadu_ps(prepared->acc));
+                if constexpr (function <= 0x0Bu || function == 0x21u || function == 0x23u || function == 0x29u)
+                    exact = _mm256_add_pd(acc, product);
+                else
+                    exact = _mm256_sub_pd(acc, product);
+            }
+            VUFlags::normalizeExactAvx2(exact, result, laneFlags, dest);
+            return;
+        }
+    }
+#endif
     for (uint32_t component = 0; component < 4u; ++component)
     {
         laneFlags[component] = 0u;
