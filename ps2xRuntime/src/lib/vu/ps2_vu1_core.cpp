@@ -2563,6 +2563,15 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
     const uint64_t budgetEnd = m_cycle + maxCycles;
     bool programEnded = false;
+#if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
+    static const bool storeTraceRequested =
+        std::getenv("PS2X_TRACE_VU_STORE_ADDRESS_FIRST") != nullptr ||
+        std::getenv("PS2X_TRACE_VU_STORE_WORD0") != nullptr;
+    // Store tracing uses the queued path. These settings stay fixed throughout
+    // this synchronous slice; avoid testing their static guards for every pair.
+    const bool useNativeBlocks = m_nativeBlocksEnabled && !xmenDiagnosticsEnabled() &&
+        !xmenTraceVu1Program && !xmenGameplayVuSummary.active && !storeTraceRequested;
+#endif
     // Resume may enter with pending work. Subsequent cycle boundaries already
     // retire pipelines in advanceOneCycle(), before PATH1 reads VU memory.
     if (m_cycle < budgetEnd && !m_stopRequested)
@@ -2575,7 +2584,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             break;
         }
 #if defined(PS2X_ENABLE_VU_NATIVE_BLOCKS)
-        if (m_nativeBlocksEnabled && !xmenDiagnosticsEnabled() && !xmenTraceVu1Program)
+        if (useNativeBlocks)
         {
             const BlockKernel block = lookupNativeBlock(m_state.pc);
             if (block != nullptr)

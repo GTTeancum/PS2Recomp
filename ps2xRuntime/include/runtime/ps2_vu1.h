@@ -360,7 +360,7 @@ private:
     template <uint32_t Word> void execUpperNative();
 #endif
 #if defined(PS2X_BUILD_VU_NATIVE_PAIRS)
-    template <uint32_t Word>
+    template <uint32_t Word, bool DirectStore = false>
     void execLowerNative(uint8_t *vuData, uint32_t dataSize, GS &gs,
                          PS2Memory *memory, uint32_t upperInstr);
     template <uint32_t Lower, uint32_t Upper>

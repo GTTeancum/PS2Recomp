@@ -71,11 +71,31 @@ namespace
 // Lower instructions
 // ============================================================================
 #if defined(PS2X_BUILD_VU_NATIVE_PAIRS)
-template <uint32_t Word>
+template <uint32_t Word, bool DirectStore>
 void VU1Interpreter::execLowerNative(uint8_t *vuData, uint32_t dataSize, GS &gs,
                                      PS2Memory *memory, uint32_t upperInstr)
 {
     constexpr uint32_t instr = Word;
+    const auto queueStore = [this, vuData](uint32_t address, const uint32_t words[4], uint8_t lanes)
+    {
+        if constexpr (DirectStore)
+        {
+            if (!vuData) return;
+            // Guarded blocks enter with no pending stores. No VU-memory reader
+            // runs between this lower operation and its one-cycle retirement;
+            // PATH1 progresses only after both instruction halves complete.
+            if (lanes == 0xFu)
+            {
+                std::memcpy(vuData + address, words, 4u * sizeof(uint32_t));
+                return;
+            }
+            for (uint32_t lane = 0u; lane < 4u; ++lane)
+                if ((lanes & (8u >> lane)) != 0u)
+                    std::memcpy(vuData + address + lane * 4u, words + lane, sizeof(uint32_t));
+        }
+        else
+            this->queueStore(address, words, lanes);
+    };
 #else
 void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize,
                                GS &gs, PS2Memory *memory, uint32_t upperInstr)

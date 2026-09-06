@@ -635,30 +635,6 @@ private:
         }
     }
 
-    static void retireReadyStores(VU1Interpreter *vu)
-    {
-        for (uint32_t slots = vu->m_storePipelineMask; slots != 0u; slots &= slots - 1u)
-        {
-            const uint32_t slot = static_cast<uint32_t>(std::countr_zero(slots));
-            auto &store = vu->m_storePipeline[slot];
-            if (store.readyCycle > vu->m_cycle)
-                continue;
-            if (vu->m_activeVuData && store.address + 16u <= vu->m_activeVuDataSize)
-            {
-                uint32_t words[4]{};
-                std::memcpy(words, vu->m_activeVuData + store.address, sizeof(words));
-                for (uint32_t component = 0u; component < 4u; ++component)
-                {
-                    if ((store.laneMask & laneForComponent(component)) != 0u)
-                        words[component] = store.words[component];
-                }
-                std::memcpy(vu->m_activeVuData + store.address, words, sizeof(words));
-            }
-            std::memset(&store, 0, sizeof(store));
-            vu->m_storePipelineMask &= ~(1u << slot);
-        }
-    }
-
     template <size_t Index, typename Words, uint8_t QueuedVf>
     static void executeFastPair(
         VU1Interpreter *vu,
@@ -704,14 +680,14 @@ private:
             float upperValue[4]{};
             std::memcpy(upperValue, vu->m_state.vf[upperUsage.writeReg], sizeof(upperValue));
             std::memcpy(vu->m_state.vf[upperUsage.writeReg], oldUpper, sizeof(oldUpper));
-            vu->template execLowerNative<Words::lower>(
+            vu->template execLowerNative<Words::lower, lowerUsage.queuesStore>(
                 vu->m_activeVuData, vu->m_activeVuDataSize,
                 *vu->m_activeGs, vu->m_activeMemory, Words::upper);
             std::memcpy(vu->m_state.vf[upperUsage.writeReg], upperValue, sizeof(upperValue));
         }
         else
         {
-            vu->template execLowerNative<Words::lower>(
+            vu->template execLowerNative<Words::lower, lowerUsage.queuesStore>(
                 vu->m_activeVuData, vu->m_activeVuDataSize,
                 *vu->m_activeGs, vu->m_activeMemory, Words::upper);
         }
@@ -823,8 +799,6 @@ private:
         ++vu->m_cycle;
         vu->m_state.cycles = vu->m_cycle;
         retireReadyFlags(vu);
-        if constexpr (lowerUsage.queuesStore)
-            retireReadyStores(vu);
         retireReadyVf(vu);
         retireReadyVi(vu);
         if (lowerUsage.viWriteReg != 0u && lowerUsage.viLatency == 1u &&
