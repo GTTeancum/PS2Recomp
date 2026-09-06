@@ -761,8 +761,13 @@ void GS::latchHostPresentationFrame()
     }();
     const bool dumpRequestedPresent = presentIndex >= requestedDumpRange.first &&
                                       presentIndex <= requestedDumpRange.second;
+    static const bool captureFirstNonBlack = []
+    {
+        const char *value = std::getenv("PS2X_CAPTURE_FIRST_NONBLACK");
+        return value && std::strcmp(value, "1") == 0;
+    }();
     static std::atomic<bool> dumpedFirstNonBlack{false};
-    if (hasFrame && !dumpedFirstNonBlack.load(std::memory_order_relaxed) &&
+    if (captureFirstNonBlack && hasFrame && !dumpedFirstNonBlack.load(std::memory_order_relaxed) &&
         frame.pixels.size() >= static_cast<size_t>(width) * height * 4u)
     {
         bool nonBlack = false;
@@ -794,10 +799,7 @@ void GS::latchHostPresentationFrame()
         std::fprintf(stderr, "[gs:present-latest] index=%u wrote=%u\n",
                      presentIndex, wrote ? 1u : 0u);
     }
-    if (hasFrame && (dumpRequestedPresent || presentIndex == 23u || presentIndex == 24u || presentIndex == 128u ||
-                     presentIndex == 256u || presentIndex == 384u || presentIndex == 640u ||
-                     presentIndex == 768u || presentIndex == 896u ||
-                     presentIndex == 1420u || presentIndex == 1450u || presentIndex == 1500u) &&
+    if (hasFrame && dumpRequestedPresent &&
         frame.pixels.size() >= static_cast<size_t>(width) * height * 4u)
     {
         const std::string path = "gs-present-" + std::to_string(presentIndex) + ".ppm";
