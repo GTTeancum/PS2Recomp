@@ -3391,6 +3391,49 @@ void register_ps2_vu1_tests()
             }
         });
 
+        tc.Run("XGKICK grows beyond the initial buffer for wrapped IMAGE2 packets", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            std::vector<uint8_t> captured;
+            mem.setGifPacketCallback([&](const uint8_t *packet, uint32_t sizeBytes)
+            {
+                captured.assign(packet, packet + sizeBytes);
+            });
+
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            uint8_t *code = mem.getVU1Code();
+            uint8_t *data = mem.getVU1Data();
+            std::memset(code, 0, PS2_VU1_CODE_SIZE);
+            for (uint32_t i = 0; i < PS2_VU1_DATA_SIZE; ++i)
+                data[i] = static_cast<uint8_t>(i * 37u + 11u);
+
+            constexpr uint16_t kPayloadQwords = 5000u;
+            constexpr uint32_t kPacketBytes = (static_cast<uint32_t>(kPayloadQwords) + 1u) * 16u;
+            const uint64_t image2Tag = makeGifTag(kPayloadQwords, GIF_FMT_IMAGE2, 0u, true);
+            std::memcpy(data, &image2Tag, sizeof(image2Tag));
+            std::memset(data + sizeof(image2Tag), 0u, sizeof(image2Tag));
+            writeVuInstructionPair(code, 0u, makeVuLowerSpecial(0x6Cu, 1u), kVuUpperNop);
+
+            VU1Interpreter vu1;
+            vu1.state().vi[1] = 0;
+            vu1.execute(code, PS2_VU1_CODE_SIZE,
+                        data, PS2_VU1_DATA_SIZE, gs, &mem,
+                        0u, 0u, 0u, kPayloadQwords * 2u + 3u);
+
+            t.Equals(captured.size(), static_cast<size_t>(kPacketBytes),
+                     "large wrapped IMAGE2 packet should exceed the initial staging capacity");
+            bool wrappedBytesMatch = captured.size() == kPacketBytes;
+            for (uint32_t i = 0u; wrappedBytesMatch && i < kPacketBytes; ++i)
+                wrappedBytesMatch = captured[i] == data[i % PS2_VU1_DATA_SIZE];
+            t.IsTrue(wrappedBytesMatch,
+                     "large PATH1 packet should retain every byte across VU memory wraps");
+        });
+
         tc.Run("XGKICK observes stores committed before a future PATH1 qword", [](TestCase &t)
         {
             PS2Memory mem;

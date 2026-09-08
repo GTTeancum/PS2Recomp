@@ -19,6 +19,7 @@ struct GifArbiterPacket
     GifPathId pathId;
     bool path2DirectHl = false;
     bool path3Image = false;
+    uint32_t logicalPackets = 1;
     std::vector<uint8_t> data;
 };
 
@@ -33,6 +34,7 @@ public:
     void setProcessPacketFn(ProcessPacketFn fn) { m_processFn = std::move(fn); }
 
     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
+    void submitOwned(GifPathId pathId, std::vector<uint8_t> data, bool path2DirectHl = false);
 
     void drain();
     bool empty() const { return m_queue.empty(); }

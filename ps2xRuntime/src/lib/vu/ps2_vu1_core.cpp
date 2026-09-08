@@ -1053,12 +1053,38 @@ void VU1Interpreter::progressXgkick()
     if (!m_xgkick.active || !m_activeVuData || m_activeVuDataSize == 0u)
         return;
 
+    const auto ensurePacketCapacity = [this](uint64_t requiredBytes)
+    {
+        if (requiredBytes <= m_xgkick.packet.size())
+            return true;
+        if (requiredBytes > XgkickPipeline::kMaxBufferSize)
+            return false;
+
+        const uint64_t doubled = static_cast<uint64_t>(m_xgkick.packet.size()) * 2u;
+        const uint64_t grown = std::min<uint64_t>(
+            XgkickPipeline::kMaxBufferSize,
+            std::max<uint64_t>(requiredBytes, doubled));
+        m_xgkick.packet.resize(static_cast<size_t>(grown));
+        return true;
+    };
+
     ++m_xgkick.cycleCredit;
     while (m_xgkick.active && m_xgkick.cycleCredit >= 2u)
     {
         m_xgkick.cycleCredit -= 2u;
-        if (m_xgkick.copiedBytes > XgkickPipeline::kBufferSize - 16u)
+        if (!ensurePacketCapacity(static_cast<uint64_t>(m_xgkick.copiedBytes) + 16u))
         {
+            std::fprintf(stderr,
+                         "[vu1:xgkick-overflow] reason=packet-buffer source=0x%x copied=%u "
+                         "tagEnd=%u program=0x%x issuePc=0x%x currentPc=0x%x tick=%llu cycle=%llu\n",
+                         m_xgkick.sourceAddress,
+                         m_xgkick.copiedBytes,
+                         m_xgkick.currentTagEnd,
+                         xmenXgkickProgramStart,
+                         xmenXgkickIssuePc,
+                         m_state.pc,
+                         static_cast<unsigned long long>(xmenXgkickIssueTick),
+                         static_cast<unsigned long long>(m_cycle));
             reportReservedInstruction(false, 0xFFFFFFFBu);
             m_xgkick.active = false;
             return;
@@ -1102,8 +1128,25 @@ void VU1Interpreter::progressXgkick()
                 return;
             }
 
-            if (tagBytes > XgkickPipeline::kBufferSize - qwordOffset)
+            if (!ensurePacketCapacity(static_cast<uint64_t>(qwordOffset) + tagBytes))
             {
+                std::fprintf(stderr,
+                             "[vu1:xgkick-overflow] reason=gif-tag source=0x%x offset=%u "
+                             "tagBytes=%llu tagLo=0x%016llx nloop=%u format=%u nreg=%u eop=%u "
+                             "program=0x%x issuePc=0x%x currentPc=0x%x tick=%llu cycle=%llu\n",
+                             m_xgkick.sourceAddress,
+                             qwordOffset,
+                             static_cast<unsigned long long>(tagBytes),
+                             static_cast<unsigned long long>(tagLo),
+                             nloop,
+                             format,
+                             nreg,
+                             static_cast<unsigned>((tagLo >> 15) & 1u),
+                             xmenXgkickProgramStart,
+                             xmenXgkickIssuePc,
+                             m_state.pc,
+                             static_cast<unsigned long long>(xmenXgkickIssueTick),
+                             static_cast<unsigned long long>(m_cycle));
                 reportReservedInstruction(false, 0xFFFFFFFBu);
                 m_xgkick.active = false;
                 return;
@@ -2283,6 +2326,9 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                              uint32_t maxCycles)
 {
     m_debugExecutionCount.fetch_add(1u, std::memory_order_relaxed);
+#if defined(PS2X_ENABLE_VU_COMPILED_ENGINE)
+    cancelCompiledVuStream(*this);
+#endif
     static std::atomic<uint32_t> titleExecutionCount{0u};
     const uint64_t titleTick = memory
         ? memory->gs().vsyncTick.load(std::memory_order_relaxed)
@@ -2483,6 +2529,10 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     const uint64_t startCycle = m_cycle;
     m_running = true;
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+#if defined(PS2X_ENABLE_VU_COMPILED_ENGINE)
+    if (m_running)
+        tryBeginCompiledVuStream(*this, vuCode, codeSize, vuData, dataSize, memory, top, itop);
+#endif
     const uint64_t elapsedCycles = m_cycle - startCycle;
     if (xmenGameplayVuSummary.active && !m_running)
     {
@@ -2541,14 +2591,32 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
     m_debugResumeCount.fetch_add(1u, std::memory_order_relaxed);
     if (m_unit == Unit::VU1 && memory)
         xmenCurrentVuTick = memory->gs().vsyncTick.load(std::memory_order_relaxed);
+    if (xmenGameplayVuSummary.active)
+        ++xmenGameplayVuSummary.slices;
+#if defined(PS2X_ENABLE_VU_COMPILED_ENGINE)
+    if (tryResumeCompiledVuStream(*this, vuCode, codeSize, vuData, dataSize,
+            gs, memory, top, itop, maxCycles))
+    {
+        if (xmenGameplayVuSummary.active && !m_running)
+        {
+            if (vuData && dataSize >= 0x498u)
+                std::memcpy(&xmenGameplayVuSummary.endTagLo,
+                    vuData + 0x490u, sizeof(xmenGameplayVuSummary.endTagLo));
+            finishXmenGameplayVuSummary(m_state, m_cycle);
+        }
+        return;
+    }
+#endif
     m_state.top = top;
     m_state.itop = itop;
     m_state.stoppedByD = false;
     m_state.stoppedByT = false;
     m_running = true;
-    if (xmenGameplayVuSummary.active)
-        ++xmenGameplayVuSummary.slices;
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+#if defined(PS2X_ENABLE_VU_COMPILED_ENGINE)
+    if (m_running)
+        tryBeginCompiledVuStream(*this, vuCode, codeSize, vuData, dataSize, memory, top, itop);
+#endif
     if (xmenGameplayVuSummary.active && !m_running)
     {
         if (vuData && dataSize >= 0x498u)

@@ -44,17 +44,23 @@ namespace
     }
 }
 
-bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
+PSPadBackend::PSPadBackend()
 {
-    if (!data || size < 32)
-        return false;
+    m_state[0] = 0x01;
+    m_state[1] = kPadAnalogMarker;
+    m_state[2] = 0xFF;
+    m_state[3] = 0xFF;
+    m_state[4] = m_state[5] = m_state[6] = m_state[7] = kPadStickCenter;
+}
 
-    std::memset(data, 0, 32);
-    data[0] = 0x01;
-    data[1] = kPadAnalogMarker;
-    data[2] = 0xFF;
-    data[3] = 0xFF;
-    data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
+void PSPadBackend::pollHostState()
+{
+    std::array<uint8_t, 32> state{};
+    state[0] = 0x01;
+    state[1] = kPadAnalogMarker;
+    state[2] = 0xFF;
+    state[3] = 0xFF;
+    state[4] = state[5] = state[6] = state[7] = kPadStickCenter;
 
     uint16_t btns = 0xFFFFu;
     const int gamepad = findFirstGamepad();
@@ -100,10 +106,10 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
         float ly = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_Y);
         float rx = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_X);
         float ry = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y);
-        data[6] = axisToByte(lx);
-        data[7] = axisToByte(ly);
-        data[4] = axisToByte(rx);
-        data[5] = axisToByte(ry);
+        state[6] = axisToByte(lx);
+        state[7] = axisToByte(ly);
+        state[4] = axisToByte(rx);
+        state[5] = axisToByte(ry);
     }
     if (IsKeyDown(KEY_UP))
         clearBit(PAD_UP);
@@ -119,13 +125,13 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     const int rightX = (IsKeyDown(KEY_L) ? 1 : 0) - (IsKeyDown(KEY_J) ? 1 : 0);
     const int rightY = (IsKeyDown(KEY_K) ? 1 : 0) - (IsKeyDown(KEY_I) ? 1 : 0);
     if (leftX != 0)
-        data[6] = leftX < 0 ? 0x00u : 0xFFu;
+        state[6] = leftX < 0 ? 0x00u : 0xFFu;
     if (leftY != 0)
-        data[7] = leftY < 0 ? 0x00u : 0xFFu;
+        state[7] = leftY < 0 ? 0x00u : 0xFFu;
     if (rightX != 0)
-        data[4] = rightX < 0 ? 0x00u : 0xFFu;
+        state[4] = rightX < 0 ? 0x00u : 0xFFu;
     if (rightY != 0)
-        data[5] = rightY < 0 ? 0x00u : 0xFFu;
+        state[5] = rightY < 0 ? 0x00u : 0xFFu;
 
     if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
         clearBit(PAD_CROSS);
@@ -152,7 +158,19 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     if (IsKeyDown(KEY_RIGHT_CONTROL))
         clearBit(PAD_R3);
 
-    data[2] = static_cast<uint8_t>(btns & 0xFF);
-    data[3] = static_cast<uint8_t>(btns >> 8);
+    state[2] = static_cast<uint8_t>(btns & 0xFF);
+    state[3] = static_cast<uint8_t>(btns >> 8);
+
+    std::lock_guard<std::mutex> lock(m_stateMutex);
+    m_state = state;
+}
+
+bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
+{
+    if (!data || size < m_state.size())
+        return false;
+
+    std::lock_guard<std::mutex> lock(m_stateMutex);
+    std::memcpy(data, m_state.data(), m_state.size());
     return true;
 }

@@ -6,6 +6,7 @@
 #include "ps2_vif_trace.h"
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -743,6 +744,7 @@ bool PS2Memory::initialize(size_t ramSize)
     }
     m_codeRegions.clear();
     m_path3Masked = false;
+    m_vif1StalledData.clear();
     m_path3MaskedFifo.clear();
     m_vif1PendingPath2ImageQwc = 0u;
     m_vif1PendingPath2DirectHl = false;
@@ -1729,6 +1731,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 m_vif1PendingPath2DirectHl = false;
                 m_vif1MscalPending = false;
                 m_vif1PendingMscalUnpacks = 0u;
+                m_vif1StalledData.clear();
             }
             if (value & 0x8u) // STC
             {
@@ -2492,6 +2495,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 void PS2Memory::processPendingTransfers()
 {
     RuntimeProfile::Scope transferProfile(RuntimeProfile::Phase::Transfers);
+    using TransferClock = std::chrono::steady_clock;
+    const bool profileTransfers = RuntimeProfile::enabled();
+    const auto profileStart = profileTransfers ? TransferClock::now() : TransferClock::time_point{};
+    const size_t profileGifPackets = m_pendingGifTransfers.size();
+    const size_t profileVif0Packets = m_pendingVif0Transfers.size();
+    const size_t profileVif1Packets = m_pendingVif1Transfers.size();
     reportRdramPageWatch(gs().vsyncTick.load(std::memory_order_relaxed));
     const bool hadGif = !m_pendingGifTransfers.empty();
     uint64_t gifTransferQwc = 0u;
@@ -2562,6 +2571,7 @@ void PS2Memory::processPendingTransfers()
         }
     }
     m_pendingGifTransfers.clear();
+    const auto profileGifDone = profileTransfers ? TransferClock::now() : TransferClock::time_point{};
 
     const bool hadVif0 = !m_pendingVif0Transfers.empty();
     for (auto &p : m_pendingVif0Transfers)
@@ -2620,6 +2630,7 @@ void PS2Memory::processPendingTransfers()
         }
     }
     m_pendingVif0Transfers.clear();
+    const auto profileVif0Done = profileTransfers ? TransferClock::now() : TransferClock::time_point{};
 
     const bool hadVif1 = !m_pendingVif1Transfers.empty();
     for (auto &p : m_pendingVif1Transfers)
@@ -2680,9 +2691,11 @@ void PS2Memory::processPendingTransfers()
         }
     }
     m_pendingVif1Transfers.clear();
+    const auto profileVif1Done = profileTransfers ? TransferClock::now() : TransferClock::time_point{};
 
     if (m_gifArbiter)
         m_gifArbiter->drain();
+    const auto profileDrainDone = profileTransfers ? TransferClock::now() : TransferClock::time_point{};
 
     constexpr uint32_t D_STAT = 0x1000E010u;
     auto raiseDStatChannel = [&](uint32_t channelBit)
@@ -2718,6 +2731,63 @@ void PS2Memory::processPendingTransfers()
         queueCompletedDmacCause(1u);
         m_ioRegisters[0x10009000u] &= ~0x100u;
         m_ioRegisters[0x10009020u] = 0u;
+    }
+
+    if (profileTransfers)
+    {
+        struct TransferProfileTotals
+        {
+            uint64_t calls = 0u;
+            uint64_t gifPackets = 0u;
+            uint64_t vif0Packets = 0u;
+            uint64_t vif1Packets = 0u;
+            uint64_t gifNs = 0u;
+            uint64_t vif0Ns = 0u;
+            uint64_t vif1Ns = 0u;
+            uint64_t drainNs = 0u;
+            uint64_t completionNs = 0u;
+            uint64_t totalNs = 0u;
+            TransferClock::time_point reportStart{};
+        };
+        static thread_local TransferProfileTotals totals{};
+        const auto profileDone = TransferClock::now();
+        auto elapsedNs = [](TransferClock::time_point begin, TransferClock::time_point end)
+        {
+            return static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
+        };
+        if (totals.reportStart == TransferClock::time_point{})
+            totals.reportStart = profileStart;
+        ++totals.calls;
+        totals.gifPackets += profileGifPackets;
+        totals.vif0Packets += profileVif0Packets;
+        totals.vif1Packets += profileVif1Packets;
+        totals.gifNs += elapsedNs(profileStart, profileGifDone);
+        totals.vif0Ns += elapsedNs(profileGifDone, profileVif0Done);
+        totals.vif1Ns += elapsedNs(profileVif0Done, profileVif1Done);
+        totals.drainNs += elapsedNs(profileVif1Done, profileDrainDone);
+        totals.completionNs += elapsedNs(profileDrainDone, profileDone);
+        totals.totalNs += elapsedNs(profileStart, profileDone);
+        if (profileDone - totals.reportStart >= std::chrono::seconds(1))
+        {
+            constexpr double kNsPerMs = 1000000.0;
+            std::fprintf(stderr,
+                         "[runtime:transfer-profile] calls=%llu packets=%llu/%llu/%llu "
+                         "gif-ms=%.3f vif0-ms=%.3f vif1-ms=%.3f drain-ms=%.3f "
+                         "completion-ms=%.3f total-ms=%.3f\n",
+                         static_cast<unsigned long long>(totals.calls),
+                         static_cast<unsigned long long>(totals.gifPackets),
+                         static_cast<unsigned long long>(totals.vif0Packets),
+                         static_cast<unsigned long long>(totals.vif1Packets),
+                         static_cast<double>(totals.gifNs) / kNsPerMs,
+                         static_cast<double>(totals.vif0Ns) / kNsPerMs,
+                         static_cast<double>(totals.vif1Ns) / kNsPerMs,
+                         static_cast<double>(totals.drainNs) / kNsPerMs,
+                         static_cast<double>(totals.completionNs) / kNsPerMs,
+                         static_cast<double>(totals.totalNs) / kNsPerMs);
+            totals = {};
+            totals.reportStart = profileDone;
+        }
     }
 }
 
@@ -2850,6 +2920,27 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
         m_gifArbiter->submit(pathId, data, sizeBytes, path2DirectHl);
     else if (m_gifPacketCallback)
         m_gifPacketCallback(data, sizeBytes);
+
+    if (m_gifArbiter && drainImmediately)
+        m_gifArbiter->drain();
+}
+
+void PS2Memory::submitGifPacket(GifPathId pathId, std::vector<uint8_t> data,
+                                bool drainImmediately, bool path2DirectHl)
+{
+    if (data.size() < 16u)
+        return;
+    if (xmenDiagnosticsEnabled() || pathId == GifPathId::Path3)
+    {
+        submitGifPacket(pathId, data.data(), static_cast<uint32_t>(data.size()),
+                        drainImmediately, path2DirectHl);
+        return;
+    }
+
+    if (m_gifArbiter)
+        m_gifArbiter->submitOwned(pathId, std::move(data), path2DirectHl);
+    else if (m_gifPacketCallback)
+        m_gifPacketCallback(data.data(), static_cast<uint32_t>(data.size()));
 
     if (m_gifArbiter && drainImmediately)
         m_gifArbiter->drain();

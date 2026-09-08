@@ -773,6 +773,39 @@ void register_ps2_memory_tests()
             t.IsTrue(matches, "UNPACK num=0 should copy 256 V4_32 vectors (4096 bytes)");
         });
 
+        tc.Run("VIF UNPACK V4-32 contiguous copy wraps VU1 memory", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kVectors = 32u;
+            constexpr uint32_t kStartVector = 0x3F0u;
+            std::vector<uint8_t> packet;
+            packet.reserve(4u + kVectors * 16u);
+            appendU32(packet, makeVifCmd(0x6Cu, kVectors, kStartVector));
+            for (uint32_t i = 0u; i < kVectors * 16u; ++i)
+                packet.push_back(static_cast<uint8_t>((i * 5u + 7u) & 0xFFu));
+
+            std::memset(mem.getVU1Data(), 0xCD, PS2_VU1_DATA_SIZE);
+            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+
+            const uint8_t *vu1Data = mem.getVU1Data();
+            bool matches = true;
+            for (uint32_t i = 0u; i < kVectors * 16u; ++i)
+            {
+                const uint32_t destination =
+                    ((kStartVector * 16u) + i) & (PS2_VU1_DATA_SIZE - 1u);
+                if (vu1Data[destination] != static_cast<uint8_t>((i * 5u + 7u) & 0xFFu))
+                {
+                    matches = false;
+                    break;
+                }
+            }
+            t.IsTrue(matches, "contiguous V4-32 copy should preserve wrapped bytes");
+            t.Equals(static_cast<uint32_t>(vu1Data[0x200u]), 0xCDu,
+                     "contiguous V4-32 copy should not touch unrelated VU1 memory");
+        });
+
         tc.Run("VIF control commands update MARK MASK ROW and COL registers", [](TestCase &t)
         {
             PS2Memory mem;
@@ -1451,6 +1484,68 @@ void register_ps2_memory_tests()
             t.IsTrue(!mem.dispatchPendingVu1Mscal(), "queue should be empty after dispatch");
         });
 
+        tc.Run("VIF1 retries a stalled MSCAL before later commands", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            bool busy = true;
+            uint32_t callbackCount = 0u;
+            mem.setVu1ServiceCallback([&](bool)
+            {
+                return busy;
+            });
+            mem.setVu1MscalCallback([&](uint32_t, uint32_t, uint32_t)
+            {
+                ++callbackCount;
+            });
+
+            std::vector<uint8_t> packet;
+            appendU32(packet, makeVifCmd(0x14u, 0u, 0x0003u));
+            appendU32(packet, makeVifCmd(0x01u, 0u, 0x0102u));
+            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+
+            t.Equals(callbackCount, 0u, "stalled MSCAL should not dispatch while VU1 is busy");
+            t.Equals(mem.vif1_regs.cycle, 0u, "commands after a stalled MSCAL should remain pending");
+
+            busy = false;
+            mem.processVIF1Data(nullptr, 0u);
+
+            t.Equals(callbackCount, 1u, "stalled MSCAL should dispatch exactly once after VU1 becomes idle");
+            t.Equals(mem.vif1_regs.cycle, 0x0102u, "commands after a stalled MSCAL should resume in order");
+        });
+
+        tc.Run("VIF1 retries a stalled MSCNT before later commands", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            bool busy = true;
+            uint32_t callbackCount = 0u;
+            mem.setVu1ServiceCallback([&](bool)
+            {
+                return busy;
+            });
+            mem.setVu1MscntCallback([&](uint32_t, uint32_t)
+            {
+                ++callbackCount;
+            });
+
+            std::vector<uint8_t> packet;
+            appendU32(packet, makeVifCmd(0x17u, 0u, 0u));
+            appendU32(packet, makeVifCmd(0x01u, 0u, 0x0203u));
+            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+
+            t.Equals(callbackCount, 0u, "stalled MSCNT should not dispatch while VU1 is busy");
+            t.Equals(mem.vif1_regs.cycle, 0u, "commands after a stalled MSCNT should remain pending");
+
+            busy = false;
+            mem.processVIF1Data(nullptr, 0u);
+
+            t.Equals(callbackCount, 1u, "stalled MSCNT should dispatch exactly once after VU1 becomes idle");
+            t.Equals(mem.vif1_regs.cycle, 0x0203u, "commands after a stalled MSCNT should resume in order");
+        });
+
         tc.Run("VIF MSKPATH3 uses immediate bit15", [](TestCase &t)
         {
             PS2Memory mem;
@@ -1531,6 +1626,48 @@ void register_ps2_memory_tests()
             t.Equals(order[0], static_cast<uint8_t>(0x11u), "PATH1 should be drained first");
             t.Equals(order[1], static_cast<uint8_t>(0x22u), "PATH2 should be drained second");
             t.Equals(order[2], static_cast<uint8_t>(0x33u), "PATH3 should be drained third");
+        });
+
+        tc.Run("GIF arbiter preserves priority for owned packets", [](TestCase &t)
+        {
+            std::vector<uint8_t> order;
+            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                if (data && sizeBytes > 0u)
+                    order.push_back(data[0]);
+            });
+
+            arbiter.submitOwned(GifPathId::Path3, std::vector<uint8_t>(16u, 0x33u));
+            arbiter.submitOwned(GifPathId::Path2, std::vector<uint8_t>(16u, 0x22u));
+            arbiter.submitOwned(GifPathId::Path1, std::vector<uint8_t>(16u, 0x11u));
+            arbiter.drain();
+
+            t.Equals(order.size(), static_cast<size_t>(3u), "all owned packets should be drained");
+            t.Equals(order[0], static_cast<uint8_t>(0x11u), "owned PATH1 should be drained first");
+            t.Equals(order[1], static_cast<uint8_t>(0x22u), "owned PATH2 should be drained second");
+            t.Equals(order[2], static_cast<uint8_t>(0x33u), "owned PATH3 should be drained third");
+        });
+
+        tc.Run("GIF arbiter coalesces adjacent owned packets", [](TestCase &t)
+        {
+            std::vector<uint8_t> bytes;
+            uint32_t callbacks = 0u;
+            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                ++callbacks;
+                bytes.assign(data, data + sizeBytes);
+            });
+
+            arbiter.submitOwned(GifPathId::Path1, std::vector<uint8_t>(16u, 0x11u));
+            arbiter.submitOwned(GifPathId::Path1, std::vector<uint8_t>(16u, 0x22u));
+            arbiter.drain();
+
+            t.Equals(callbacks, 1u, "adjacent owned PATH1 packets should share one callback");
+            t.Equals(bytes.size(), static_cast<size_t>(32u), "coalesced bytes should be preserved");
+            t.Equals(bytes.front(), static_cast<uint8_t>(0x11u), "first packet should remain first");
+            t.Equals(bytes.back(), static_cast<uint8_t>(0x22u), "second packet should remain second");
+            const auto counters = arbiter.debugCounters();
+            t.Equals(counters.processed[0], uint64_t{2u}, "processed count should remain logical");
         });
 
         tc.Run("VIF DIRECTHL stalls behind queued PATH3 IMAGE packets", [](TestCase &t)

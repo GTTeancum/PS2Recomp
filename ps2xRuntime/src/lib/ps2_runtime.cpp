@@ -14,6 +14,9 @@
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
+#if defined(PS2X_ENABLE_VU_COMPILED_ENGINE)
+#include "runtime_adapter.h"
+#endif
 
 #include <iostream>
 #include <fstream>
@@ -1547,6 +1550,37 @@ bool PS2Runtime::syncCoreSubsystems()
                                        if (!m_vu1.isRunning())
                                            return false;
 
+                                       static const uint64_t traceMinTick = []
+                                       {
+                                           const char *value = std::getenv(
+                                               "PS2X_VU1_SERVICE_TRACE_MIN_TICK");
+                                           if (!value || value[0] == '\0')
+                                               return std::numeric_limits<uint64_t>::max();
+                                           char *end = nullptr;
+                                           const uint64_t parsed = std::strtoull(value, &end, 0);
+                                           return end && end != value && *end == '\0'
+                                               ? parsed
+                                               : std::numeric_limits<uint64_t>::max();
+                                       }();
+                                       static uint32_t traceCount = 0u;
+                                       const uint64_t tick = m_memory.gs().vsyncTick.load(
+                                           std::memory_order_relaxed);
+                                       const bool traceService = drain && tick >= traceMinTick && traceCount < 256u;
+                                       if (traceService)
+                                       {
+                                           const auto &state = m_vu1.state();
+                                           std::fprintf(stderr,
+                                                        "[vu1:service-before] index=%u tick=%llu drain=%u "
+                                                        "pc=0x%x cycles=%llu top=0x%x itop=0x%x\n",
+                                                        traceCount,
+                                                        static_cast<unsigned long long>(tick),
+                                                        drain ? 1u : 0u,
+                                                        state.pc,
+                                                        static_cast<unsigned long long>(state.cycles),
+                                                        state.top,
+                                                        state.itop);
+                                       }
+
                                        const uint32_t traceSlice =
                                            g_xmenVu1MailboxTraceSlice.load(std::memory_order_relaxed);
                                        const bool traceMailbox =
@@ -1568,6 +1602,53 @@ bool PS2Runtime::syncCoreSubsystems()
                                                     m_gs, &m_memory,
                                                     m_vu1.state().top, m_vu1.state().itop,
                                                     drain ? (1u << 20) : 64u);
+                                       if (traceService)
+                                       {
+                                           const auto &state = m_vu1.state();
+                                           std::fprintf(stderr,
+                                                        "[vu1:service-after] index=%u tick=%llu drain=%u "
+                                                        "pc=0x%x cycles=%llu top=0x%x itop=0x%x running=%u\n",
+                                                        traceCount,
+                                                        static_cast<unsigned long long>(tick),
+                                                        drain ? 1u : 0u,
+                                                        state.pc,
+                                                        static_cast<unsigned long long>(state.cycles),
+                                                        state.top,
+                                                        state.itop,
+                                                        m_vu1.isRunning() ? 1u : 0u);
+                                           ++traceCount;
+                                       }
+                                       if (drain && m_vu1.isRunning() && tick >= traceMinTick)
+                                       {
+                                           static uint32_t stalledDrainCount = 0u;
+                                           if (stalledDrainCount < 64u)
+                                           {
+                                               const auto &state = m_vu1.state();
+                                               std::fprintf(stderr,
+                                                            "[vu1:drain-stalled] index=%u tick=%llu "
+                                                            "pc=0x%x cycles=%llu top=0x%x itop=0x%x"
+#if defined(PS2X_ENABLE_VU_COMPILED_ENGINE)
+                                                            " rejectTick=%llu rejectPc=0x%x "
+                                                            "rejectCycles=%llu reject=%s"
+#endif
+                                                            "\n",
+                                                            stalledDrainCount++,
+                                                            static_cast<unsigned long long>(tick),
+                                                            state.pc,
+                                                            static_cast<unsigned long long>(state.cycles),
+                                                            state.top,
+                                                            state.itop
+#if defined(PS2X_ENABLE_VU_COMPILED_ENGINE)
+                                                            , static_cast<unsigned long long>(
+                                                                compiledVuLastDrainRejection().tick),
+                                                            compiledVuLastDrainRejection().pc,
+                                                            static_cast<unsigned long long>(
+                                                                compiledVuLastDrainRejection().cycles),
+                                                            compiledVuLastDrainRejection().reason.c_str()
+#endif
+                                                            );
+                                           }
+                                       }
                                        if (traceMailbox)
                                        {
                                            traceXmenVu1Mailbox("resume-after", traceSlice, m_vu1, m_memory.getVU1Data());
@@ -1593,6 +1674,34 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     static const uint64_t traceMinTick = []
+                                     {
+                                         const char *value = std::getenv(
+                                             "PS2X_VU1_SERVICE_TRACE_MIN_TICK");
+                                         if (!value || value[0] == '\0')
+                                             return std::numeric_limits<uint64_t>::max();
+                                         char *end = nullptr;
+                                         const uint64_t parsed = std::strtoull(value, &end, 0);
+                                         return end && end != value && *end == '\0'
+                                             ? parsed
+                                             : std::numeric_limits<uint64_t>::max();
+                                     }();
+                                     static uint32_t traceCount = 0u;
+                                     const uint64_t tick = m_memory.gs().vsyncTick.load(
+                                         std::memory_order_relaxed);
+                                     const bool traceExecute = tick >= traceMinTick && traceCount < 128u;
+                                     if (traceExecute)
+                                     {
+                                         std::fprintf(stderr,
+                                                      "[vu1:execute-before] index=%u tick=%llu start=0x%x "
+                                                      "top=0x%x itop=0x%x cycles=%llu\n",
+                                                      traceCount,
+                                                      static_cast<unsigned long long>(tick),
+                                                      startPC,
+                                                      top,
+                                                      itop,
+                                                      static_cast<unsigned long long>(m_vu1.state().cycles));
+                                     }
                                      const bool traceMailbox =
                                          startPC == 0x80u && top == 0xA8u && itop == 0x11Au;
                                      if (traceMailbox)
@@ -1605,6 +1714,22 @@ bool PS2Runtime::syncCoreSubsystems()
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 64u);
+                                     if (traceExecute)
+                                     {
+                                         const auto &state = m_vu1.state();
+                                         std::fprintf(stderr,
+                                                      "[vu1:execute-after] index=%u tick=%llu start=0x%x "
+                                                      "pc=0x%x cycles=%llu top=0x%x itop=0x%x running=%u\n",
+                                                      traceCount,
+                                                      static_cast<unsigned long long>(tick),
+                                                      startPC,
+                                                      state.pc,
+                                                      static_cast<unsigned long long>(state.cycles),
+                                                      state.top,
+                                                      state.itop,
+                                                      m_vu1.isRunning() ? 1u : 0u);
+                                         ++traceCount;
+                                     }
                                      if (traceMailbox)
                                      {
                                          traceXmenVu1Mailbox("execute-after", 0u, m_vu1, m_memory.getVU1Data());
@@ -2367,6 +2492,38 @@ void PS2Runtime::dispatchGuestReturn(R5900Context *ctx, uint32_t targetPc) noexc
         (result != 0u ? g_xmenFrameRenderGateTrue : g_xmenFrameRenderGateFalse)
             .fetch_add(1u, std::memory_order_relaxed);
         g_xmenFrameRenderGateLastResult.store(result, std::memory_order_relaxed);
+
+        if (PS2X_CACHED_GETENV("PS2X_XMEN_RENDER_GATE_TRACE") != nullptr)
+        {
+            static uint32_t lastResult = std::numeric_limits<uint32_t>::max();
+            static uint64_t falseCount = 0u;
+            const bool changed = result != lastResult;
+            lastResult = result;
+            if (result == 0u)
+                ++falseCount;
+            if (changed || (result == 0u && (falseCount <= 8u || (falseCount % 120u) == 0u)))
+            {
+                uint8_t *rdram = m_memory.getRDRAM();
+                const uint32_t owner = GPR_U32(ctx, 18);
+                const uint32_t ownerVtable = readRdramProbeU32(rdram, owner);
+                const uint32_t method = readRdramProbeU32(rdram, ownerVtable + 0x11Cu);
+                std::fprintf(stderr,
+                             "[xmen-render-gate:return] tick=%llu result=%u false-count=%llu "
+                             "owner=0x%x vtable=0x%x method=0x%x be0=%u bd4=0x%x c08=0x%x "
+                             "source=0x%x ra=0x%x\n",
+                             static_cast<unsigned long long>(m_eeScheduler->currentVSyncTick()),
+                             result,
+                             static_cast<unsigned long long>(falseCount),
+                             owner,
+                             ownerVtable,
+                             method,
+                             readRdramProbeU32(rdram, owner + 0xBE0u),
+                             readRdramProbeU32(rdram, owner + 0xBD4u),
+                             readRdramProbeU32(rdram, owner + 0xC08u),
+                             sourcePc,
+                             getRegU32(ctx, 31));
+            }
+        }
     }
     if (targetPc == 0x003B1160u || sourcePc == 0x002FA54Cu)
     {
@@ -2431,6 +2588,45 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
     const GuestHeapCallScope heapCall(ctx, sourcePc, targetPc);
+    if (targetPc == 0x00321B90u &&
+        PS2X_CACHED_GETENV("PS2X_XMEN_RENDER_GATE_TRACE") != nullptr)
+    {
+        const uint32_t owner = getRegU32(ctx, 4);
+        std::fprintf(stderr,
+                     "[xmen-render-owner:set] tick=%llu source=0x%x owner=0x%x "
+                     "old=0x%x new=0x%x ra=0x%x\n",
+                     static_cast<unsigned long long>(m_eeScheduler->currentVSyncTick()),
+                     sourcePc,
+                     owner,
+                     readRdramProbeU32(rdram, owner + 0xC08u),
+                     getRegU32(ctx, 5),
+                     getRegU32(ctx, 31));
+    }
+    if (targetPc == 0x0031EB90u &&
+        PS2X_CACHED_GETENV("PS2X_XMEN_RENDER_GATE_TRACE") != nullptr)
+    {
+        std::fprintf(stderr,
+                     "[xmen-render-owner:shutdown] tick=%llu source=0x%x "
+                     "owner=0x%x ra=0x%x sp=0x%x\n",
+                     static_cast<unsigned long long>(m_eeScheduler->currentVSyncTick()),
+                     sourcePc,
+                     getRegU32(ctx, 4),
+                     getRegU32(ctx, 31),
+                     getRegU32(ctx, 29));
+    }
+    if (targetPc == 0x00322CC0u &&
+        PS2X_CACHED_GETENV("PS2X_XMEN_RENDER_GATE_TRACE") != nullptr)
+    {
+        std::fprintf(stderr,
+                     "[xmen-render-owner:leave-scene] tick=%llu source=0x%x "
+                     "owner=0x%x ra=0x%x sp=0x%x a1=0x%x\n",
+                     static_cast<unsigned long long>(m_eeScheduler->currentVSyncTick()),
+                     sourcePc,
+                     getRegU32(ctx, 4),
+                     getRegU32(ctx, 31),
+                     getRegU32(ctx, 29),
+                     getRegU32(ctx, 5));
+    }
     static thread_local std::array<uint32_t, 256> s_guestReturnTargets{};
     static thread_local std::array<uint32_t, 256> s_guestCallSources{};
     static thread_local uint32_t s_guestReturnDepth = 0u;
@@ -14290,6 +14486,7 @@ void PS2Runtime::run()
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
         EndDrawing();
+        m_padBackend.pollHostState();
 
         if (presentationFps.update(PresentationFps::Clock::now(), newPresentation))
             SetWindowTitle(presentationFps.title(g_hostWindowTitle).c_str());

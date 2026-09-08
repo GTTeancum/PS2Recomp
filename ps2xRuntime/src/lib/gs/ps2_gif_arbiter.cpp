@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 namespace
 {
@@ -154,6 +155,42 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     m_queue.push_back(std::move(pkt));
 }
 
+void GifArbiter::submitOwned(GifPathId pathId, std::vector<uint8_t> data, bool path2DirectHl)
+{
+    if (xmenDiagnosticsEnabled())
+    {
+        submit(pathId, data.data(), static_cast<uint32_t>(data.size()), path2DirectHl);
+        return;
+    }
+    if (data.size() < 16u || !m_processFn)
+        return;
+
+    m_debugSubmitted[static_cast<size_t>(pathId) - 1u].fetch_add(
+        1u, std::memory_order_relaxed);
+    const bool directHl = (pathId == GifPathId::Path2) && path2DirectHl;
+    const bool path3Image = (pathId == GifPathId::Path3) &&
+        isImagePacket(data.data(), static_cast<uint32_t>(data.size()));
+    if (!m_queue.empty())
+    {
+        auto &tail = m_queue.back();
+        if (tail.pathId == pathId && tail.path2DirectHl == directHl &&
+            tail.path3Image == path3Image &&
+            tail.data.size() <= std::numeric_limits<uint32_t>::max() &&
+            data.size() <= std::numeric_limits<uint32_t>::max() - tail.data.size())
+        {
+            tail.data.insert(tail.data.end(), data.begin(), data.end());
+            ++tail.logicalPackets;
+            return;
+        }
+    }
+    GifArbiterPacket pkt;
+    pkt.pathId = pathId;
+    pkt.path2DirectHl = directHl;
+    pkt.path3Image = path3Image;
+    pkt.data = std::move(data);
+    m_queue.push_back(std::move(pkt));
+}
+
 void GifArbiter::drain()
 {
     if (!m_processFn)
@@ -190,7 +227,7 @@ void GifArbiter::drain()
         if (!pkt.data.empty())
         {
             m_debugProcessed[static_cast<size_t>(pkt.pathId) - 1u].fetch_add(
-                1u, std::memory_order_relaxed);
+                pkt.logicalPackets, std::memory_order_relaxed);
             if (xmenDiagnosticsEnabled())
                 traceXmenConsoleTexturePacket("process", pkt.pathId, pkt.path2DirectHl,
                                               pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));

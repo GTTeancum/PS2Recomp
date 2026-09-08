@@ -363,6 +363,7 @@ public:
     void flushMaskedPath3Packets(bool drainImmediately = true);
 
     void submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately = true, bool path2DirectHl = false);
+    void submitGifPacket(GifPathId pathId, std::vector<uint8_t> data, bool drainImmediately = true, bool path2DirectHl = false);
     void processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount);
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     bool tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint32_t chcr);
@@ -448,6 +449,7 @@ public:
     uint32_t m_vif1PendingMscalTop = 0u;
     uint32_t m_vif1PendingMscalItop = 0u;
     uint32_t m_vif1PendingMscalUnpacks = 0u;
+    std::vector<uint8_t> m_vif1StalledData;
     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
 
     struct PendingTransfer

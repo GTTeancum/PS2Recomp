@@ -9,7 +9,7 @@
 std::optional<VUCompiledState::Input> VUCompiledState::capture(const VU1Interpreter &v, uint32_t budget)
 {
     const auto &s = v.m_state;
-    if (v.m_unit != VU1Interpreter::Unit::VU1 || budget <= 64 || budget > 1048576 ||
+    if (v.m_unit != VU1Interpreter::Unit::VU1 || budget <= 64 ||
         !v.m_running || v.m_stopRequested || s.pc >= 16384 || (s.pc & 7) || s.ebit ||
         s.haltAfterDelaySlot || s.branchPending || s.dBitEnabled || s.tBitEnabled ||
         s.stoppedByD || s.stoppedByT || v.m_pendingHaltD || v.m_pendingHaltT ||
@@ -102,17 +102,42 @@ bool validPacket(const std::vector<uint8_t> &bytes)
 bool VUCompiledState::commit(VU1Interpreter &v, const Input &input, const Output &output,
     uint8_t *data, uint32_t dataSize, GS &gs, PS2Memory *memory)
 {
-    const auto current = capture(v, input.budget);
-    if (!current || !data || dataSize != 16384 ||
-        !sameState(current->state, input.state) ||
-        current->cycle != input.cycle || current->nextSequence != input.nextSequence ||
-        current->vfWrites != input.vfWrites || current->flags != input.flags ||
-        current->vfReady != input.vfReady || current->vfLatest != input.vfLatest ||
-        current->branchBackupValue != input.branchBackupValue || current->branchBackupReg != input.branchBackupReg ||
-        current->branchBackupValid != input.branchBackupValid || current->vfMask != input.vfMask ||
-        current->flagMask != input.flagMask || !output.elapsed || output.elapsed > input.budget ||
+    return commitInternal(v, input, output, data, dataSize, gs, memory, false, nullptr);
+}
+
+bool VUCompiledState::commitStream(VU1Interpreter &v, const Input &input, Output &&output,
+    uint8_t *data, uint32_t dataSize, GS &gs, PS2Memory *memory)
+{
+    return commitInternal(v, input, output, data, dataSize, gs, memory, true, &output);
+}
+
+bool VUCompiledState::commitInternal(VU1Interpreter &v, const Input &input, const Output &output,
+    uint8_t *data, uint32_t dataSize, GS &gs, PS2Memory *memory, bool streamOwned,
+    Output *ownedOutput)
+{
+    if (!data || dataSize != 16384 || !output.elapsed || output.elapsed > input.budget ||
         (output.statusMask & 0xfff) != 0xfff || (output.macMask & 0xffff) != 0xffff ||
         output.packets.size() > 1024) return false;
+    if (streamOwned)
+    {
+        if (v.m_unit != VU1Interpreter::Unit::VU1 || !v.m_running || v.m_stopRequested ||
+            v.m_cycle != input.cycle || v.m_nextWriteSequence != input.nextSequence ||
+            v.m_vfWritePipelineMask != input.vfMask || v.m_flagPipelineMask != input.flagMask ||
+            !sameState(v.m_state, input.state)) return false;
+    }
+    else
+    {
+        if (output.dataIsLive) return false;
+        const auto current = capture(v, input.budget);
+        if (!current || !sameState(current->state, input.state) ||
+            current->cycle != input.cycle || current->nextSequence != input.nextSequence ||
+            current->vfWrites != input.vfWrites || current->flags != input.flags ||
+            current->vfReady != input.vfReady || current->vfLatest != input.vfLatest ||
+            current->branchBackupValue != input.branchBackupValue ||
+            current->branchBackupReg != input.branchBackupReg ||
+            current->branchBackupValid != input.branchBackupValid ||
+            current->vfMask != input.vfMask || current->flagMask != input.flagMask) return false;
+    }
     const auto &s = output.state;
     constexpr uint32_t zeroRegister[] = {0, 0, 0, 0x3f800000};
     if (s.pc >= 16384 || (s.pc & 7) || s.cycles != input.cycle + output.elapsed ||
@@ -146,12 +171,17 @@ bool VUCompiledState::commit(VU1Interpreter &v, const Input &input, const Output
     v.m_viBranchBackupReg = 0;
     v.m_viBranchBackupValid = false;
     v.m_running = false;
-    std::memcpy(data, output.data.data(), output.data.size());
-    for (const auto &packet : output.packets)
+    if (!output.dataIsLive)
+        std::memcpy(data, output.data.data(), output.data.size());
+    for (size_t index = 0; index < output.packets.size(); ++index)
     {
+        const auto &packet = output.packets[index];
         const auto size = static_cast<uint32_t>(packet.bytes.size());
         if (VUReplay::observeGif(packet.bytes.data(), size, input.cycle + packet.cycle)) continue;
-        if (memory) memory->submitGifPacket(GifPathId::Path1, packet.bytes.data(), size);
+        if (memory && ownedOutput)
+            memory->submitGifPacket(GifPathId::Path1,
+                std::move(ownedOutput->packets[index].bytes), false);
+        else if (memory) memory->submitGifPacket(GifPathId::Path1, packet.bytes.data(), size);
         else gs.processGIFPacket(packet.bytes.data(), size);
     }
     return true;

@@ -46,10 +46,20 @@ public:
         uint32_t statusMask = 0, macMask = 0;
         std::array<uint8_t, 16384> data{};
         std::vector<Packet> packets;
+        bool dataIsLive = false;
     };
     static std::optional<Input> capture(const VU1Interpreter &, uint32_t budget);
     // False means nothing was changed/submitted. True is a completed commit:
     // callers must not fall back after it, including after downstream GS work.
     static bool commit(VU1Interpreter &, const Input &, const Output &,
         uint8_t *data, uint32_t dataSize, GS &, PS2Memory * = nullptr);
+    // Persistent streams hold exclusive ownership between capture and commit.
+    // This keeps output validation while avoiding a second full pipeline capture.
+    static bool commitStream(VU1Interpreter &, const Input &, Output &&,
+        uint8_t *data, uint32_t dataSize, GS &, PS2Memory * = nullptr);
+
+private:
+    static bool commitInternal(VU1Interpreter &, const Input &, const Output &,
+        uint8_t *data, uint32_t dataSize, GS &, PS2Memory *, bool streamOwned,
+        Output *ownedOutput);
 };

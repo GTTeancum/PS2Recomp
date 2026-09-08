@@ -4,6 +4,7 @@
 #include "runtime/ps2_memory.h"
 #include <atomic>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -47,6 +48,54 @@ namespace
             }
         }
         return static_cast<bool>(out);
+    }
+
+    struct PresentationCoverage
+    {
+        uint32_t nonblackPixels = 0u;
+        uint32_t centralNonblackPixels = 0u;
+        uint32_t occupiedTiles = 0u;
+        uint32_t left = UINT32_MAX;
+        uint32_t top = UINT32_MAX;
+        uint32_t right = 0u;
+        uint32_t bottom = 0u;
+    };
+
+    PresentationCoverage measurePresentationCoverage(const std::vector<uint8_t> &pixels,
+                                                       uint32_t width,
+                                                       uint32_t height)
+    {
+        PresentationCoverage coverage{};
+        if (width == 0u || height == 0u ||
+            pixels.size() < static_cast<size_t>(width) * height * 4u)
+            return coverage;
+
+        std::array<bool, 16u * 16u> occupied{};
+        const uint32_t centralLeft = width / 5u;
+        const uint32_t centralRight = (width * 9u + 9u) / 10u;
+        const uint32_t centralTop = (height * 8u) / 100u;
+        const uint32_t centralBottom = (height * 92u + 99u) / 100u;
+        for (uint32_t y = 0u; y < height; ++y)
+        {
+            for (uint32_t x = 0u; x < width; ++x)
+            {
+                const size_t offset = (static_cast<size_t>(y) * width + x) * 4u;
+                if (pixels[offset] <= 4u && pixels[offset + 1u] <= 4u && pixels[offset + 2u] <= 4u)
+                    continue;
+
+                ++coverage.nonblackPixels;
+                if (x >= centralLeft && x < centralRight && y >= centralTop && y < centralBottom)
+                    ++coverage.centralNonblackPixels;
+                coverage.left = std::min(coverage.left, x);
+                coverage.top = std::min(coverage.top, y);
+                coverage.right = std::max(coverage.right, x);
+                coverage.bottom = std::max(coverage.bottom, y);
+                occupied[std::min(15u, y * 16u / height) * 16u +
+                         std::min(15u, x * 16u / width)] = true;
+            }
+        }
+        coverage.occupiedTiles = static_cast<uint32_t>(std::count(occupied.begin(), occupied.end(), true));
+        return coverage;
     }
 
     GSPrimReg decodePrimRegister(uint64_t value)
@@ -800,12 +849,26 @@ void GS::latchHostPresentationFrame()
         presentIndex % latestCaptureInterval == 0u &&
         frame.pixels.size() >= static_cast<size_t>(width) * height * 4u)
     {
-        const bool wrote = writePresentationPpm("gs-present-latest.ppm",
+        const std::string path = "gs-present-latest-" + std::to_string(presentIndex) + ".ppm";
+        const bool wrote = writePresentationPpm(path,
                                                 frame.pixels,
                                                 width,
                                                 height);
-        std::fprintf(stderr, "[gs:present-latest] index=%u wrote=%u\n",
-                     presentIndex, wrote ? 1u : 0u);
+        const PresentationCoverage coverage = measurePresentationCoverage(frame.pixels, width, height);
+        std::fprintf(stderr,
+                     "[gs:present-latest] index=%u tick=%llu path=%s wrote=%u nonblack=%u central=%u "
+                     "tiles=%u bounds=%u,%u,%u,%u\n",
+                     presentIndex,
+                     static_cast<unsigned long long>(request.vsyncTick),
+                     path.c_str(),
+                     wrote ? 1u : 0u,
+                     coverage.nonblackPixels,
+                     coverage.centralNonblackPixels,
+                     coverage.occupiedTiles,
+                     coverage.left,
+                     coverage.top,
+                     coverage.right,
+                     coverage.bottom);
     }
     if (hasFrame && dumpRequestedPresent &&
         frame.pixels.size() >= static_cast<size_t>(width) * height * 4u)

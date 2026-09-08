@@ -220,6 +220,9 @@ template <class Archive> void VUReplay::visitState(Archive &a, VU1Interpreter &v
     {
         a(x.sourceAddress, x.totalBytes, x.copiedBytes, x.currentTagEnd,
           x.cycleCredit, x.issueCycle, x.currentTagEop);
+        require(x.copiedBytes <= x.kMaxBufferSize, "Invalid VU replay PATH1 prefix limit");
+        if (x.packet.size() < x.copiedBytes)
+            x.packet.resize(std::max<size_t>(x.kInitialBufferSize, x.copiedBytes));
         require(x.copiedBytes <= x.packet.size(), "Invalid VU replay PATH1 prefix size");
         a.raw(x.packet.data(), x.copiedBytes);
     }

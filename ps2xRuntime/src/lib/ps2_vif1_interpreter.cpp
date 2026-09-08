@@ -2,6 +2,7 @@
 #include "runtime/ps2_memory.h"
 #include "ps2_vif_trace.h"
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -38,6 +39,71 @@ namespace
     {
         static const bool enabled = std::getenv("PS2X_XMEN_DIAGNOSTICS") != nullptr;
         return enabled;
+    }
+
+    bool runtimePhaseProfileEnabled()
+    {
+        static const bool enabled = std::getenv("PS2X_RUNTIME_PHASE_PROFILE") != nullptr;
+        return enabled;
+    }
+
+    struct Vif1UnpackWorkload
+    {
+        uint64_t calls = 0u;
+        uint64_t writeVectors = 0u;
+        uint64_t sourceVectors = 0u;
+        uint64_t decodeNanoseconds = 0u;
+        uint64_t serviceNanoseconds = 0u;
+    };
+
+    void recordVif1UnpackWorkload(uint8_t vn, uint8_t vl, bool maskEnable,
+                                  uint32_t mode, bool zeroExtend,
+                                  uint32_t cl, uint32_t wl, bool bulk,
+                                  uint32_t writeVectors, uint32_t sourceVectors,
+                                  uint64_t decodeNanoseconds,
+                                  uint64_t serviceNanoseconds)
+    {
+        constexpr size_t kWorkloadCount = 2048u;
+        thread_local std::array<Vif1UnpackWorkload, kWorkloadCount> workloads{};
+        thread_local uint64_t packetCount = 0u;
+
+        const uint32_t cycleClass = (cl == wl) ? 0u : ((cl > wl) ? 1u : 2u);
+        const size_t key = static_cast<size_t>(vn) |
+                           (static_cast<size_t>(vl) << 2u) |
+                           (static_cast<size_t>(maskEnable) << 4u) |
+                           (static_cast<size_t>(mode & 3u) << 5u) |
+                           (static_cast<size_t>(zeroExtend) << 7u) |
+                           (static_cast<size_t>(cycleClass) << 8u) |
+                           (static_cast<size_t>(bulk) << 10u);
+        Vif1UnpackWorkload &workload = workloads[key];
+        ++workload.calls;
+        workload.writeVectors += writeVectors;
+        workload.sourceVectors += sourceVectors;
+        workload.decodeNanoseconds += decodeNanoseconds;
+        workload.serviceNanoseconds += serviceNanoseconds;
+
+        ++packetCount;
+        if (packetCount < 1024u || (packetCount & (packetCount - 1u)) != 0u)
+            return;
+
+        for (size_t form = 0u; form < workloads.size(); ++form)
+        {
+            const Vif1UnpackWorkload &entry = workloads[form];
+            if (entry.calls == 0u)
+                continue;
+
+            std::fprintf(stderr,
+                         "[vif1:workload] packets=%llu vn=%zu vl=%zu mask=%zu mode=%zu usn=%zu cycle=%zu bulk=%zu calls=%llu write-vectors=%llu source-vectors=%llu decode-ns=%llu service-ns=%llu\n",
+                         static_cast<unsigned long long>(packetCount),
+                         form & 3u, (form >> 2u) & 3u, (form >> 4u) & 1u,
+                         (form >> 5u) & 3u, (form >> 7u) & 1u,
+                         (form >> 8u) & 3u, (form >> 10u) & 1u,
+                         static_cast<unsigned long long>(entry.calls),
+                         static_cast<unsigned long long>(entry.writeVectors),
+                         static_cast<unsigned long long>(entry.sourceVectors),
+                         static_cast<unsigned long long>(entry.decodeNanoseconds),
+                         static_cast<unsigned long long>(entry.serviceNanoseconds));
+        }
     }
 
     constexpr uint8_t kGifFmtImage = 2u;
@@ -510,13 +576,23 @@ bool PS2Memory::dispatchPendingVu1Mscal()
 
 void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
-    if (sizeBytes == 0u)
+    std::vector<uint8_t> resumedData;
+    if (!m_vif1StalledData.empty())
+    {
+        resumedData = std::move(m_vif1StalledData);
+        if (data && sizeBytes > 0u)
+            resumedData.insert(resumedData.end(), data, data + sizeBytes);
+        data = resumedData.data();
+        sizeBytes = static_cast<uint32_t>(resumedData.size());
+    }
+
+    if (!data || sizeBytes == 0u)
         return;
 
     m_vif1TransferCount.fetch_add(1u, std::memory_order_relaxed);
 
-    static std::atomic<uint32_t> vif1TransferTraceCount{0u};
-    const uint32_t transferIndex = vif1TransferTraceCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    static thread_local uint32_t vif1TransferTraceCount = 0u;
+    const uint32_t transferIndex = ++vif1TransferTraceCount;
     if (xmenDiagnosticsEnabled() &&
         (transferIndex <= 12u || (transferIndex & (transferIndex - 1u)) == 0u))
     {
@@ -558,8 +634,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         uint8_t num = (cmd >> 16) & 0xFF;
         const bool irq = (cmd & 0x80000000u) != 0u;
 
-        static std::atomic<uint32_t> vif1CommandTraceCount{0u};
-        const uint32_t commandIndex = vif1CommandTraceCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        static thread_local uint32_t vif1CommandTraceCount = 0u;
+        const uint32_t commandIndex = ++vif1CommandTraceCount;
         if (xmenDiagnosticsEnabled() && commandIndex <= 160u)
         {
             std::fprintf(stderr,
@@ -642,9 +718,15 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (!drainVu1Pipeline())
             {
                 std::fprintf(stderr,
-                             "[vif1:mscal-stall] transfer=%u pc=0x%x previous VU1 program did not stop\n",
-                             transferIndex, static_cast<uint32_t>(imm) * 8u);
-                continue;
+                             "[vif1:mscal-stall] transfer=%u tick=%llu pc=0x%x "
+                             "previous VU1 program did not stop\n",
+                             transferIndex,
+                             static_cast<unsigned long long>(
+                                 gs().vsyncTick.load(std::memory_order_relaxed)),
+                             static_cast<uint32_t>(imm) * 8u);
+                pos -= sizeof(uint32_t);
+                m_vif1StalledData.assign(data + pos, data + sizeBytes);
+                break;
             }
             uint32_t startPC = (uint32_t)imm * 8u;
             uint32_t sourceAddr = 0u;
@@ -711,9 +793,14 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (!drainVu1Pipeline())
             {
                 std::fprintf(stderr,
-                             "[vif1:mscnt-stall] transfer=%u previous VU1 program did not stop\n",
-                             transferIndex);
-                continue;
+                             "[vif1:mscnt-stall] transfer=%u tick=%llu "
+                             "previous VU1 program did not stop\n",
+                             transferIndex,
+                             static_cast<unsigned long long>(
+                                 gs().vsyncTick.load(std::memory_order_relaxed)));
+                pos -= sizeof(uint32_t);
+                m_vif1StalledData.assign(data + pos, data + sizeBytes);
+                break;
             }
             const uint32_t runTop = vif1_regs.tops & 0x3FFu;
             const uint32_t runItop = vif1_regs.itops & 0x3FFu;
@@ -911,8 +998,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vuAddr = (vuAddr + (vif1_regs.tops & 0x3FFu)) & 0x3FFu;
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
-            static std::atomic<uint32_t> vif1UnpackTraceCount{0u};
-            const uint32_t unpackTraceIndex = vif1UnpackTraceCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            static thread_local uint32_t vif1UnpackTraceCount = 0u;
+            const uint32_t unpackTraceIndex = ++vif1UnpackTraceCount;
             const bool topRelative = (imm & 0x8000u) != 0u;
             const bool traceUnpack = xmenDiagnosticsEnabled() && unpackTraceIndex <= 192u;
 
@@ -933,12 +1020,55 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
+                const bool profileWorkload = runtimePhaseProfileEnabled();
+                const auto workloadStart = profileWorkload
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
                 const uint8_t *srcBase = data + pos;
                 uint32_t srcIndex = 0u;
-                for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
+                const uint32_t mode = vif1_regs.mode & 3u;
+                const XmenTargetVifWriteConfig &targetConfig =
+                    xmenTargetVifWriteConfig();
+                const bool bulkV432 =
+                    components == 4 && vl == 0u && !maskEnable &&
+                    (mode == 0u || mode == 3u) && cl == wl &&
+                    !traceUnpack && !targetConfig.enabled;
+                if (bulkV432)
                 {
-                    const uint32_t cyclePos = writeIndex % wl;
-                    const bool sourceAvailable = (cl >= wl) || (cyclePos < cl);
+                    const uint32_t firstVectors =
+                        std::min<uint32_t>(writeVectorCount, 1024u - vuAddr);
+                    const size_t firstBytes = static_cast<size_t>(firstVectors) * 16u;
+                    std::memcpy(m_vu1Data + static_cast<size_t>(vuAddr) * 16u,
+                                srcBase, firstBytes);
+                    const uint32_t remainingVectors = writeVectorCount - firstVectors;
+                    if (remainingVectors != 0u)
+                    {
+                        std::memcpy(m_vu1Data, srcBase + firstBytes,
+                                    static_cast<size_t>(remainingVectors) * 16u);
+                    }
+
+                    if (profileWorkload)
+                    {
+                        static thread_local uint64_t bulkV432Calls = 0u;
+                        static thread_local uint64_t bulkV432Vectors = 0u;
+                        ++bulkV432Calls;
+                        bulkV432Vectors += writeVectorCount;
+                        if (bulkV432Calls == 1u ||
+                            (bulkV432Calls & (bulkV432Calls - 1u)) == 0u)
+                        {
+                            std::fprintf(stderr,
+                                         "[vif1:bulk-v4-32] calls=%llu vectors=%llu\n",
+                                         static_cast<unsigned long long>(bulkV432Calls),
+                                         static_cast<unsigned long long>(bulkV432Vectors));
+                        }
+                    }
+                }
+                else
+                {
+                    for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
+                    {
+                        const uint32_t cyclePos = writeIndex % wl;
+                        const bool sourceAvailable = (cl >= wl) || (cyclePos < cl);
 
                     uint32_t destVec = 0;
                     if (cl >= wl)
@@ -1149,7 +1279,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     }
 
                     const bool canAdd = (vl != 3u || vn != 3u);
-                    const uint32_t mode = vif1_regs.mode & 3u;
                     const uint32_t colIdx = (cyclePos > 3u) ? 3u : cyclePos;
                     const uint32_t maskCycle = (cyclePos > 3u) ? 3u : cyclePos;
 
@@ -1198,8 +1327,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
                     std::memcpy(m_vu1Data + destOff, lanes, sizeof(lanes));
 
-                    const XmenTargetVifWriteConfig &targetConfig =
-                        xmenTargetVifWriteConfig();
                     const uint64_t targetTick =
                         gs_regs.vsyncTick.load(std::memory_order_relaxed);
                     static uint32_t targetWriteTraceCount = 0u;
@@ -1258,6 +1385,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                         std::fprintf(stderr, "\n");
                     }
                 }
+                }
 
                 if (traceUnpack)
                 {
@@ -1266,11 +1394,28 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     if (topRelative && vuAddr != (vif1_regs.tops & 0x3FFu))
                         traceVuQwords("unpack-tops", transferIndex, m_vu1Data, PS2_VU1_DATA_SIZE, vif1_regs.tops & 0x3FFu, 8u);
                 }
+                const auto workloadDecodeEnd = profileWorkload
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
                 bool dispatchedMscal = false;
                 if (m_vif1MscalPending && ++m_vif1PendingMscalUnpacks > 3u)
                     dispatchedMscal = dispatchPendingVu1Mscal();
                 if (!dispatchedMscal && m_vu1ServiceCallback)
                     m_vu1ServiceCallback(false);
+
+                if (profileWorkload)
+                {
+                    const uint64_t decodeElapsed = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            workloadDecodeEnd - workloadStart).count());
+                    const uint64_t serviceElapsed = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - workloadDecodeEnd).count());
+                    recordVif1UnpackWorkload(
+                        vn, vl, maskEnable, mode, zeroExtend, cl, wl, bulkV432,
+                        writeVectorCount, sourceVectorCount,
+                        decodeElapsed, serviceElapsed);
+                }
             }
             pos += totalBytes;
 

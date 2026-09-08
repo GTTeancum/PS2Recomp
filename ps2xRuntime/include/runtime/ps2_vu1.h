@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 class GS;
 class PS2Memory;
@@ -259,8 +260,10 @@ private:
 
     struct XgkickPipeline
     {
-        static constexpr uint32_t kBufferSize = 0x10000u;
-        std::array<uint8_t, kBufferSize> packet{};
+        static constexpr uint32_t kInitialBufferSize = 0x10000u;
+        static constexpr uint32_t kMaxBufferSize = 0x1000000u;
+        static constexpr uint32_t kBufferSize = kMaxBufferSize;
+        std::vector<uint8_t> packet = std::vector<uint8_t>(kInitialBufferSize);
         uint32_t sourceAddress = 0;
         uint32_t totalBytes = 0;
         uint32_t copiedBytes = 0;
