@@ -17,6 +17,75 @@ extern "C" bool ps2xGuestBumpFree(uint32_t address);
 extern "C" uint32_t ps2xGuestBumpRealloc(uint8_t *rdram, uint32_t address,
                                        uint32_t size, uint32_t alignment);
 
+static void checkCompatibilityAllocatorIdentity(TestCase &t)
+{
+    std::vector<uint8_t> ram(PS2_RAM_SIZE, 0);
+    PS2Runtime runtime;
+    R5900Context ctx{};
+    using Kind = PS2Runtime::GuestBranchKind;
+    constexpr uint32_t owner = 0x1000u, continuation = 0x800008u, returnPc = 0x800080u;
+    const uint16_t alignment = 16u;
+    std::memcpy(ram.data() + owner + 0xACu, &alignment, sizeof(alignment));
+    SET_GPR_U32(&ctx, 4, owner);
+    SET_GPR_U32(&ctx, 5, 64u);
+    t.IsTrue(runtime.dispatchGuestBranch(ram.data(), &ctx, 0x231EB0u, 0x800000u,
+        continuation, Kind::IndirectCall, "allocator-identity-allocation"), "owned allocation returns");
+    uint32_t address = ::getRegU32(&ctx, 2);
+    const auto query = [&](uint32_t target, Kind kind, uint32_t expected, uint32_t queriedOwner = 0x1000u) {
+        const bool method = target == 0x233710u || target == 0x233800u;
+        SET_GPR_U32(&ctx, 4, method ? queriedOwner : address);
+        SET_GPR_U32(&ctx, 5, address);
+        SET_GPR_U32(&ctx, 31, returnPc);
+        const bool call = kind == Kind::DirectCall || kind == Kind::IndirectCall;
+        t.Equals(runtime.dispatchGuestBranch(ram.data(), &ctx, target, 0x800000u,
+            continuation, kind, "allocator-identity-query"), call, "query continuation kind");
+        t.Equals(ctx.pc, call ? continuation : returnPc, "query continuation address");
+        t.Equals(::getRegU32(&ctx, 2), expected, "query uses tracked allocator metadata");
+    };
+    for (const auto kind : {Kind::DirectCall, Kind::IndirectCall, Kind::DirectJump, Kind::IndirectJump}) {
+        query(0x203F90u, kind, owner);
+        query(0x200FE0u, kind, owner);
+        query(0x233710u, kind, 1u);
+        query(0x233710u, kind, 0u, owner + 0x100u);
+        query(0x233800u, kind, 64u);
+    }
+    const uint32_t guard = ps2xGuestBumpAlloc(ram.data(), 64u, 16u);
+    address = ps2xGuestBumpRealloc(ram.data(), address, 256u, 16u);
+    t.IsTrue(address != 0u, "moving realloc succeeds");
+    query(0x203F90u, Kind::DirectCall, owner);
+    query(0x233800u, Kind::DirectCall, 256u);
+    t.Equals(ps2xGuestBumpRealloc(ram.data(), address, PS2_RAM_SIZE, 16u), 0u, "oversized realloc fails");
+    query(0x203F90u, Kind::DirectCall, owner);
+    t.IsTrue(ps2xGuestBumpFree(address), "free owned allocation");
+    t.IsTrue(ps2xGuestBumpFree(guard), "free guard");
+    runtime.registerFunction(0x203F90u, [](uint8_t *, R5900Context *c, PS2Runtime *) {
+        SET_GPR_U32(c, 2, 0xFACEu);
+    });
+    query(0x203F90u, Kind::DirectCall, 0xFACEu);
+}
+
+static void checkCompatibilityReservedPartition(TestCase &t)
+{
+    const bool reserved = std::getenv("PS2X_XMEN_RESERVED_HEAP") != nullptr;
+    std::vector<uint8_t> ram(PS2_RAM_SIZE, 0);
+    PS2Runtime runtime;
+    runtime.configureGuestHeap(0x100000u, 0x1E00000u);
+    t.Equals(runtime.guestHeapLimit(), 0x1800000u, "native heap cannot enter upper lease");
+    t.IsTrue(runtime.reserveAsyncCallbackStack(0x200000u, 16u) != 0u, "top two MiB remain available for callbacks");
+    t.Equals(runtime.reserveAsyncCallbackStack(16u, 16u) == 0u, reserved,
+        "callback allocator respects the selected partition floor");
+    const uint32_t lower = ps2xGuestBumpAlloc(ram.data(), 0xF00000u - 16u, 16u);
+    t.IsTrue(lower != 0u, "fill lower compatibility arena");
+    const uint32_t extension = ps2xGuestBumpAlloc(ram.data(), 64u, 16u);
+    t.Equals(extension != 0u, reserved, "only a reserved lease permits crossing 24 MiB");
+    if (extension) {
+        t.IsTrue(extension + 64u > 0x1800000u && extension + 64u < 0x1E00000u,
+            "extended allocation stays below callback floor");
+        t.IsTrue(ps2xGuestBumpFree(extension), "release extended allocation");
+    }
+    t.IsTrue(ps2xGuestBumpFree(lower), "release lower arena");
+}
+
 static void checkCompatibilityHeapDispatch(TestCase &t)
 {
     std::vector<uint8_t> ram(PS2_RAM_SIZE, 0);
@@ -440,6 +509,8 @@ void register_ps2_memory_tests()
         tc.Run("best fit preserves a large allocation under fragmentation", checkCompatibilityHeapFragmentation);
         tc.Run("reallocation preserves ownership and resizes safely", checkCompatibilityHeapReallocation);
         tc.Run("public allocator dispatch preserves heap ownership", checkCompatibilityHeapDispatch);
+        tc.Run("allocator identity survives moving and failed realloc", checkCompatibilityAllocatorIdentity);
+        tc.Run("reserved compatibility partition excludes native heap and callbacks", checkCompatibilityReservedPartition);
         tc.Run("free frontier joins untouched tail", checkCompatibilityHeapTailJoin);
         tc.Run("reuse free frontier before exhaustion", checkCompatibilityHeapFrontierFirst);
         tc.Run("split free extent retains address order", checkCompatibilityHeapSplitOrder);

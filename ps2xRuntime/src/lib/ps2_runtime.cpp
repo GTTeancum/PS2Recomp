@@ -310,13 +310,17 @@ namespace
     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
     constexpr uint32_t kGuestHeapHardLimit = 0x01800000u;
-    // Keep emergency HLE allocations below the game's custom heap at
-    // 0x01800000. Sharing that arena corrupts live Alchemy objects as the two
-    // allocators advance independently.
+    // Default to the original compatibility arena. The opt-in X-Men partition
+    // leases 24..30 MiB from the callback-stack arena, not from the native heap:
+    // guestMalloc/SetupHeap remain capped at 24 MiB, and both callback-stack
+    // initialization paths below reserve the region by raising their floor.
+    // The fixed RPC pool at 31 MiB and retail EE stacks remain above this lease.
     constexpr uint32_t kGuestBumpAllocatorBase = 0x00900000u;
-    constexpr uint32_t kGuestBumpAllocatorLimit = 0x01800000u;
+    const uint32_t kGuestBumpAllocatorLimit = std::getenv("PS2X_XMEN_RESERVED_HEAP")
+        ? 0x01E00000u : 0x01800000u;
     std::mutex g_guestBumpAllocationMutex;
     std::unordered_map<uint32_t, uint32_t> g_guestBumpAllocationSizes;
+    std::unordered_map<uint32_t, uint32_t> g_guestBumpAllocationOwners;
     std::vector<std::pair<uint32_t, uint32_t>> g_guestBumpFreeBlocks;
 
     struct XmenHostInflateState
@@ -1107,6 +1111,20 @@ extern "C" uint32_t ps2xGuestBumpAlloc(uint8_t *rdram, uint32_t size, uint32_t a
                     }
                     if (failureIndex == 0u)
                     {
+                        // Preserve the guest's allocator/object metadata at the first
+                        // failure, before callers can overwrite it through a null result.
+                        // This opt-in snapshot is diagnostic only; it never changes ownership.
+                        if (const char *path = std::getenv("PS2X_GUEST_HEAP_FAILURE_SNAPSHOT"))
+                        {
+                            if (std::FILE *file = std::fopen(path, "wb"))
+                            {
+                                const size_t written = std::fwrite(rdram, 1u, PS2_RAM_SIZE, file);
+                                const int closed = std::fclose(file);
+                                std::fprintf(stderr, "[heap:failure-snapshot] bytes=%zu complete=%u\n",
+                                    written, written == PS2_RAM_SIZE && closed == 0 ? 1u : 0u);
+                            }
+                            else std::fprintf(stderr, "[heap:failure-snapshot] open-failed=1\n");
+                        }
                         std::unordered_map<uint32_t, uint32_t> sizeCounts;
                         for (const auto &[address, bytes] : g_guestBumpAllocationSizes) ++sizeCounts[bytes];
                         std::vector<std::pair<uint32_t, uint32_t>> ranked(sizeCounts.begin(), sizeCounts.end());
@@ -1161,6 +1179,23 @@ extern "C" uint32_t ps2xGuestBumpAllocationSize(uint32_t address)
     return it != g_guestBumpAllocationSizes.end() ? it->second : 0u;
 }
 
+static uint32_t guestBumpOwner(uint32_t address)
+{
+    std::lock_guard<std::mutex> lock(g_guestBumpAllocationMutex);
+    const auto it = g_guestBumpAllocationOwners.find(address);
+    return it == g_guestBumpAllocationOwners.end() ? 0u : it->second;
+}
+
+static uint32_t guestBumpSetOwner(uint32_t address, uint32_t owner)
+{
+    if (address && owner)
+    {
+        std::lock_guard<std::mutex> lock(g_guestBumpAllocationMutex);
+        g_guestBumpAllocationOwners[address] = owner;
+    }
+    return address;
+}
+
 static void insertGuestBumpFreeBlockLocked(uint32_t address, uint32_t paddedSize)
 {
     g_guestBumpFreeBlocks.emplace_back(address, paddedSize);
@@ -1189,6 +1224,7 @@ extern "C" bool ps2xGuestBumpFree(uint32_t address)
     const uint32_t paddedSize = (allocation->second + 0xfu) & ~0xfu;
     recordGuestHeapEvent(2u, address, allocation->second, 0u);
     g_guestBumpAllocationSizes.erase(allocation);
+    g_guestBumpAllocationOwners.erase(address);
     insertGuestBumpFreeBlockLocked(address, paddedSize);
     return true;
 }
@@ -1255,9 +1291,11 @@ extern "C" uint32_t ps2xGuestBumpRealloc(uint8_t *rdram, uint32_t address,
         }
     }
     // Failure leaves the original allocation and its contents owned by the caller.
+    const uint32_t owner = guestBumpOwner(address);
     const uint32_t result = ps2xGuestBumpAlloc(rdram, size, alignment);
     if (result)
     {
+        guestBumpSetOwner(result, owner);
         std::memmove(rdram + result, rdram + address, std::min(oldSize, size));
         (void)ps2xGuestBumpFree(address);
     }
@@ -1413,7 +1451,7 @@ PS2Runtime::PS2Runtime()
     m_guestHeapLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
     m_guestHeapSuggestedBase = kGuestHeapDefaultBase;
     m_guestHeapConfigured = false;
-    m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+    m_asyncCallbackStackFloor = std::min(kGuestBumpAllocatorLimit, PS2_RAM_SIZE);
     m_asyncCallbackStackTop = PS2_RAM_SIZE;
 }
 
@@ -2058,7 +2096,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
     {
         std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
         const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-        m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
+        m_asyncCallbackStackFloor = std::min(std::max(kGuestBumpAllocatorLimit, suggestedHeapBase), PS2_RAM_SIZE);
         m_asyncCallbackStackTop = PS2_RAM_SIZE;
     }
 
@@ -2588,6 +2626,37 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
     const GuestHeapCallScope heapCall(ctx, sourcePc, targetPc);
+    if (targetPc == 0x00233710u || targetPc == 0x00233800u ||
+        targetPc == 0x00203F90u || targetPc == 0x00200FE0u)
+    {
+        const bool method = targetPc == 0x00233710u || targetPc == 0x00233800u;
+        const uint32_t address = ::getRegU32(ctx, method ? 5 : 4);
+        const uint32_t owner = guestBumpOwner(address);
+        if (owner)
+        {
+            // Native metadata lives before the pointer and is absent for HLE
+            // blocks. Preserve the allocator identity supplied at allocation.
+            const uint32_t result = !method ? owner : targetPc == 0x00233710u
+                ? uint32_t{owner == ::getRegU32(ctx, 4)}
+                : (owner == ::getRegU32(ctx, 4) ? ps2xGuestBumpAllocationSize(address) : 0u);
+            SET_GPR_U32(ctx, 2, result);
+            ctx->pc = isCall ? fallthroughPc : ::getRegU32(ctx, 31);
+            return isCall;
+        }
+    }
+    if (heapCall.enabled && (targetPc == 0x00233710u || targetPc == 0x00233800u ||
+                             targetPc == 0x00203F90u || targetPc == 0x00200FE0u))
+    {
+        const bool method = targetPc == 0x00233710u || targetPc == 0x00233800u;
+        const uint32_t address = ::getRegU32(ctx, method ? 5 : 4);
+        if (const uint32_t bytes = ps2xGuestBumpAllocationSize(address))
+        {
+            static thread_local uint32_t count = 0;
+            if (count++ < 32u)
+                std::fprintf(stderr, "[heap:native-query] source=0x%x target=0x%x owner=0x%x address=0x%x size=%u\n",
+                    sourcePc, targetPc, method ? ::getRegU32(ctx, 4) : 0u, address, bytes);
+        }
+    }
     if (targetPc == 0x00321B90u &&
         PS2X_CACHED_GETENV("PS2X_XMEN_RENDER_GATE_TRACE") != nullptr)
     {
@@ -10340,7 +10409,7 @@ xmen_component_attach_trace_done:
                 ? requestedAlignment
                 : 16u;
         const uint32_t classSizeOperand = GPR_U32(ctx, 2);
-        const uint32_t result = ps2xGuestBumpAlloc(rdram, size, alignment);
+        const uint32_t result = guestBumpSetOwner(ps2xGuestBumpAlloc(rdram, size, alignment), allocator);
         SET_GPR_U32(ctx, 2, result);
 
         if (xmenRuntimeDiagnosticsEnabled() && sourcePc == 0x00211CCCu &&
@@ -10400,7 +10469,7 @@ xmen_component_attach_trace_done:
             requestedAlignment != 0u && (requestedAlignment & (requestedAlignment - 1u)) == 0u
                 ? requestedAlignment
                 : 16u;
-        const uint32_t result = ps2xGuestBumpAlloc(rdram, size, alignment);
+        const uint32_t result = guestBumpSetOwner(ps2xGuestBumpAlloc(rdram, size, alignment), allocator);
         SET_GPR_U32(ctx, 2, result);
 
         static std::atomic<uint32_t> s_xmenAlignedAllocationWrapperLogCount{0u};
@@ -10443,7 +10512,7 @@ xmen_component_attach_trace_done:
                 : 16u;
         const uint32_t allocatorFlags = readRdramProbeU32(rdram, allocator + 0xC0u);
         const bool clearAllocation = (allocatorFlags & 0x2u) != 0u || (allocatorFlags & 0x4u) == 0u;
-        const uint32_t result = ps2xGuestBumpAlloc(rdram, totalSize, alignment);
+        const uint32_t result = guestBumpSetOwner(ps2xGuestBumpAlloc(rdram, totalSize, alignment), allocator);
         if (clearAllocation && result != 0u && totalSize != 0u)
         {
             std::memset(rdram + result, 0, totalSize);
@@ -12489,6 +12558,15 @@ void PS2Runtime::guestFree(uint32_t guestAddr)
     if (guestAddr == 0u)
     {
         return;
+    }
+
+    if (PS2X_CACHED_GETENV("PS2X_GUEST_BUMP_DIAGNOSTICS") != nullptr &&
+        ps2xGuestBumpAllocationSize(guestAddr) != 0u)
+    {
+        static thread_local uint32_t count = 0;
+        if (count++ < 32u)
+            std::fprintf(stderr, "[heap:libc-foreign-free] address=0x%x trace=%s\n",
+                guestAddr, formatDispatchHistory().c_str());
     }
 
     std::lock_guard<std::mutex> lock(m_guestHeapMutex);
